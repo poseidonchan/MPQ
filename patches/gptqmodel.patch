@@ -1,0 +1,177 @@
+diff --git a/gptqmodel/looper/gptq_processor.py b/gptqmodel/looper/gptq_processor.py
+index e9b342a5..327667bc 100644
+--- a/gptqmodel/looper/gptq_processor.py
++++ b/gptqmodel/looper/gptq_processor.py
+@@ -322,6 +322,18 @@ class GPTQProcessor(LoopProcessor):
+ 
+         # cleanup all memory or states vars persistently added by this processor
+         module.stream_sync()
++        mpgq_cfg = getattr(self.qcfg, "mpgq", None)
++        if mpgq_cfg is not None and bool(getattr(mpgq_cfg, "enabled", False)) and str(getattr(self.qcfg, "rotation", None)) == "hadamard":
++            # MPGQ exact-full path with internal Hadamard is a dense research path; skip packing/export.
++            with (self.lock):
++                if self.calculate_w_wq_diff:
++                    module.weight.data = module.state.pop("wq").to(CPU)
++                module.state.pop("w", None)
++                module.state.pop("w_wq_diff", None)
++                module.state.pop("q_scales", None)
++                module.state.pop("q_zeros", None)
++                module.state.pop("q_g_idx", None)
++            return
+         with (self.lock):
+             # if calculate_w_wq_diff is enabled (eora), we need to revert our original wq
+             if self.calculate_w_wq_diff:
+diff --git a/gptqmodel/quantization/config.py b/gptqmodel/quantization/config.py
+index 97998f41..96d9719b 100644
+--- a/gptqmodel/quantization/config.py
++++ b/gptqmodel/quantization/config.py
+@@ -324,6 +324,56 @@ class HessianConfig:
+             raise ValueError("HessianConfig: `staging_dtype` must be a torch.dtype or string.")
+ 
+ 
++@dataclass
++class MPGQConfig:
++    """MPGQ exact-full VAMP + greedy polish (research path).
++
++    This is a dense quantization path that can optionally use an internal right-side
++    Hadamard rotation for preconditioning. When that internal rotation is enabled
++    (`rotation='hadamard'`), the result is intended for dense evaluation and is not
++    packed/exported as a GPTQ checkpoint.
++    """
++
++    enabled: bool = False
++
++    # VAMP loop
++    iters: int = 10
++    damping: float = 0.5
++    x1_mode: str = "mmse"  # "mmse" | "map"
++    final_decision: str = "map"
++    gamma_start: float = 1.0
++    gamma_retry_factor: float = 4.0
++    gamma_retry_steps: int = 3
++    prior_tau: float = 0.2
++
++    # Linear module / likelihood
++    obs_precision: float = 0.0  # <=0 means warm start
++    em_obs_precision: bool = True
++    em_obs_precision_damping: float = 0.3
++    em_obs_precision_min: float = 1e-4
++    em_obs_precision_max: float = 1e8
++
++    # Adaptive accept/reject
++    best_iterate_export: bool = True
++    adaptive_accept_reject: bool = True
++    adaptive_retry_steps: int = 3
++    adaptive_accept_tol: float = 1e-4
++    adaptive_damping_min: float = 0.1
++    adaptive_obs_precision_backoff: float = 0.5
++
++    # Greedy polish
++    polish_sweeps: int = 3
++
++    # Full-layer driver
++    block_rows: int = 32
++
++    # GPTQModel upstream stores H = 2/m X^T X. Set to 0.5 to match X^T X / m.
++    hessian_scale: float = 0.5
++    eigen_jitter: float = 1e-6
++    eigen_floor_scale: float = 1e-6
++    rotation_seed: int = 0
++
++
+ @dataclass
+ class GPTAQConfig:
+     alpha: float = field(default=0.25)
+@@ -693,6 +743,9 @@ class QuantizeConfig():
+     # Hessian accumulation controls (GPTQ only)
+     hessian: Optional[HessianConfig] = field(default_factory=HessianConfig)
+ 
++    # MPGQ exact-full solver config (research-only dense path)
++    mpgq: MPGQConfig = field(default_factory=MPGQConfig)
++
+     # Callback function to filter devices for compute-intensive stages (quantization and forwarding)
+     # Takes a list of devices and returns either the original list or a filtered subset
+     compute_device_filter: Optional[callable] = field(
+diff --git a/gptqmodel/quantization/gptq.py b/gptqmodel/quantization/gptq.py
+index ae0921aa..e7979190 100644
+--- a/gptqmodel/quantization/gptq.py
++++ b/gptqmodel/quantization/gptq.py
+@@ -935,6 +935,78 @@ class GPTQ:
+             W = self.module_copy.to(device=self.H.device)
+             del self.module_copy
+ 
++        mpgq_cfg = getattr(self.qcfg, "mpgq", None)
++        if mpgq_cfg is not None and bool(getattr(mpgq_cfg, "enabled", False)):
++            from mpgq.adapters.gptqmodel import GPTQAdapterConfig, run_mpgq_quantization
++            from mpgq.solver import UniformVampConfig
++
++            vamp_cfg = UniformVampConfig(
++                iters=int(getattr(mpgq_cfg, "iters", 10)),
++                damping=float(getattr(mpgq_cfg, "damping", 0.5)),
++                x1_mode=str(getattr(mpgq_cfg, "x1_mode", "mmse") or "mmse"),
++                final_decision=str(getattr(mpgq_cfg, "final_decision", "map") or "map"),
++                init_from="rtn",
++                gamma_start=float(getattr(mpgq_cfg, "gamma_start", 1.0)),
++                gamma_retry_factor=float(getattr(mpgq_cfg, "gamma_retry_factor", 4.0)),
++                gamma_retry_steps=int(getattr(mpgq_cfg, "gamma_retry_steps", 3)),
++                prior_tau=float(getattr(mpgq_cfg, "prior_tau", 0.2)),
++                obs_precision=float(getattr(mpgq_cfg, "obs_precision", 0.0)),
++                em_obs_precision=bool(getattr(mpgq_cfg, "em_obs_precision", True)),
++                em_obs_precision_damping=float(getattr(mpgq_cfg, "em_obs_precision_damping", 0.3)),
++                em_obs_precision_min=float(getattr(mpgq_cfg, "em_obs_precision_min", 1e-4)),
++                em_obs_precision_max=float(getattr(mpgq_cfg, "em_obs_precision_max", 1e8)),
++                best_iterate_export=bool(getattr(mpgq_cfg, "best_iterate_export", True)),
++                adaptive_accept_reject=bool(getattr(mpgq_cfg, "adaptive_accept_reject", True)),
++                adaptive_retry_steps=int(getattr(mpgq_cfg, "adaptive_retry_steps", 3)),
++                adaptive_accept_tol=float(getattr(mpgq_cfg, "adaptive_accept_tol", 1e-4)),
++                adaptive_damping_min=float(getattr(mpgq_cfg, "adaptive_damping_min", 0.1)),
++                adaptive_obs_precision_backoff=float(getattr(mpgq_cfg, "adaptive_obs_precision_backoff", 0.5)),
++                polish_sweeps=int(getattr(mpgq_cfg, "polish_sweeps", 3)),
++            )
++            adapter_cfg = GPTQAdapterConfig(
++                hessian_scale=float(getattr(mpgq_cfg, "hessian_scale", 0.5)),
++                block_rows=int(getattr(mpgq_cfg, "block_rows", 32)),
++                jitter_base=float(getattr(mpgq_cfg, "eigen_jitter", 1e-6)),
++                eigen_floor_scale=float(getattr(mpgq_cfg, "eigen_floor_scale", 1e-6)),
++                rotation_seed=int(getattr(mpgq_cfg, "rotation_seed", 0)),
++            )
++
++            Q, _q_int, scale, zero, g_idx, duration, _stats = run_mpgq_quantization(
++                W=W,
++                H=self.H,
++                quantizer=self.quantizer,
++                qcfg=self.qcfg,
++                module_name=self.name,
++                vamp_cfg=vamp_cfg,
++                adapter_cfg=adapter_cfg,
++            )
++
++            if scale is None or zero is None:
++                scale = Q.new_empty((Q.shape[0], 0), dtype=torch.float32)
++                zero = Q.new_empty((Q.shape[0], 0), dtype=torch.float32)
++            if g_idx is None:
++                g_idx = torch.empty((Q.shape[1],), dtype=torch.int32, device=Q.device)
++
++            if self._tp_pad_cols:
++                valid_cols = self._original_columns
++                Q = Q[:, :valid_cols]
++                g_idx = g_idx[:valid_cols]
++                scale = self.truncate_last_dim(scale, valid_cols)
++                zero = self.truncate_last_dim(zero, valid_cols)
++
++            if isinstance(self.module, transformers.Conv1D):
++                Q = Q.t()
++
++            if Q.shape != self.module.weight.shape:
++                Q = Q.reshape(self.module.weight.shape).to(self.module.weight.dtype)
++            else:
++                Q = Q.to(self.module.weight.dtype)
++
++            Q = Q.to(device=self.module.weight.data.device, non_blocking=False)
++            avg_loss = float("nan")
++            damp = 0.0
++            return Q, scale, zero, g_idx, float(duration), avg_loss, damp, self.nsamples
++
+         self.quantizer.find_params(W, weight=True)
+ 
+         # H = self.H.to(device=self.H.device)

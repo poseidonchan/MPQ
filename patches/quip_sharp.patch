@@ -1,0 +1,107 @@
+diff --git a/lib/algo/quip.py b/lib/algo/quip.py
+index 7ceb211..765587b 100644
+--- a/lib/algo/quip.py
++++ b/lib/algo/quip.py
+@@ -354,7 +354,7 @@ def LDLQ_buffered_lowmem(Wr, Hr, L, D, cb, args, buf_cols=128):
+     return hatWr, Qidxs
+ 
+ 
+-def quantize(H_orig, W_orig, rank, codebook_orig, args, device='cpu'):
++def quantize(H_orig, W_orig, rank, codebook_orig, args, device='cpu', module_name: str = ''):
+     orig_device = H_orig.device
+     W_orig_dtype = W_orig.dtype
+     dtype_ = torch.float64 if args.use_fp64 else torch.float32
+@@ -441,6 +441,23 @@ def quantize(H_orig, W_orig, rank, codebook_orig, args, device='cpu'):
+                                      args,
+                                      buf_cols=128)
+ 
++    solver = str(getattr(args, 'solver', 'quip') or 'quip').strip().lower()
++    if solver == 'wmpq':
++        solver = 'mpgq'
++    mpgq_stats = None
++    if solver == 'mpgq':
++        from mpgq.adapters.quip_sharp import mpgq_refine_codebook
++
++        hatWr, Qidxs, mpgq_stats = mpgq_refine_codebook(
++            Wr,
++            Hr,
++            hatWr,
++            Qidxs,
++            codebook,
++            args,
++            module_name=module_name,
++        )
++
+     Wr = Wr.cpu()
+     Hr = Hr.cpu()
+     L = L.cpu()
+@@ -472,6 +489,8 @@ def quantize(H_orig, W_orig, rank, codebook_orig, args, device='cpu'):
+             torch.float16).to(orig_device),  # fuse Wscale into SV
+         'scaleWH': scaleWH,
+     }
++    if mpgq_stats is not None:
++        attr['mpgq_stats'] = mpgq_stats
+ 
+     utils.clean()
+ 
+@@ -496,7 +515,7 @@ def quantize_linear(weights, save_path, hessian_path, cb, args, device='cpu'):
+         weights[i].to(dtype_) / scales[i] for i in range(len(weights))
+     ]).to(dtype_)
+     H = utils.regularize_H(H, n, args.sigma_reg)
+-    hatW, attr = quantize(H, W, args.lora_rank, cb, args, device)
++    hatW, attr = quantize(H, W, args.lora_rank, cb, args, device, module_name=os.path.basename(save_path))
+     if len(scales) == 1:
+         # fuse single scale into SV too
+         attr['SV'] *= scales[0]
+diff --git a/quantize_llama/quantize_finetune_llama.py b/quantize_llama/quantize_finetune_llama.py
+index af33222..945cc25 100644
+--- a/quantize_llama/quantize_finetune_llama.py
++++ b/quantize_llama/quantize_finetune_llama.py
+@@ -57,6 +57,47 @@ parser.add_argument('--ft_early_stop', default=3, type=int)
+ parser.add_argument('--ft_train_mode', action='store_true')
+ parser.add_argument('--ft_grad_ckpt', action='store_true')
+ 
++# Solver selection
++parser.add_argument(
++    '--solver',
++    default='quip',
++    type=str,
++    choices=['quip', 'mpgq', 'wmpq'],
++    help="Quantization solver: 'quip' runs LDLQ baseline; 'mpgq' (alias 'wmpq') runs MPGQ refine after LDLQ.",
++)
++
++# MPGQ / (legacy) WMPQ hyperparameters (used when --solver in {mpgq,wmpq})
++parser.add_argument('--wmpq_init', default='random', type=str, choices=['random', 'rtn', 'ldlq'])
++parser.add_argument('--wmpq_iters', default=4, type=int)
++parser.add_argument('--wmpq_damping', default=0.5, type=float)
++parser.add_argument('--wmpq_prior_tau', default=0.0, type=float)
++parser.add_argument('--wmpq_prior_tau_scale_mode',
++                    default='absmax',
++                    type=str,
++                    choices=['none', 'absmax', 'rms', 'mean_abs'])
++parser.add_argument('--wmpq_gamma_start', default=1.0, type=float)
++parser.add_argument('--wmpq_gamma_retry_factor', default=4.0, type=float)
++parser.add_argument('--wmpq_gamma_retry_steps', default=3, type=int)
++parser.add_argument('--wmpq_obs_precision', default=0.0, type=float)
++parser.add_argument('--wmpq_obs_precision_end', default=None, type=float)
++parser.add_argument('--wmpq_em_obs_precision', action=argparse.BooleanOptionalAction, default=True)
++parser.add_argument('--wmpq_em_obs_precision_damping', default=0.3, type=float)
++parser.add_argument('--wmpq_em_obs_precision_min', default=1e-4, type=float)
++parser.add_argument('--wmpq_em_obs_precision_max', default=1e8, type=float)
++parser.add_argument('--wmpq_vamp_x1_mode', default='map', type=str, choices=['mean', 'map', 'mix'])
++parser.add_argument('--wmpq_vamp_map_mix', default=0.5, type=float)
++parser.add_argument('--wmpq_adaptive_accept_reject', action=argparse.BooleanOptionalAction, default=True)
++parser.add_argument('--wmpq_adaptive_retry_steps', default=3, type=int)
++parser.add_argument('--wmpq_adaptive_accept_tol', default=1e-4, type=float)
++parser.add_argument('--wmpq_adaptive_damping_min', default=0.1, type=float)
++parser.add_argument('--wmpq_adaptive_obs_backoff', default=0.5, type=float)
++parser.add_argument('--wmpq_best_iterate_export', action=argparse.BooleanOptionalAction, default=True)
++parser.add_argument('--wmpq_blocks_per_chunk', default=16, type=int)
++parser.add_argument('--wmpq_block_rows', default=32, type=int)
++parser.add_argument('--wmpq_polish_sweeps', default=3, type=int)
++parser.add_argument('--wmpq_polish_metric', default='gram', type=str, choices=['gram', 'isotropic', 'diag'])
++parser.add_argument('--wmpq_metric_rows_per_chunk', default=0, type=int)
++
+ 
+ def check_exist(idx, args):
+     suffix = ['qkv', 'o', 'up', 'down', 'layernorm']
