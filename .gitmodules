@@ -1,0 +1,6 @@
+[submodule "third_party/GPTQModel"]
+	path = third_party/GPTQModel
+	url = https://github.com/ModelCloud/GPTQModel.git
+[submodule "third_party/quip-sharp"]
+	path = third_party/quip-sharp
+	url = https://github.com/Cornell-RelaxML/quip-sharp.git

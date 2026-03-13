@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+
+# Builds / artifacts
+build/
+dist/
+*.egg-info/
+
+# Local runs
+runs/
+logs/
+
+# Editors
+.vscode/
+.idea/
+
+# Submodules build junk
+third_party/**/build/
+third_party/**/.cache/
+
