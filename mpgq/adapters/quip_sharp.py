@@ -75,6 +75,29 @@ def _exact_surrogate_mean(
 
 
 @torch.inference_mode()
+def _exact_surrogate_chunk_means(
+    Wr: torch.Tensor,
+    hatWr: torch.Tensor,
+    Hr: torch.Tensor,
+    *,
+    block_rows: int,
+) -> Tuple[float, list[float]]:
+    """Return (overall_mean, per_chunk_means) over row chunks of size block_rows."""
+    m = int(Wr.shape[0])
+    block_rows = _resolve_block_rows(m, block_rows)
+    total_sum = 0.0
+    total_count = 0
+    chunk_means: list[float] = []
+    for row_start in range(0, m, block_rows):
+        row_end = min(row_start + block_rows, m)
+        scores = _exact_surrogate_rows(Wr[row_start:row_end], hatWr[row_start:row_end], Hr)
+        chunk_means.append(float(scores.mean().item()) if scores.numel() else 0.0)
+        total_sum += float(scores.sum().item())
+        total_count += int(scores.numel())
+    return float(total_sum / max(total_count, 1)), chunk_means
+
+
+@torch.inference_mode()
 def _resolve_block_rows(rows: int, requested: int) -> int:
     return min(int(rows), max(int(requested), 1))
 
@@ -208,7 +231,13 @@ def mpgq_refine_codebook(
     final_hatWr = hatWr_init.clone()
     final_Qidxs = Qidxs_init.clone()
 
-    exact_before = _exact_surrogate_mean(Wr, hatWr_init, Hr, block_rows=block_rows)
+    exact_ldlq, exact_ldlq_chunks = _exact_surrogate_chunk_means(
+        Wr,
+        hatWr0.to(dtype=torch.float32),
+        Hr,
+        block_rows=block_rows,
+    )
+    exact_before, exact_before_chunks = _exact_surrogate_chunk_means(Wr, hatWr_init, Hr, block_rows=block_rows)
     obs_precision_block = float(obs_precision)
     for row_start in range(0, m, block_rows):
         row_end = min(row_start + block_rows, m)
@@ -232,7 +261,19 @@ def mpgq_refine_codebook(
         if bool(vamp_cfg.em_obs_precision) and float(vamp_cfg.obs_precision) <= 0.0:
             obs_precision_block = float(stats_chunk.get("obs_precision_final", obs_precision_block))
 
-    exact_after = _exact_surrogate_mean(Wr, final_hatWr, Hr, block_rows=block_rows)
+    exact_after, exact_after_chunks = _exact_surrogate_chunk_means(Wr, final_hatWr, Hr, block_rows=block_rows)
+
+    # Surrogate gate helpers: compare per-row-chunk (block_rows) means vs LDLQ.
+    chunk_eps = 1e-8
+    violation_count = 0
+    max_delta = 0.0
+    max_ratio = 0.0
+    for ldlq_val, mpgq_val in zip(exact_ldlq_chunks, exact_after_chunks):
+        if mpgq_val > ldlq_val + chunk_eps:
+            violation_count += 1
+            max_delta = max(max_delta, float(mpgq_val - ldlq_val))
+            if ldlq_val > 0:
+                max_ratio = max(max_ratio, float(mpgq_val / ldlq_val))
 
     stats: Dict[str, Any] = {
         "method": "mpgq",
@@ -246,9 +287,16 @@ def mpgq_refine_codebook(
         "obs_precision_initial": float(obs_precision),
         "obs_precision_final": float(obs_precision_block),
         "block_rows": int(block_rows),
+        "exact_surrogate_ldlq_mean": float(exact_ldlq),
+        "exact_surrogate_ldlq_chunk_means": exact_ldlq_chunks,
         "exact_surrogate_before_mean": float(exact_before),
+        "exact_surrogate_before_chunk_means": exact_before_chunks,
         "exact_surrogate_after_mean": float(exact_after),
+        "exact_surrogate_after_chunk_means": exact_after_chunks,
         "exact_surrogate_gain_mean": float(exact_before - exact_after),
+        "surrogate_chunk_violation_count": int(violation_count),
+        "surrogate_chunk_violation_max_delta": float(max_delta),
+        "surrogate_chunk_violation_max_ratio": float(max_ratio),
         "solver_time_s": float(time.time() - start),
         "vamp": stats_chunk if "stats_chunk" in locals() else {},
     }

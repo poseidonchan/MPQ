@@ -93,7 +93,7 @@ index 97998f41..96d9719b 100644
      # Takes a list of devices and returns either the original list or a filtered subset
      compute_device_filter: Optional[callable] = field(
 diff --git a/gptqmodel/quantization/gptq.py b/gptqmodel/quantization/gptq.py
-index ae0921aa..e7979190 100644
+index ae0921aa..123f3929 100644
 --- a/gptqmodel/quantization/gptq.py
 +++ b/gptqmodel/quantization/gptq.py
 @@ -935,6 +935,78 @@ class GPTQ:
@@ -175,3 +175,55 @@ index ae0921aa..e7979190 100644
          self.quantizer.find_params(W, weight=True)
  
          # H = self.H.to(device=self.H.device)
+@@ -990,6 +1062,51 @@ class GPTQ:
+         else:
+             Hinv, damp = None, 0.0
+ 
++        ojbkq_cfg = getattr(self.qcfg, "ojbkq", None)
++        if ojbkq_cfg is not None and bool(getattr(ojbkq_cfg, "enabled", False)):
++            if Hinv is None:
++                raise ValueError(
++                    f"OJBKQ: Module `{self.name}` requires the GPTQ Hessian path and cannot run under failsafe/no-Hessian mode."
++                )
++
++            from mpgq.baselines.ojbkq import run_ojbkq_gptq_quantization
++
++            Q_ojbkq, q_int_ojbkq, scale_ojbkq, zero_ojbkq, g_idx_ojbkq, avg_loss_ojbkq, _ojbkq_stats = (
++                run_ojbkq_gptq_quantization(
++                    W=W,
++                    Hinv=Hinv,
++                    quantizer=self.quantizer,
++                    qcfg=self.qcfg,
++                    config=ojbkq_cfg,
++                    nsamples=self.nsamples,
++                    module_name=self.name,
++                )
++            )
++
++            if self._tp_pad_cols:
++                valid_cols = self._original_columns
++                Q_ojbkq = Q_ojbkq[:, :valid_cols]
++                q_int_ojbkq = q_int_ojbkq[:, :valid_cols]
++                g_idx_ojbkq = g_idx_ojbkq[:valid_cols]
++                scale_ojbkq = self.truncate_last_dim(scale_ojbkq, valid_cols)
++                zero_ojbkq = self.truncate_last_dim(zero_ojbkq, valid_cols)
++
++            if isinstance(self.module, transformers.Conv1D):
++                Q_ojbkq = Q_ojbkq.t()
++
++            if Q_ojbkq.shape != self.module.weight.shape:
++                Q_ojbkq = Q_ojbkq.reshape(self.module.weight.shape).to(self.module.weight.dtype)
++            else:
++                Q_ojbkq = Q_ojbkq.to(self.module.weight.dtype)
++
++            Q_ojbkq = Q_ojbkq.to(device=self.module.weight.data.device, non_blocking=False)
++            duration = time.time() - start
++            del q_int_ojbkq
++            del Hinv
++            del self.H
++            del W
++            return Q_ojbkq, scale_ojbkq, zero_ojbkq, g_idx_ojbkq, duration, avg_loss_ojbkq, damp, self.nsamples
++
+         # Use simplified loop when mock_quantization is active
+         if self.qcfg.mock_quantization:
+             for i1 in range(0, self.columns, blocksize):
