@@ -13,5 +13,7 @@ dependencies = [
 ]
 
 [tool.setuptools]
-packages = ["mpgq"]
 
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mpgq*"]

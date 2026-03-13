@@ -1,0 +1,460 @@
+from __future__ import annotations
+
+import math
+from typing import Dict, Optional
+
+import torch
+
+
+@torch.inference_mode()
+def _e8p12_sign_parity(sign_ids: torch.Tensor, *, bit_count: int = 8) -> torch.Tensor:
+    bit_values = (1 << torch.arange(bit_count, device=sign_ids.device, dtype=torch.long)).view(1, bit_count)
+    bits = ((sign_ids.to(dtype=torch.long).unsqueeze(-1) & bit_values) != 0).to(dtype=torch.long)
+    return (bits.sum(dim=-1) & 1).to(dtype=torch.long)
+
+
+@torch.inference_mode()
+def prior_scale_from_center(prior_center_blocks: Optional[torch.Tensor], mode: str) -> Optional[torch.Tensor]:
+    if prior_center_blocks is None:
+        return None
+    mode = str(mode or "absmax").strip().lower()
+    if mode in ("none", "unit", "legacy"):
+        shape = prior_center_blocks.shape[:-1] + (1,)
+        return torch.ones(shape, dtype=torch.float32, device=prior_center_blocks.device)
+    if mode in ("absmax", "exact_full", "exact_full_absmax"):
+        scale = prior_center_blocks.abs().amax(dim=-1, keepdim=True)
+    elif mode in ("rms", "std"):
+        scale = prior_center_blocks.square().mean(dim=-1, keepdim=True).sqrt()
+    elif mode in ("mean_abs", "l1"):
+        scale = prior_center_blocks.abs().mean(dim=-1, keepdim=True)
+    else:
+        raise ValueError(f"unsupported prior_tau_scale_mode={mode!r}; supported: none|absmax|rms|mean_abs")
+    return scale.to(dtype=torch.float32).clamp_min_(1e-12)
+
+
+@torch.inference_mode()
+def resolve_factorized_blocks_per_chunk(batch_rows: int, n_blocks: int, requested: int, device: torch.device) -> int:
+    requested = max(int(requested or 1), 1)
+    if n_blocks <= requested:
+        return int(n_blocks)
+    if device.type != "cuda":
+        return int(min(n_blocks, max(requested, 64)))
+
+    try:
+        total_bytes = int(torch.cuda.get_device_properties(device).total_memory)
+    except RuntimeError:
+        return int(min(n_blocks, max(requested, 128)))
+
+    bytes_per_item_base = 4 * 48
+    budget = min(max(int(total_bytes // 8), 256 * 1024**2), 4 * 1024**3)
+    denom = max(int(batch_rows) * 256 * bytes_per_item_base, 1)
+    auto = max(1, int(budget // denom))
+    return int(min(n_blocks, max(requested, auto)))
+
+
+@torch.inference_mode()
+def get_e8p12_factor_cache(cb: object, *, device: Optional[torch.device] = None) -> Dict[str, torch.Tensor]:
+    target_device = cb.grid.device if device is None else device
+    cache = getattr(cb, "_mpgq_factor_cache", None)
+    if cache is not None and cache.get("device") == target_device:
+        return cache
+
+    if cb.__class__.__name__ != "E8P12_codebook":
+        raise ValueError(f"factorized E8P12 cache requires E8P12_codebook, got {cb.__class__.__name__}.")
+
+    grid = cb.grid.to(device=target_device, dtype=torch.float32)
+    codesz = int(cb.codesz)
+    abs_count = int(cb.grid_packed_abs.shape[0])
+    if abs_count != 256 or codesz != 8:
+        raise ValueError(f"expected 256 abs patterns with codesz=8, got abs_count={abs_count}, codesz={codesz}.")
+
+    bit_values = (1 << torch.arange(codesz, device=target_device, dtype=torch.long)).contiguous()
+    valid_even_sign = (_e8p12_sign_parity(torch.arange(1 << codesz, device=target_device, dtype=torch.long)) == 0)
+
+    seed_idxs = (torch.arange(abs_count, device=target_device, dtype=torch.long) << 8).contiguous()
+    base_template = (grid.index_select(0, seed_idxs) - 0.25).contiguous()
+    base_sign_mask = (base_template < 0).to(dtype=torch.long).contiguous()
+    base_parity = (base_sign_mask.sum(dim=-1) & 1).to(dtype=torch.long).contiguous()
+    base_abs = base_template.abs().contiguous()
+    base_sqnorm = base_abs.square().sum(dim=-1).contiguous()
+    base_abs_sq = base_abs.square().contiguous()
+
+    full_idxs = torch.arange(grid.shape[0], device=target_device, dtype=torch.long)
+    abs_idx = (full_idxs >> 8).contiguous()
+    raw_sign = (full_idxs & 255).contiguous()
+    branch = _e8p12_sign_parity(raw_sign)
+    branch_offsets = torch.tensor([0.25, -0.25], dtype=torch.float32, device=target_device)
+    offset = branch_offsets.index_select(0, branch).unsqueeze(-1)
+    residual = grid - offset
+    total_sign_bits = (residual < 0).to(dtype=torch.long)
+    sign_id_total = (total_sign_bits * bit_values.view(1, codesz)).sum(dim=-1)
+
+    idx_lut = torch.full((2, abs_count, 1 << codesz), -1, dtype=torch.long, device=target_device)
+    idx_lut[branch, abs_idx, sign_id_total] = full_idxs
+
+    expected_abs = base_abs.index_select(0, abs_idx)
+    if not torch.allclose(residual.abs(), expected_abs, atol=1e-6, rtol=1e-6):
+        raise RuntimeError("failed to reconstruct E8P12 abs base patterns from current codebook grid.")
+
+    sign_parity = _e8p12_sign_parity(torch.arange(1 << codesz, device=target_device, dtype=torch.long))
+    expected_valid = sign_parity.view(1, 1, -1) == base_parity.view(1, abs_count, 1)
+    if not torch.all(idx_lut[expected_valid.expand(2, -1, -1)] >= 0):
+        raise RuntimeError("missing valid sign entries in E8P12 factor cache.")
+    if not torch.all(idx_lut[~expected_valid.expand(2, -1, -1)] < 0):
+        raise RuntimeError("unexpected invalid sign entries in E8P12 factor cache.")
+
+    cache = {
+        "device": target_device,
+        "codesz": torch.tensor(codesz, device=target_device),
+        "abs_count": torch.tensor(abs_count, device=target_device),
+        "base_sign_mask": base_sign_mask,
+        "base_parity": base_parity,
+        "base_abs": base_abs,
+        "base_abs_sq": base_abs_sq,
+        "base_sqnorm": base_sqnorm,
+        "idx_lut": idx_lut,
+        "valid_even_sign": valid_even_sign,
+        "bit_values": bit_values,
+        "branch_offsets": branch_offsets,
+    }
+    setattr(cb, "_mpgq_factor_cache", cache)
+    return cache
+
+
+@torch.inference_mode()
+def _branch_factorized_stats(
+    *,
+    y_branch: torch.Tensor,  # (N, 8)
+    gamma_flat: torch.Tensor,  # (N, 1) or (N, 8)
+    offset: float,
+    branch_idx: int,
+    cache: Dict[str, torch.Tensor],
+    need_stats: bool,
+) -> Dict[str, torch.Tensor]:
+    base_abs = cache["base_abs"]
+    base_abs_sq = cache["base_abs_sq"]
+    base_sqnorm = cache["base_sqnorm"]
+    base_parity = cache["base_parity"]
+    bit_values = cache["bit_values"]
+    idx_lut_branch = cache["idx_lut"][branch_idx]
+
+    n_items = int(y_branch.shape[0])
+    n_bases = int(base_abs.shape[0])
+    codesz = int(base_abs.shape[1])
+    device = y_branch.device
+    dtype = y_branch.dtype
+
+    if gamma_flat.ndim != 2:
+        raise ValueError(f"expected gamma_flat with shape (N,1) or (N,8), got {tuple(gamma_flat.shape)}")
+
+    if gamma_flat.shape[1] == 1:
+        gamma_eff = gamma_flat.view(n_items, 1, 1)
+    else:
+        gamma_eff = gamma_flat.view(n_items, 1, codesz)
+
+    a = gamma_eff * y_branch.view(n_items, 1, codesz) * base_abs.view(1, n_bases, codesz)
+    y_norm = y_branch.square().sum(dim=-1, keepdim=True)
+    const = -0.5 * gamma_flat[:, :1] * (y_norm + base_sqnorm.view(1, n_bases))
+    parity_mask = (base_parity.view(1, n_bases) == 0)
+
+    logC = torch.logaddexp(a, -a).sum(dim=-1)
+    t = torch.tanh(a)
+    t_eps = 1e-7 if t.dtype == torch.float32 else 1e-12
+    t_safe = t.clamp(min=-1.0 + t_eps, max=1.0 - t_eps)
+    log_abs_prod_t = torch.log(t_safe.abs().clamp_min(t_eps)).sum(dim=-1)
+    sign_prod_neg = ((t_safe < 0).sum(dim=-1) & 1).bool()
+    prod_abs_t = torch.exp(log_abs_prod_t)
+    prod_t = torch.where(sign_prod_neg, -prod_abs_t, prod_abs_t)
+    one = torch.ones_like(prod_t)
+
+    def _log1mexp(x: torch.Tensor) -> torch.Tensor:
+        cutoff = -math.log(2.0)
+        return torch.where(
+            x < cutoff,
+            torch.log1p(-torch.exp(x)),
+            torch.log(-torch.expm1(x)),
+        )
+
+    log_one_plus_prod = torch.where(
+        sign_prod_neg,
+        _log1mexp(log_abs_prod_t),
+        torch.logaddexp(torch.zeros_like(log_abs_prod_t), log_abs_prod_t),
+    )
+    log_one_minus_prod = torch.where(
+        sign_prod_neg,
+        torch.logaddexp(torch.zeros_like(log_abs_prod_t), log_abs_prod_t),
+        _log1mexp(log_abs_prod_t),
+    )
+    logZ_even = logC + log_one_plus_prod - math.log(2.0)
+    logZ_odd = logC + log_one_minus_prod - math.log(2.0)
+    logZ_sign = torch.where(parity_mask, logZ_even, logZ_odd)
+
+    prefix = []
+    acc = one
+    for coord in range(codesz):
+        prefix.append(acc)
+        acc = acc * t_safe[:, :, coord]
+
+    sign_mean = torch.empty((n_items, n_bases, codesz), dtype=dtype, device=device)
+    suffix = one
+    denom_even = one + prod_t
+    denom_odd = one - prod_t
+    denom_eps = 1e-12
+    denom_even_safe = torch.where(denom_even.abs() > denom_eps, denom_even, torch.ones_like(denom_even))
+    denom_odd_safe = torch.where(denom_odd.abs() > denom_eps, denom_odd, torch.ones_like(denom_odd))
+    for coord in reversed(range(codesz)):
+        t_coord = t_safe[:, :, coord]
+        excl_prod = prefix[coord] * suffix
+        even_mean = (t_coord + excl_prod) / denom_even_safe
+        odd_mean = (t_coord - excl_prod) / denom_odd_safe
+        sign_mean[:, :, coord] = torch.where(parity_mask, even_mean, odd_mean)
+        suffix = suffix * t_coord
+    sign_mean = torch.nan_to_num(sign_mean, nan=0.0, posinf=0.0, neginf=0.0)
+
+    mu_core = sign_mean * base_abs.view(1, n_bases, codesz)
+    mu_component = mu_core + float(offset)
+    second_component = (
+        base_sqnorm.view(1, n_bases)
+        + codesz * (float(offset) ** 2)
+        + 2.0 * float(offset) * mu_core.sum(dim=-1)
+    )
+    log_component = const + logZ_sign
+
+    abs_a = a.abs()
+    sum_abs = abs_a.sum(dim=-1)
+    best_sign_bits = (a < 0)
+    best_parity = (best_sign_bits.to(dtype=torch.long).sum(dim=-1) & 1)
+    min_pos = abs_a.argmin(dim=-1)
+    min_abs = abs_a.gather(-1, min_pos.unsqueeze(-1)).squeeze(-1)
+    mismatch = best_parity != base_parity.view(1, n_bases)
+    best_sign_id = (best_sign_bits.to(dtype=torch.long) * bit_values.view(1, 1, codesz)).sum(dim=-1)
+    min_bit = bit_values[min_pos]
+    best_sign_id = torch.where(mismatch, torch.bitwise_xor(best_sign_id, min_bit), best_sign_id)
+    best_linear = sum_abs - 2.0 * mismatch.to(dtype=dtype) * min_abs
+    best_logscore = const + best_linear
+
+    base_ids = torch.arange(n_bases, device=device, dtype=torch.long).view(1, n_bases).expand(n_items, -1)
+    map_idx = idx_lut_branch[base_ids, best_sign_id]
+    if not torch.all(map_idx >= 0):
+        raise RuntimeError("failed to map factorized E8P12 MAP sign patterns back to full codebook indices.")
+
+    out = {
+        "log_component": log_component,
+        "mu_component": mu_component,
+        "second_component": second_component,
+        "best_logscore": best_logscore,
+        "best_idx": map_idx,
+    }
+    if need_stats:
+        second_abs = abs_a.clone()
+        second_abs.scatter_(-1, min_pos.unsqueeze(-1), float("inf"))
+        second_min_abs = second_abs.min(dim=-1).values
+        second_linear = torch.where(
+            mismatch,
+            sum_abs - 2.0 * second_min_abs,
+            sum_abs - 2.0 * (min_abs + second_min_abs),
+        )
+        out["second_logscore"] = const + second_linear
+        sign_entropy = torch.where(
+            torch.isfinite(logZ_sign),
+            (logZ_sign - (a * sign_mean).sum(dim=-1)).clamp_min_(0.0),
+            torch.zeros_like(logZ_sign),
+        )
+        out["sign_entropy"] = sign_entropy
+    return out
+
+
+@torch.inference_mode()
+def vamp_vector_discrete_mmse_e8p12(
+    *,
+    r1_blocks: torch.Tensor,  # (B, n_blocks, 8)
+    gamma1: torch.Tensor,  # (B, 1) or (B, n_blocks, 1) or (B, n_blocks, 8)
+    cb: object,
+    blocks_per_chunk: int = 64,
+    need_stats: bool = False,
+    need_var_diag: bool = False,
+    prior_center_blocks: Optional[torch.Tensor] = None,
+    prior_scale_blocks: Optional[torch.Tensor] = None,
+    prior_tau: float = 0.0,
+    prior_tau_scale_mode: str = "absmax",
+) -> Dict[str, torch.Tensor | float]:
+    batch, n_blocks, codesz = r1_blocks.shape
+    if int(codesz) != 8:
+        raise ValueError(f"E8P12 posterior expects codesz=8, got {codesz}.")
+
+    r1_work = r1_blocks
+    gamma_blocks = None
+    if float(prior_tau) > 0.0 and prior_center_blocks is not None:
+        scale_blocks = prior_scale_blocks
+        if scale_blocks is None:
+            scale_blocks = prior_scale_from_center(prior_center_blocks, prior_tau_scale_mode)
+        assert scale_blocks is not None
+        scale_blocks = scale_blocks.to(dtype=torch.float32, device=r1_blocks.device).clamp_min_(1e-12)
+        tau2 = (max(float(prior_tau), 1e-12) * scale_blocks).square()
+        prior_prec = 1.0 / tau2
+        if gamma1.ndim == 2:
+            gamma_base = gamma1.unsqueeze(1).expand(batch, n_blocks, 1).to(dtype=torch.float32)
+        elif gamma1.ndim == 3:
+            gamma_base = gamma1.to(dtype=torch.float32)
+            if gamma_base.shape[-1] not in (1, codesz):
+                raise ValueError(f"expected gamma1 last dim in {{1,{codesz}}}, got {tuple(gamma1.shape)}")
+        else:
+            raise ValueError(f"expected gamma1 with ndim in {{2,3}}, got {tuple(gamma1.shape)}")
+        gamma_blocks = gamma_base + prior_prec
+        r1_work = (
+            gamma_base * r1_blocks.to(dtype=torch.float32)
+            + prior_prec * prior_center_blocks.to(dtype=torch.float32)
+        ) / gamma_blocks
+        r1_work = r1_work.to(dtype=r1_blocks.dtype)
+
+    blocks_per_chunk = resolve_factorized_blocks_per_chunk(batch, n_blocks, blocks_per_chunk, r1_blocks.device)
+    cache = get_e8p12_factor_cache(cb, device=r1_blocks.device)
+    branch_offsets = cache["branch_offsets"]
+    base_abs_sq = cache["base_abs_sq"]
+
+    x1_blocks = torch.empty_like(r1_blocks)
+    var1 = torch.empty(batch, n_blocks, dtype=torch.float32, device=r1_blocks.device)
+    var1_diag = (
+        torch.empty(batch, n_blocks, codesz, dtype=torch.float32, device=r1_blocks.device)
+        if bool(need_var_diag)
+        else None
+    )
+    map_idxs = torch.empty(batch, n_blocks, dtype=torch.long, device=r1_blocks.device)
+    map_vals = torch.empty_like(r1_blocks)
+    entropy_values = []
+    margin_values = []
+
+    high_gamma_snap = 1e3
+
+    for bstart in range(0, n_blocks, blocks_per_chunk):
+        bend = min(bstart + blocks_per_chunk, n_blocks)
+        chunk_size = bend - bstart
+        r1_chunk = r1_work[:, bstart:bend, :]
+        r1_flat = r1_chunk.reshape(batch * chunk_size, codesz).to(dtype=torch.float32)
+
+        if gamma_blocks is None:
+            if gamma1.ndim == 2:
+                gamma_flat = (
+                    gamma1.unsqueeze(1)
+                    .expand(batch, chunk_size, 1)
+                    .reshape(batch * chunk_size, 1)
+                    .to(dtype=torch.float32)
+                )
+            else:
+                gamma_src = gamma1[:, bstart:bend, :]
+                if gamma_src.shape[-1] not in (1, codesz):
+                    raise ValueError(f"expected gamma1 last dim in {{1,{codesz}}}, got {tuple(gamma1.shape)}")
+                gamma_flat = gamma_src.reshape(batch * chunk_size, gamma_src.shape[-1]).to(dtype=torch.float32)
+        else:
+            gamma_src = gamma_blocks[:, bstart:bend, :]
+            gamma_flat = gamma_src.reshape(batch * chunk_size, gamma_src.shape[-1]).to(dtype=torch.float32)
+
+        branch_outputs = []
+        for branch_idx, offset in enumerate(branch_offsets.tolist()):
+            y_branch = r1_flat - float(offset)
+            branch_outputs.append(
+                _branch_factorized_stats(
+                    y_branch=y_branch,
+                    gamma_flat=gamma_flat,
+                    offset=float(offset),
+                    branch_idx=int(branch_idx),
+                    cache=cache,
+                    need_stats=need_stats,
+                )
+            )
+
+        log_component = torch.stack([out["log_component"] for out in branch_outputs], dim=1)
+        log_weights = log_component - torch.logsumexp(
+            log_component.reshape(batch * chunk_size, -1), dim=-1, keepdim=True
+        ).view(batch * chunk_size, 1, 1)
+        weights = torch.exp(log_weights)
+
+        mu = torch.zeros((batch * chunk_size, codesz), dtype=torch.float32, device=r1_blocks.device)
+        second_moment = torch.zeros((batch * chunk_size,), dtype=torch.float32, device=r1_blocks.device)
+        var_diag = None
+
+        if bool(need_var_diag):
+            second_moment_diag = torch.zeros((batch * chunk_size, codesz), dtype=torch.float32, device=r1_blocks.device)
+            for branch_idx, offset in enumerate(branch_offsets.tolist()):
+                w_branch = weights[:, branch_idx, :]
+                mu_comp = branch_outputs[branch_idx]["mu_component"]
+                mu_branch = (w_branch.unsqueeze(-1) * mu_comp).sum(dim=1)
+                mu += mu_branch
+                second_moment += (w_branch * branch_outputs[branch_idx]["second_component"]).sum(dim=1)
+                base_abs_sq_weighted = w_branch.matmul(base_abs_sq)
+                w_sum = w_branch.sum(dim=1, keepdim=True)
+                second_moment_diag += base_abs_sq_weighted - float(offset) ** 2 * w_sum + 2.0 * float(offset) * mu_branch
+            var_diag = (second_moment_diag - mu.square()).clamp_min_(0.0)
+            block_var = var_diag.mean(dim=-1)
+        else:
+            for branch_idx, _offset in enumerate(branch_offsets.tolist()):
+                w_branch = weights[:, branch_idx, :]
+                mu_comp = branch_outputs[branch_idx]["mu_component"]
+                mu += (w_branch.unsqueeze(-1) * mu_comp).sum(dim=1)
+                second_moment += (w_branch * branch_outputs[branch_idx]["second_component"]).sum(dim=1)
+            block_var = ((second_moment - mu.square().sum(dim=-1)) / float(codesz)).clamp_min_(0.0)
+
+        best_logscore = torch.stack([out["best_logscore"] for out in branch_outputs], dim=1)
+        best_flat = best_logscore.reshape(batch * chunk_size, -1)
+        best_pos = best_flat.argmax(dim=-1)
+        best_branch = torch.div(best_pos, int(cache["abs_count"].item()), rounding_mode="floor")
+        best_abs = best_pos % int(cache["abs_count"].item())
+        map_idx_per_branch = torch.stack([out["best_idx"] for out in branch_outputs], dim=1)
+        map_idx = map_idx_per_branch[torch.arange(batch * chunk_size, device=r1_blocks.device), best_branch, best_abs]
+        map_val_flat = cb.grid.index_select(0, map_idx).to(dtype=torch.float32)
+
+        if gamma_flat.shape[1] == 1:
+            high_gamma_mask = gamma_flat.squeeze(-1) >= high_gamma_snap
+        else:
+            high_gamma_mask = gamma_flat.min(dim=-1).values >= high_gamma_snap
+        if bool(high_gamma_mask.any().item()):
+            mu[high_gamma_mask] = map_val_flat[high_gamma_mask]
+            block_var[high_gamma_mask] = 0.0
+            if var_diag is not None:
+                var_diag[high_gamma_mask] = 0.0
+
+        map_val = map_val_flat.view(batch, chunk_size, codesz).to(dtype=r1_blocks.dtype)
+        x1_blocks[:, bstart:bend, :] = mu.view(batch, chunk_size, codesz).to(dtype=r1_blocks.dtype)
+        var1[:, bstart:bend] = block_var.view(batch, chunk_size)
+        if var1_diag is not None and var_diag is not None:
+            var1_diag[:, bstart:bend, :] = var_diag.view(batch, chunk_size, codesz)
+        map_idxs[:, bstart:bend] = map_idx.view(batch, chunk_size)
+        map_vals[:, bstart:bend, :] = map_val
+
+        if need_stats:
+            sign_entropy = torch.stack([out["sign_entropy"] for out in branch_outputs], dim=1)
+            weight_log_term = torch.where(
+                torch.isfinite(log_weights), weights * log_weights, torch.zeros_like(log_weights)
+            )
+            entropy = (-(weight_log_term).sum(dim=(1, 2)) + (weights * sign_entropy).sum(dim=(1, 2))).mean()
+            entropy_values.append(float(entropy.item()))
+
+            second_logscore = torch.stack([out["second_logscore"] for out in branch_outputs], dim=1)
+            top_candidates = torch.stack([best_logscore, second_logscore], dim=-1).reshape(batch * chunk_size, -1)
+            top2 = torch.topk(top_candidates, k=min(2, top_candidates.shape[-1]), dim=-1).values
+            if top2.shape[-1] == 1:
+                margin_values.append(float("inf"))
+            else:
+                margin_values.append(float((top2[:, 0] - top2[:, 1]).mean().item()))
+
+    if gamma1.ndim == 2:
+        alpha1 = gamma1.to(dtype=torch.float32) * var1.mean(dim=1, keepdim=True)
+    else:
+        if gamma1.shape[-1] == 1:
+            alpha1 = (gamma1.squeeze(-1).to(dtype=torch.float32) * var1).mean(dim=1, keepdim=True)
+        elif var1_diag is not None:
+            alpha1 = (gamma1.to(dtype=torch.float32) * var1_diag).mean(dim=(1, 2)).unsqueeze(-1)
+        else:
+            alpha1 = (gamma1[..., 0].to(dtype=torch.float32) * var1).mean(dim=1, keepdim=True)
+
+    return {
+        "x1_blocks": x1_blocks,
+        "var1": var1,
+        "var1_diag": var1_diag,
+        "map_idxs": map_idxs,
+        "map_vals": map_vals,
+        "alpha1": alpha1,
+        "entropy": float(sum(entropy_values) / len(entropy_values)) if entropy_values else 0.0,
+        "margin": float(sum(margin_values) / len(margin_values)) if margin_values else 0.0,
+    }
+
