@@ -129,6 +129,7 @@ def solve_uniform_rankspace_vamp(
     S: torch.Tensor,  # (R,)
     Vs: torch.Tensor,  # (n, R)
     cfg: UniformVampConfig,
+    obs_precision_init: Optional[float] = None,
     log_stats: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
     """Scalar uniform exact-full VAMP in rank space, with greedy polish.
@@ -172,7 +173,11 @@ def solve_uniform_rankspace_vamp(
     require_valid_precision("gamma1_init", gamma1)
 
     Y_u = W.matmul(Vs)
-    obs_precision_local = _resolve_obs_precision(W=W, x_init=x_rtn, Vs=Vs, requested=float(cfg.obs_precision))
+    if obs_precision_init is not None and float(obs_precision_init) > 0.0:
+        obs_precision_initial = float(obs_precision_init)
+    else:
+        obs_precision_initial = _resolve_obs_precision(W=W, x_init=x_rtn, Vs=Vs, requested=float(cfg.obs_precision))
+    obs_precision_local = float(obs_precision_initial)
 
     q_rtn_int = nearest_atom_idx(x=x_rtn, scale_full=scale_full, zero_full=zero_full, maxq=maxq).to(dtype=torch.int32)
     best_q_final = q_rtn_int.clone()
@@ -453,7 +458,7 @@ def solve_uniform_rankspace_vamp(
         "adaptive_accept_tol": float(adaptive_accept_tol),
         "adaptive_damping_min": float(adaptive_damping_min),
         "adaptive_obs_precision_backoff": float(adaptive_obs_backoff),
-        "obs_precision_initial": float(obs_precision_local) if not obs_precision_values else float(obs_precision_values[0]),
+        "obs_precision_initial": float(obs_precision_initial),
         "obs_precision_final": float(obs_precision_local),
         "obs_precision_mean": float(sum(obs_precision_values) / len(obs_precision_values)) if obs_precision_values else float(obs_precision_local),
         "iter_residuals": iter_residuals,
@@ -487,6 +492,7 @@ def solve_e8p12_rankspace_vamp(
     Vs: torch.Tensor,  # (n, R)
     cfg: E8P12VampConfig,
     module_name: str = "",
+    obs_precision_init: Optional[float] = None,
     log_stats: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
     """E8P12 exact-full VAMP in rank space, with greedy gram polish."""
@@ -515,7 +521,12 @@ def solve_e8p12_rankspace_vamp(
         prior_scale_blocks = prior_scale_from_center(W_blocks, prior_tau_scale_mode)
 
     Y_u = Wr.matmul(Vs)
-    obs_precision_start = _resolve_obs_precision(W=Wr, x_init=hatWr_init, Vs=Vs, requested=float(cfg.obs_precision))
+    if float(cfg.obs_precision) > 0.0:
+        obs_precision_start = float(cfg.obs_precision)
+    elif obs_precision_init is not None and float(obs_precision_init) > 0.0:
+        obs_precision_start = float(obs_precision_init)
+    else:
+        obs_precision_start = _resolve_obs_precision(W=Wr, x_init=hatWr_init, Vs=Vs, requested=float(cfg.obs_precision))
     obs_precision_end = cfg.obs_precision_end if float(cfg.obs_precision) > 0.0 else None
     obs_precision_local = float(obs_precision_start)
     em_obs_active = bool(cfg.em_obs_precision) and float(cfg.obs_precision) <= 0.0
@@ -834,4 +845,3 @@ def solve_e8p12_rankspace_vamp(
         "rankspace_error_mean": float(final_err.mean().item()) if final_err.numel() else 0.0,
     }
     return final_hatWr, final_Qidxs, final_err, stats
-

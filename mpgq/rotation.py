@@ -250,6 +250,60 @@ def is_pow2(n):
     return (n & (n - 1) == 0) and (n > 0)
 
 
+@torch.inference_mode()
+def sample_hadamard_signs(
+    *,
+    width: int,
+    key: str,
+    seed: int = 0,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    try:
+        get_hadK(int(width))
+    except AssertionError as exc:
+        raise ValueError(f"hadamard rotation requires supported width; got width={width}.") from exc
+
+    from .utils import stable_seed
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(stable_seed(str(key), base_seed=int(seed)))
+    signs = torch.randint(0, 2, (int(width),), generator=generator, dtype=torch.int64)
+    signs = signs.to(dtype=torch.float32).mul_(2.0).sub_(1.0)
+    return signs.to(device=device, dtype=dtype, non_blocking=False)
+
+
+@torch.inference_mode()
+def apply_exact_hadamard(
+    matrix: torch.Tensor,
+    *,
+    transpose: bool = False,
+) -> torch.Tensor:
+    width = int(matrix.shape[-1])
+    hadK, K = get_hadK(width, transpose=bool(transpose))
+    matrix = matrix.to(dtype=torch.float32).contiguous()
+
+    if matrix.is_cuda:
+        try:
+            return matmul_hadU_cuda(matrix, hadK, K).contiguous()
+        except Exception as exc:
+            log.debug("Hadamard CUDA path failed; falling back to torch implementation: %s", exc)
+
+    if transpose:
+        return matmul_hadUt(matrix).contiguous()
+    return matmul_hadU(matrix).contiguous()
+
+
+@torch.inference_mode()
+def apply_right_hadamard(matrix: torch.Tensor, *, signs: torch.Tensor) -> torch.Tensor:
+    return apply_exact_hadamard(matrix.to(dtype=torch.float32) * signs.view(1, -1)).contiguous()
+
+
+@torch.inference_mode()
+def apply_right_hadamard_inverse(matrix: torch.Tensor, *, signs: torch.Tensor) -> torch.Tensor:
+    return (apply_exact_hadamard(matrix.to(dtype=torch.float32), transpose=True) * signs.view(1, -1)).contiguous()
+
+
 # hadamard matrices for had12, had36.pal2, had52,will,
 # # had60.pal, had108.pal, had140.pal, had156.will, had172.will:
 # http://www.neilsloane.com/hadamard/index.html
