@@ -1,0 +1,235 @@
+diff --git a/pyproject.toml b/pyproject.toml
+new file mode 100644
+index 0000000..a73a047
+--- /dev/null
++++ b/pyproject.toml
+@@ -0,0 +1,9 @@
++[build-system]
++requires = [
++    "setuptools>=64",
++    "wheel",
++    "packaging",
++    "ninja",
++    "torch",
++]
++build-backend = "setuptools.build_meta"
+diff --git a/setup.py b/setup.py
+index 942ebcf..fbff2bd 100644
+--- a/setup.py
++++ b/setup.py
+@@ -15,14 +15,6 @@ import urllib.request
+ import urllib.error
+ from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
+ 
+-import torch
+-from torch.utils.cpp_extension import (
+-    BuildExtension,
+-    CppExtension,
+-    CUDAExtension,
+-    CUDA_HOME,
+-)
+-
+ 
+ with open("README.md", "r", encoding="utf-8") as fh:
+     long_description = fh.read()
+@@ -84,10 +76,47 @@ def check_if_cuda_home_none(global_option: str) -> None:
+ def append_nvcc_threads():
+     return ["--threads", os.getenv("NVCC_THREADS") or "4"]
+ 
++
++def _load_torch_build_tools():
++    import torch
++    from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
++
++    return torch, BuildExtension, CUDAExtension, CUDA_HOME
++
++
++def _is_metadata_only_invocation():
++    metadata_commands = {
++        "egg_info",
++        "dist_info",
++        "sdist",
++        "--name",
++        "--version",
++        "--fullname",
++        "--author",
++        "--author-email",
++        "--url",
++        "--license",
++        "--description",
++        "--long-description",
++        "--classifiers",
++        "--keywords",
++        "--platforms",
++        "--help",
++        "--help-commands",
++    }
++    return any(arg in metadata_commands for arg in sys.argv[1:])
++
++
+ cmdclass = {}
+ ext_modules = []
++BuildExtension = None
++METADATA_ONLY = _is_metadata_only_invocation()
++CAN_BUILD_EXTENSION = False
++
++if not SKIP_CUDA_BUILD and not METADATA_ONLY:
++    torch, BuildExtension, CUDAExtension, CUDA_HOME = _load_torch_build_tools()
+ 
+-if not SKIP_CUDA_BUILD:
++if not SKIP_CUDA_BUILD and not METADATA_ONLY:
+     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
+     TORCH_MAJOR = int(torch.__version__.split(".")[0])
+     TORCH_MINOR = int(torch.__version__.split(".")[1])
+@@ -103,67 +132,66 @@ if not SKIP_CUDA_BUILD:
+                 "Note: make sure nvcc has a supported version by running nvcc -V."
+             )
+ 
+-    cc_flag.append("-gencode")
+-    cc_flag.append("arch=compute_75,code=sm_75")
+-    cc_flag.append("-gencode")
+-    cc_flag.append("arch=compute_80,code=sm_80")
+-    cc_flag.append("-gencode")
+-    cc_flag.append("arch=compute_87,code=sm_87")
+-    if bare_metal_version >= Version("11.8"):
+-        cc_flag.append("-gencode")
+-        cc_flag.append("arch=compute_90,code=sm_90")
+-    if bare_metal_version >= Version("12.8"):
+-        cc_flag.append("-gencode")
+-        cc_flag.append("arch=compute_100,code=sm_100")
+-        cc_flag.append("-gencode")
+-        cc_flag.append("arch=compute_120,code=sm_120")
+-    if bare_metal_version >= Version("13.0"):
+-        cc_flag.append("-gencode")
+-        cc_flag.append("arch=compute_103,code=sm_103")
+-        cc_flag.append("-gencode")
+-        cc_flag.append("arch=compute_110,code=sm_110")
+-        cc_flag.append("-gencode")
+-        cc_flag.append("arch=compute_121,code=sm_121")
+-
+-
+     # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
+     # torch._C._GLIBCXX_USE_CXX11_ABI
+     # https://github.com/pytorch/pytorch/blob/8472c24e3b5b60150096486616d98b7bea01500b/torch/utils/cpp_extension.py#L920
+     if FORCE_CXX11_ABI:
+         torch._C._GLIBCXX_USE_CXX11_ABI = True
+ 
+-    ext_modules.append(
+-        CUDAExtension(
+-            name="fast_hadamard_transform_cuda",
+-            sources=[
+-                "csrc/fast_hadamard_transform.cpp",
+-                "csrc/fast_hadamard_transform_cuda.cu",
+-            ],
+-            extra_compile_args={
+-                "cxx": ["-O3"],
+-                "nvcc":
+-                    [
+-                        "-O3",
+-                        "-U__CUDA_NO_HALF_OPERATORS__",
+-                        "-U__CUDA_NO_HALF_CONVERSIONS__",
+-                        "-U__CUDA_NO_BFLOAT16_OPERATORS__",
+-                        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+-                        "-U__CUDA_NO_BFLOAT162_OPERATORS__",
+-                        "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
+-                        "--expt-relaxed-constexpr",
+-                        "--expt-extended-lambda",
+-                        "--use_fast_math",
+-                        "--ptxas-options=-v",
+-                        "-lineinfo",
+-                    ]
+-                    + append_nvcc_threads()
+-                    + cc_flag,
+-            },
+-            include_dirs=[this_dir],
++    if CUDA_HOME is not None:
++        CAN_BUILD_EXTENSION = True
++        cc_flag.append("-gencode")
++        cc_flag.append("arch=compute_75,code=sm_75")
++        cc_flag.append("-gencode")
++        cc_flag.append("arch=compute_80,code=sm_80")
++        cc_flag.append("-gencode")
++        cc_flag.append("arch=compute_87,code=sm_87")
++        if bare_metal_version >= Version("11.8"):
++            cc_flag.append("-gencode")
++            cc_flag.append("arch=compute_90,code=sm_90")
++        if bare_metal_version >= Version("12.8"):
++            cc_flag.append("-gencode")
++            cc_flag.append("arch=compute_100,code=sm_100")
++            cc_flag.append("-gencode")
++            cc_flag.append("arch=compute_120,code=sm_120")
++        if bare_metal_version >= Version("13.0"):
++            cc_flag.append("-gencode")
++            cc_flag.append("arch=compute_103,code=sm_103")
++            cc_flag.append("-gencode")
++            cc_flag.append("arch=compute_110,code=sm_110")
++            cc_flag.append("-gencode")
++            cc_flag.append("arch=compute_121,code=sm_121")
++
++        ext_modules.append(
++            CUDAExtension(
++                name="fast_hadamard_transform_cuda",
++                sources=[
++                    "csrc/fast_hadamard_transform.cpp",
++                    "csrc/fast_hadamard_transform_cuda.cu",
++                ],
++                extra_compile_args={
++                    "cxx": ["-O3"],
++                    "nvcc":
++                        [
++                            "-O3",
++                            "-U__CUDA_NO_HALF_OPERATORS__",
++                            "-U__CUDA_NO_HALF_CONVERSIONS__",
++                            "-U__CUDA_NO_BFLOAT16_OPERATORS__",
++                            "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
++                            "-U__CUDA_NO_BFLOAT162_OPERATORS__",
++                            "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
++                            "--expt-relaxed-constexpr",
++                            "--expt-extended-lambda",
++                            "--use_fast_math",
++                            "--ptxas-options=-v",
++                            "-lineinfo",
++                        ]
++                        + append_nvcc_threads()
++                        + cc_flag,
++                },
++                include_dirs=[this_dir],
++            )
+         )
+-    )
+-
+-
+ def get_package_version():
+     with open(Path(this_dir) / "fast_hadamard_transform" / "__init__.py", "r") as f:
+         version_match = re.search(r"^__version__\s*=\s*(.*)$", f.read(), re.MULTILINE)
+@@ -179,6 +207,7 @@ def get_wheel_url():
+     # Determine the version numbers that will be used to determine the correct wheel
+     # We're using the CUDA version used to build torch, not the one currently installed
+     # _, cuda_version_raw = get_cuda_bare_metal_version(CUDA_HOME)
++    torch, _, _, _ = _load_torch_build_tools()
+     torch_cuda_version = parse(torch.version.cuda)
+     torch_version_raw = parse(torch.__version__)
+     # For CUDA 11, we only compile for CUDA 11.8, and for CUDA 12 we only compile for CUDA 12.2
+@@ -210,6 +239,10 @@ class CachedWheelsCommand(_bdist_wheel):
+ 
+     def run(self):
+         if FORCE_BUILD:
++            if not CAN_BUILD_EXTENSION:
++                raise RuntimeError(
++                    "FAST_HADAMARD_TRANSFORM_FORCE_BUILD=TRUE requires a local CUDA toolkit with nvcc."
++                )
+             return super().run()
+ 
+         wheel_url, wheel_filename = get_wheel_url()
+@@ -232,6 +265,11 @@ class CachedWheelsCommand(_bdist_wheel):
+         except urllib.error.HTTPError:
+             print("Precompiled wheel not found. Building from source...")
+             # If the wheel could not be downloaded, build from source
++            if not CAN_BUILD_EXTENSION:
++                raise RuntimeError(
++                    "Precompiled wheel not found and nvcc is unavailable. Install a CUDA toolkit or use an "
++                    "environment matching an available prebuilt wheel."
++                )
+             super().run()
+ 
+ 

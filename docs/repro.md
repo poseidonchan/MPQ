@@ -2,6 +2,18 @@
 
 This repo enforces two quality gates:
 
+## Prereq: fast_hadamard_transform (recommended)
+
+On new GPUs (e.g. SM 12.0 / RTX 5090), you typically need to **build from source**.
+We vendor `fast-hadamard-transform` as a pinned submodule and patch it for robust installs.
+
+Install (inside the target conda env):
+```bash
+python patches/apply_patches.py
+FAST_HADAMARD_TRANSFORM_FORCE_BUILD=TRUE \
+  python -m pip install --no-build-isolation -v third_party/fast-hadamard-transform
+```
+
 ## Gate A (GPTQModel, 4-bit Qwen 0.6B)
 - Target: MPGQ exact-full achieves ~22.1 PPL on Wikitext2 (±0.3).
 - Recipe: C4 token blocks 128×2048, seed=0, iters=10, tau=0.2, damping=0.5, polish=3, rotation=hadamard.

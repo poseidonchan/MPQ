@@ -114,7 +114,12 @@ def _load_fast_hadamard_transform(*, required: bool = True) -> bool:
         return True
     except ImportError as e:
         if required:
-            log.error("Package: Please install missing `fast_hadamard_transform` module via: `pip install -U git+https://github.com/Dao-AILab/fast-hadamard-transform.git --no-build-isolation -v`")
+            log.error(
+                "Missing optional dependency `fast_hadamard_transform`. Install from this repo:\n"
+                "  FAST_HADAMARD_TRANSFORM_FORCE_BUILD=TRUE python -m pip install --no-build-isolation -v third_party/fast-hadamard-transform\n"
+                "or from upstream:\n"
+                "  python -m pip install --no-build-isolation -v git+https://github.com/Dao-AILab/fast-hadamard-transform.git"
+            )
             raise e
         return False
 

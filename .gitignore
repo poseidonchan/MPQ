@@ -16,6 +16,7 @@ dist/
 # Local runs
 runs/
 logs/
+gptq_log_*.log
 
 # Editors
 .vscode/
@@ -24,4 +25,3 @@ logs/
 # Submodules build junk
 third_party/**/build/
 third_party/**/.cache/
-

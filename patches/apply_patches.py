@@ -15,6 +15,11 @@ SUBMODULES = {
         "expected_sha": "ed96f2e04ec868b04f969733a242ce3b5bb7cb1e",
         "patch": REPO_ROOT / "patches" / "gptqmodel.patch",
     },
+    "fast-hadamard-transform": {
+        "path": REPO_ROOT / "third_party" / "fast-hadamard-transform",
+        "expected_sha": "e7706faf8d1c3b9f241e36860640ad1dac644ede",
+        "patch": REPO_ROOT / "patches" / "fast_hadamard_transform.patch",
+    },
     "quip-sharp": {
         "path": REPO_ROOT / "third_party" / "quip-sharp",
         "expected_sha": "1d8f873e9a2a8b86b12bb1064c312c5689b77d98",
@@ -35,7 +40,7 @@ def _run(cmd: Sequence[str], *, cwd: pathlib.Path) -> subprocess.CompletedProces
 
 
 def _require_clean_worktree(path: pathlib.Path, *, name: str) -> None:
-    proc = _run(["git", "status", "--porcelain=v1"], cwd=path)
+    proc = _run(["git", "status", "--porcelain=v1", "--untracked-files=no"], cwd=path)
     if proc.returncode != 0:
         raise RuntimeError(f"{name}: failed to run git status:\n{proc.stdout}")
     if proc.stdout.strip():
