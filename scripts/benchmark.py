@@ -123,25 +123,20 @@ def main() -> None:
     parser.add_argument("--scale-override", type=float, default=0.9)
     parser.add_argument("--hessian-batch-size", type=int, default=2)
     parser.add_argument("--force-hessians", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--wmpq-init", type=str, default="random", choices=["random", "rtn", "ldlq"])
-    parser.add_argument("--wmpq-iters", type=int, default=4)
-    parser.add_argument("--wmpq-damping", type=float, default=0.5)
-    parser.add_argument("--wmpq-prior-tau", type=float, default=0.0)
-    parser.add_argument("--wmpq-prior-tau-scale-mode", type=str, default="absmax", choices=["none", "absmax", "rms", "mean_abs"])
-    parser.add_argument("--wmpq-gamma-start", type=float, default=1.0)
-    parser.add_argument("--wmpq-gamma-retry-factor", type=float, default=4.0)
-    parser.add_argument("--wmpq-gamma-retry-steps", type=int, default=3)
-    parser.add_argument("--wmpq-obs-precision", type=float, default=0.0)
-    parser.add_argument("--wmpq-vamp-x1-mode", type=str, default="map", choices=["mean", "map", "mix"])
-    parser.add_argument("--wmpq-vamp-map-mix", type=float, default=0.5)
-    parser.add_argument("--wmpq-adaptive-accept-reject", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--wmpq-best-iterate-export", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--wmpq-blocks-per-chunk", type=int, default=16)
-    parser.add_argument("--wmpq-block-rows", type=int, default=32)
-    parser.add_argument("--wmpq-polish-sweeps", type=int, default=3)
-    parser.add_argument("--wmpq-polish-metric", type=str, default="gram", choices=["gram", "diag", "isotropic"])
-    parser.add_argument("--wmpq-polish-max-blocks", type=int, default=0)
-    parser.add_argument("--wmpq-metric-rows-per-chunk", type=int, default=0)
+    parser.add_argument("--mpgq-init", type=str, default="random", choices=["random", "rtn", "ldlq"])
+    parser.add_argument("--mpgq-prior-tau-scale-mode", type=str, default="absmax", choices=["none", "absmax", "rms", "mean_abs"])
+    parser.add_argument("--mpgq-gamma-start", type=float, default=1.0)
+    parser.add_argument("--mpgq-gamma-retry-factor", type=float, default=4.0)
+    parser.add_argument("--mpgq-gamma-retry-steps", type=int, default=3)
+    parser.add_argument("--mpgq-obs-precision", type=float, default=0.0)
+    parser.add_argument("--mpgq-vamp-x1-mode", type=str, default="map", choices=["mean", "map", "mix"])
+    parser.add_argument("--mpgq-vamp-map-mix", type=float, default=0.5)
+    parser.add_argument("--mpgq-adaptive-accept-reject", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--mpgq-best-iterate-export", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--mpgq-blocks-per-chunk", type=int, default=16)
+    parser.add_argument("--mpgq-polish-metric", type=str, default="gram", choices=["gram", "diag", "isotropic"])
+    parser.add_argument("--mpgq-polish-max-blocks", type=int, default=0)
+    parser.add_argument("--mpgq-metric-rows-per-chunk", type=int, default=0)
 
     # Orchestration
     parser.add_argument("--runs-dir", type=str, default="runs")
@@ -230,42 +225,43 @@ def main() -> None:
                     str(int(args.eval_max_eval_tokens)),
                     "--eval-datasets",
                     *list(args.eval_datasets),
-                    "--wmpq-init",
-                    str(args.wmpq_init),
-                    "--wmpq-iters",
-                    str(int(args.wmpq_iters)),
-                    "--wmpq-damping",
-                    str(float(args.wmpq_damping)),
-                    "--wmpq-prior-tau",
-                    str(float(args.wmpq_prior_tau)),
-                    "--wmpq-prior-tau-scale-mode",
-                    str(args.wmpq_prior_tau_scale_mode),
-                    "--wmpq-gamma-start",
-                    str(float(args.wmpq_gamma_start)),
-                    "--wmpq-gamma-retry-factor",
-                    str(float(args.wmpq_gamma_retry_factor)),
-                    "--wmpq-gamma-retry-steps",
-                    str(int(args.wmpq_gamma_retry_steps)),
-                    "--wmpq-obs-precision",
-                    str(float(args.wmpq_obs_precision)),
-                    "--wmpq-vamp-x1-mode",
-                    str(args.wmpq_vamp_x1_mode),
-                    "--wmpq-vamp-map-mix",
-                    str(float(args.wmpq_vamp_map_mix)),
-                    "--wmpq-adaptive-accept-reject" if bool(args.wmpq_adaptive_accept_reject) else "--no-wmpq-adaptive-accept-reject",
-                    "--wmpq-best-iterate-export" if bool(args.wmpq_best_iterate_export) else "--no-wmpq-best-iterate-export",
-                    "--wmpq-blocks-per-chunk",
-                    str(int(args.wmpq_blocks_per_chunk)),
-                    "--wmpq-block-rows",
-                    str(int(args.wmpq_block_rows)),
-                    "--wmpq-polish-sweeps",
-                    str(int(args.wmpq_polish_sweeps)),
-                    "--wmpq-polish-metric",
-                    str(args.wmpq_polish_metric),
-                    "--wmpq-polish-max-blocks",
-                    str(int(args.wmpq_polish_max_blocks)),
-                    "--wmpq-metric-rows-per-chunk",
-                    str(int(args.wmpq_metric_rows_per_chunk)),
+                    "--mpgq-init",
+                    str(args.mpgq_init),
+                    "--mpgq-iters",
+                    str(int(args.mpgq_iters)),
+                    "--mpgq-damping",
+                    str(float(args.mpgq_damping)),
+                    "--mpgq-prior-tau",
+                    str(float(args.mpgq_prior_tau)),
+                    "--mpgq-prior-tau-scale-mode",
+                    str(args.mpgq_prior_tau_scale_mode),
+                    "--mpgq-gamma-start",
+                    str(float(args.mpgq_gamma_start)),
+                    "--mpgq-gamma-retry-factor",
+                    str(float(args.mpgq_gamma_retry_factor)),
+                    "--mpgq-gamma-retry-steps",
+                    str(int(args.mpgq_gamma_retry_steps)),
+                    "--mpgq-obs-precision",
+                    str(float(args.mpgq_obs_precision)),
+                    "--mpgq-em-obs-precision" if bool(args.mpgq_em_obs_precision) else "--no-mpgq-em-obs-precision",
+                    "--mpgq-vamp-x1-mode",
+                    str(args.mpgq_vamp_x1_mode),
+                    "--mpgq-vamp-map-mix",
+                    str(float(args.mpgq_vamp_map_mix)),
+                    "--mpgq-adaptive-accept-reject" if bool(args.mpgq_adaptive_accept_reject) else "--no-mpgq-adaptive-accept-reject",
+                    "--mpgq-best-iterate-export" if bool(args.mpgq_best_iterate_export) else "--no-mpgq-best-iterate-export",
+                    "--mpgq-blocks-per-chunk",
+                    str(int(args.mpgq_blocks_per_chunk)),
+                    "--mpgq-block-rows",
+                    str(int(args.mpgq_block_rows)),
+                    "--mpgq-polish-sweeps",
+                    str(int(args.mpgq_polish_sweeps)),
+                    "--mpgq-polish-metric",
+                    str(args.mpgq_polish_metric),
+                    "--mpgq-polish-max-blocks",
+                    str(int(args.mpgq_polish_max_blocks)),
+                    "--mpgq-metric-rows-per-chunk",
+                    str(int(args.mpgq_metric_rows_per_chunk)),
                     "--output-dir",
                     str(method_dir),
                     "--json-out",

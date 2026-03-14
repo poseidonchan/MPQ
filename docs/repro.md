@@ -41,6 +41,6 @@ python scripts/benchmark.py \
   --methods quip quip+mpgq \
   --seeds 0 1 2 \
   --devset-size 128 --ctx-size 2048 --batch-size 16 --sample-proc 1 --scale-override 0.9 \
-  --wmpq-init random --wmpq-iters 4 --wmpq-damping 0.5 --wmpq-prior-tau 0.0 \
-  --wmpq-vamp-x1-mode map --wmpq-polish-sweeps 3 --wmpq-polish-metric gram
+  --mpgq-init random --mpgq-iters 4 --mpgq-damping 0.5 --mpgq-prior-tau 0.0 \
+  --mpgq-vamp-x1-mode map --mpgq-polish-sweeps 3 --mpgq-polish-metric gram
 ```

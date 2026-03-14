@@ -147,7 +147,7 @@ def mpgq_refine_codebook(
         raise ValueError(f"mpgq QUIP adapter expects E8P12 codesz=8; got codesz={codesz}, n={n}.")
     nblocks = n // codesz
 
-    init_mode = str(getattr(args, "mpgq_init", getattr(args, "wmpq_init", "random")) or "random").strip().lower()
+    init_mode = str(getattr(args, "mpgq_init", "random") or "random").strip().lower()
     seed = int(getattr(args, "seed", getattr(args, "mpgq_seed", 0)) or 0)
 
     if init_mode == "random":
@@ -176,11 +176,11 @@ def mpgq_refine_codebook(
     Vs = V * S.unsqueeze(0)
 
     # Warm-start obs precision from init mismatch in rank space, unless fixed.
-    requested_obs = float(getattr(args, "mpgq_obs_precision", getattr(args, "wmpq_obs_precision", 0.0)) or 0.0)
+    requested_obs = float(getattr(args, "mpgq_obs_precision", 0.0) or 0.0)
     if requested_obs > 0.0:
         obs_precision = requested_obs
     else:
-        block_rows = _resolve_block_rows(m, int(getattr(args, "mpgq_block_rows", getattr(args, "wmpq_block_rows", adapter_cfg.block_rows)) or adapter_cfg.block_rows))
+        block_rows = _resolve_block_rows(m, int(getattr(args, "mpgq_block_rows", adapter_cfg.block_rows) or adapter_cfg.block_rows))
         sum_sq = 0.0
         count = 0
         for row_start in range(0, m, block_rows):
@@ -193,41 +193,41 @@ def mpgq_refine_codebook(
         obs_precision = 1.0 / float(mse)
 
     vamp_cfg = E8P12VampConfig(
-        iters=int(getattr(args, "mpgq_iters", getattr(args, "wmpq_iters", 4)) or 4),
-        damping=float(getattr(args, "mpgq_damping", getattr(args, "wmpq_damping", 0.5)) or 0.5),
-        x1_mode=str(getattr(args, "mpgq_vamp_x1_mode", getattr(args, "wmpq_vamp_x1_mode", "map")) or "map"),
-        map_mix=float(getattr(args, "mpgq_vamp_map_mix", getattr(args, "wmpq_vamp_map_mix", 0.5)) or 0.5),
-        gamma_start=float(getattr(args, "mpgq_gamma_start", getattr(args, "wmpq_gamma_start", 1.0)) or 1.0),
-        gamma_retry_factor=float(getattr(args, "mpgq_gamma_retry_factor", getattr(args, "wmpq_gamma_retry_factor", 4.0)) or 4.0),
-        gamma_retry_steps=int(getattr(args, "mpgq_gamma_retry_steps", getattr(args, "wmpq_gamma_retry_steps", 3)) or 3),
-        prior_tau=float(getattr(args, "mpgq_prior_tau", getattr(args, "wmpq_prior_tau", 0.0)) or 0.0),
-        prior_tau_scale_mode=str(getattr(args, "mpgq_prior_tau_scale_mode", getattr(args, "wmpq_prior_tau_scale_mode", "absmax")) or "absmax"),
+        iters=int(getattr(args, "mpgq_iters", 4) or 4),
+        damping=float(getattr(args, "mpgq_damping", 0.5) or 0.5),
+        x1_mode=str(getattr(args, "mpgq_vamp_x1_mode", "map") or "map"),
+        map_mix=float(getattr(args, "mpgq_vamp_map_mix", 0.5) or 0.5),
+        gamma_start=float(getattr(args, "mpgq_gamma_start", 1.0) or 1.0),
+        gamma_retry_factor=float(getattr(args, "mpgq_gamma_retry_factor", 4.0) or 4.0),
+        gamma_retry_steps=int(getattr(args, "mpgq_gamma_retry_steps", 3) or 3),
+        prior_tau=float(getattr(args, "mpgq_prior_tau", 0.0) or 0.0),
+        prior_tau_scale_mode=str(getattr(args, "mpgq_prior_tau_scale_mode", "absmax") or "absmax"),
         obs_precision=float(requested_obs),
         obs_precision_end=(
             None
-            if getattr(args, "mpgq_obs_precision_end", getattr(args, "wmpq_obs_precision_end", None)) is None
-            else float(getattr(args, "mpgq_obs_precision_end", getattr(args, "wmpq_obs_precision_end", None)))
+            if getattr(args, "mpgq_obs_precision_end", None) is None
+            else float(getattr(args, "mpgq_obs_precision_end", None))
         ),
-        em_obs_precision=bool(getattr(args, "mpgq_em_obs_precision", getattr(args, "wmpq_em_obs_precision", True))),
-        em_obs_precision_damping=float(getattr(args, "mpgq_em_obs_precision_damping", getattr(args, "wmpq_em_obs_precision_damping", 0.3)) or 0.3),
-        em_obs_precision_min=float(getattr(args, "mpgq_em_obs_precision_min", getattr(args, "wmpq_em_obs_precision_min", 1e-4)) or 1e-4),
-        em_obs_precision_max=float(getattr(args, "mpgq_em_obs_precision_max", getattr(args, "wmpq_em_obs_precision_max", 1e8)) or 1e8),
-        best_iterate_export=bool(getattr(args, "mpgq_best_iterate_export", getattr(args, "wmpq_best_iterate_export", True))),
-        adaptive_accept_reject=bool(getattr(args, "mpgq_adaptive_accept_reject", getattr(args, "wmpq_adaptive_accept_reject", True))),
-        adaptive_retry_steps=int(getattr(args, "mpgq_adaptive_retry_steps", getattr(args, "wmpq_adaptive_retry_steps", 3)) or 3),
-        adaptive_accept_tol=float(getattr(args, "mpgq_adaptive_accept_tol", getattr(args, "wmpq_adaptive_accept_tol", 1e-4)) or 1e-4),
-        adaptive_damping_min=float(getattr(args, "mpgq_adaptive_damping_min", getattr(args, "wmpq_adaptive_damping_min", 0.1)) or 0.1),
-        adaptive_obs_precision_backoff=float(getattr(args, "mpgq_adaptive_obs_backoff", getattr(args, "wmpq_adaptive_obs_backoff", 0.5)) or 0.5),
-        blocks_per_chunk=int(getattr(args, "mpgq_blocks_per_chunk", getattr(args, "wmpq_blocks_per_chunk", 16)) or 16),
-        polish_sweeps=int(getattr(args, "mpgq_polish_sweeps", getattr(args, "wmpq_polish_sweeps", 3)) or 3),
-        polish_metric=str(getattr(args, "mpgq_polish_metric", getattr(args, "wmpq_polish_metric", "gram")) or "gram"),
-        polish_metric_rows_per_chunk=int(getattr(args, "mpgq_metric_rows_per_chunk", getattr(args, "wmpq_metric_rows_per_chunk", 0)) or 0),
-        polish_max_blocks=int(getattr(args, "mpgq_polish_max_blocks", getattr(args, "wmpq_polish_max_blocks", 0)) or 0),
+        em_obs_precision=bool(getattr(args, "mpgq_em_obs_precision", True)),
+        em_obs_precision_damping=float(getattr(args, "mpgq_em_obs_precision_damping", 0.3) or 0.3),
+        em_obs_precision_min=float(getattr(args, "mpgq_em_obs_precision_min", 1e-4) or 1e-4),
+        em_obs_precision_max=float(getattr(args, "mpgq_em_obs_precision_max", 1e8) or 1e8),
+        best_iterate_export=bool(getattr(args, "mpgq_best_iterate_export", True)),
+        adaptive_accept_reject=bool(getattr(args, "mpgq_adaptive_accept_reject", True)),
+        adaptive_retry_steps=int(getattr(args, "mpgq_adaptive_retry_steps", 3) or 3),
+        adaptive_accept_tol=float(getattr(args, "mpgq_adaptive_accept_tol", 1e-4) or 1e-4),
+        adaptive_damping_min=float(getattr(args, "mpgq_adaptive_damping_min", 0.1) or 0.1),
+        adaptive_obs_precision_backoff=float(getattr(args, "mpgq_adaptive_obs_backoff", 0.5) or 0.5),
+        blocks_per_chunk=int(getattr(args, "mpgq_blocks_per_chunk", 16) or 16),
+        polish_sweeps=int(getattr(args, "mpgq_polish_sweeps", 3) or 3),
+        polish_metric=str(getattr(args, "mpgq_polish_metric", "gram") or "gram"),
+        polish_metric_rows_per_chunk=int(getattr(args, "mpgq_metric_rows_per_chunk", 0) or 0),
+        polish_max_blocks=int(getattr(args, "mpgq_polish_max_blocks", 0) or 0),
     )
 
     block_rows = _resolve_block_rows(
         m,
-        int(getattr(args, "mpgq_block_rows", getattr(args, "wmpq_block_rows", adapter_cfg.block_rows)) or adapter_cfg.block_rows),
+        int(getattr(args, "mpgq_block_rows", adapter_cfg.block_rows) or adapter_cfg.block_rows),
     )
     final_hatWr = hatWr_init.clone()
     final_Qidxs = Qidxs_init.clone()
