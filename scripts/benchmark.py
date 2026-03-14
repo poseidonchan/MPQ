@@ -31,6 +31,10 @@ def _timestamp_id() -> str:
     return time.strftime("%Y%m%d_%H%M%S", time.localtime())
 
 
+def _sanitize_path_component(text: str) -> str:
+    return str(text).replace("/", "_").replace(":", "_")
+
+
 def _run_logged(cmd: List[str], *, log_path: Path, cwd: Path) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8") as fh:
@@ -90,6 +94,7 @@ def main() -> None:
     parser.add_argument("--calibration-seqlen", type=int, default=2048)
     parser.add_argument("--eval-seqlen", type=int, default=2048)
     parser.add_argument("--eval-max-eval-tokens", type=int, default=131072)
+    parser.add_argument("--eval-datasets", nargs="*", default=["wikitext2", "c4"])
 
     # MPGQ (GPTQ side) defaults (Gate A recipe)
     parser.add_argument("--mpgq-iters", type=int, default=10)
@@ -135,6 +140,7 @@ def main() -> None:
     parser.add_argument("--wmpq-block-rows", type=int, default=32)
     parser.add_argument("--wmpq-polish-sweeps", type=int, default=3)
     parser.add_argument("--wmpq-polish-metric", type=str, default="gram", choices=["gram", "diag", "isotropic"])
+    parser.add_argument("--wmpq-polish-max-blocks", type=int, default=0)
     parser.add_argument("--wmpq-metric-rows-per-chunk", type=int, default=0)
 
     # Orchestration
@@ -183,7 +189,7 @@ def main() -> None:
             log_path = method_dir / "run.log"
 
             if bits == 2:
-                hess_dir = seed_dir / "hess"
+                hess_dir = seed_dir / f"hess_{_sanitize_path_component(args.calibration_dataset)}_{_sanitize_path_component(args.calibration_split)}"
                 cmd = [
                     "conda",
                     "run",
@@ -199,6 +205,10 @@ def main() -> None:
                     str(int(seed)),
                     "--codebook",
                     str(args.codebook),
+                    "--calibration-dataset",
+                    str(args.calibration_dataset),
+                    "--calibration-split",
+                    str(args.calibration_split),
                     "--devset-size",
                     str(int(args.devset_size)),
                     "--ctx-size",
@@ -216,6 +226,10 @@ def main() -> None:
                     str(int(args.hessian_batch_size)),
                     "--eval-seqlen",
                     str(int(args.eval_seqlen)),
+                    "--eval-max-eval-tokens",
+                    str(int(args.eval_max_eval_tokens)),
+                    "--eval-datasets",
+                    *list(args.eval_datasets),
                     "--wmpq-init",
                     str(args.wmpq_init),
                     "--wmpq-iters",
@@ -248,6 +262,8 @@ def main() -> None:
                     str(int(args.wmpq_polish_sweeps)),
                     "--wmpq-polish-metric",
                     str(args.wmpq_polish_metric),
+                    "--wmpq-polish-max-blocks",
+                    str(int(args.wmpq_polish_max_blocks)),
                     "--wmpq-metric-rows-per-chunk",
                     str(int(args.wmpq_metric_rows_per_chunk)),
                     "--output-dir",
@@ -336,4 +352,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

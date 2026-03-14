@@ -1,13 +1,17 @@
 diff --git a/gptqmodel/looper/gptq_processor.py b/gptqmodel/looper/gptq_processor.py
-index e9b342a5..327667bc 100644
+index e9b342a5..12a8e496 100644
 --- a/gptqmodel/looper/gptq_processor.py
 +++ b/gptqmodel/looper/gptq_processor.py
-@@ -322,6 +322,18 @@ class GPTQProcessor(LoopProcessor):
+@@ -322,6 +322,22 @@ class GPTQProcessor(LoopProcessor):
  
          # cleanup all memory or states vars persistently added by this processor
          module.stream_sync()
 +        mpgq_cfg = getattr(self.qcfg, "mpgq", None)
-+        if mpgq_cfg is not None and bool(getattr(mpgq_cfg, "enabled", False)) and str(getattr(self.qcfg, "rotation", None)) == "hadamard":
++        if (
++            mpgq_cfg is not None
++            and bool(getattr(mpgq_cfg, "enabled", False))
++            and str(getattr(self.qcfg, "rotation", None)) == "hadamard"
++        ):
 +            # MPGQ exact-full path with internal Hadamard is a dense research path; skip packing/export.
 +            with (self.lock):
 +                if self.calculate_w_wq_diff:
@@ -21,6 +25,73 @@ index e9b342a5..327667bc 100644
          with (self.lock):
              # if calculate_w_wq_diff is enabled (eora), we need to revert our original wq
              if self.calculate_w_wq_diff:
+diff --git a/gptqmodel/models/base.py b/gptqmodel/models/base.py
+index 7d16f5ae..1353e15e 100644
+--- a/gptqmodel/models/base.py
++++ b/gptqmodel/models/base.py
+@@ -749,30 +749,38 @@ class BaseQModel(nn.Module):
+ 
+         # rotate model
+         if self.quantize_config.rotation:
+-            from gptqmodel.models.definitions.llama import LlamaQModel
+-            from gptqmodel.models.definitions.qwen2 import Qwen2QModel
+-            if not isinstance(self, (LlamaQModel, Qwen2QModel)):
+-                raise ValueError(f"rotation only supports: llama/qwen2 model, "
+-                                    f"current model is {self.__class__.__name__}")
+-
+-            if self.model.config.tie_word_embeddings:
+-                log.info("Rotation requires word embeddings to be untied. Untying.")
+-                self.model.config.tie_word_embeddings = False
+-                lm_head, _ = get_module_by_name_prefix(self.model, self.lm_head)
+-                lm_head.weight = nn.Parameter(lm_head.weight.data.clone())
+-
+-            module_name_args = {
+-                "layers_node": self.extract_layers_node(),
+-                "lm_head_name": self.lm_head
+-            }
+-            self.model = fuse_layer_norms(model=self.model,
+-                                            pre_lm_head_norm_module_name=self.pre_lm_head_norm_module,
+-                                            **module_name_args)
+-
+-            # MPS does not support float64.
+-            rotation_device = self.quantize_config.device if self.quantize_config.device != DEVICE.MPS else DEVICE.CPU
+-            self.model, _ = rotate_model(model=self.model, rotate_mode=self.quantize_config.rotation,
+-                                            device=rotation_device, **module_name_args)
++            mpgq_cfg = getattr(self.quantize_config, "mpgq", None)
++            if (
++                mpgq_cfg is not None
++                and bool(getattr(mpgq_cfg, "enabled", False))
++                and str(self.quantize_config.rotation) == "hadamard"
++            ):
++                log.info("MPGQ `rotation=hadamard`: using internal right-side Hadamard; skipping model rotation.")
++            else:
++                from gptqmodel.models.definitions.llama import LlamaQModel
++                from gptqmodel.models.definitions.qwen2 import Qwen2QModel
++                if not isinstance(self, (LlamaQModel, Qwen2QModel)):
++                    raise ValueError(f"rotation only supports: llama/qwen2 model, "
++                                        f"current model is {self.__class__.__name__}")
++
++                if self.model.config.tie_word_embeddings:
++                    log.info("Rotation requires word embeddings to be untied. Untying.")
++                    self.model.config.tie_word_embeddings = False
++                    lm_head, _ = get_module_by_name_prefix(self.model, self.lm_head)
++                    lm_head.weight = nn.Parameter(lm_head.weight.data.clone())
++
++                module_name_args = {
++                    "layers_node": self.extract_layers_node(),
++                    "lm_head_name": self.lm_head
++                }
++                self.model = fuse_layer_norms(model=self.model,
++                                                pre_lm_head_norm_module_name=self.pre_lm_head_norm_module,
++                                                **module_name_args)
++
++                # MPS does not support float64.
++                rotation_device = self.quantize_config.device if self.quantize_config.device != DEVICE.MPS else DEVICE.CPU
++                self.model, _ = rotate_model(model=self.model, rotate_mode=self.quantize_config.rotation,
++                                                device=rotation_device, **module_name_args)
+ 
+         # init processor with default GPTQ processor
+         from ..looper.tensorparallel_weight_processor import TensorParallelWeightProcessor
 diff --git a/gptqmodel/quantization/config.py b/gptqmodel/quantization/config.py
 index 97998f41..96d9719b 100644
 --- a/gptqmodel/quantization/config.py
@@ -227,3 +298,141 @@ index ae0921aa..123f3929 100644
          # Use simplified loop when mock_quantization is active
          if self.qcfg.mock_quantization:
              for i1 in range(0, self.columns, blocksize):
+diff --git a/gptqmodel/quantization/rotation/hadamard_utils.py b/gptqmodel/quantization/rotation/hadamard_utils.py
+index a58ad7fa..f23263dc 100644
+--- a/gptqmodel/quantization/rotation/hadamard_utils.py
++++ b/gptqmodel/quantization/rotation/hadamard_utils.py
+@@ -106,20 +106,24 @@ fast_hadamard_transform = None
+ 
+ 
+ # TODO make this a util
+-def import_fast_hadamard_transform():
++def import_fast_hadamard_transform(*, required: bool = True) -> bool:
+     global fast_hadamard_transform
+     if fast_hadamard_transform is not None:
+-        return
++        return True
+ 
+     try:
+         import fast_hadamard_transform as fht
+         fast_hadamard_transform = fht
++        return True
+     except ImportError as e:
+-        log.error("Package: Please install missing `fast_hadamard_transform` module via: `pip install -U git+https://github.com/Dao-AILab/fast-hadamard-transform.git --no-build-isolation -v`")
+-        raise e
++        if required:
++            log.error("Package: Please install missing `fast_hadamard_transform` module via: `pip install -U git+https://github.com/Dao-AILab/fast-hadamard-transform.git --no-build-isolation -v`")
++            raise e
++        return False
+ 
+ def matmul_hadU_cuda(X, hadK, K):
+-    import_fast_hadamard_transform()
++    if not import_fast_hadamard_transform(required=False):
++        return matmul_hadU(X).contiguous()
+ 
+     n = X.shape[-1]
+     if K == 1:
+@@ -139,9 +143,13 @@ def matmul_hadU_cuda(X, hadK, K):
+ # def matmul_hadUt_cuda(X, hadK, K):
+ #     return matmul_hadU_cuda(X, hadK, K, transpose=True)
+ 
++def _apply_hadamard_last_dim_torch(X, had_dim):
++    shape = X.shape
++    return matmul_hadU(X.reshape(-1, had_dim)).reshape(shape).contiguous()
++
+ 
+ def apply_exact_had_to_linear(module, had_dim=-1, output=False):
+-    import_fast_hadamard_transform()
++    use_fast_hadamard = import_fast_hadamard_transform(required=False)
+ 
+     assert isinstance(module, torch.nn.Linear)
+     in_features, out_features = module.in_features, module.out_features
+@@ -168,41 +176,68 @@ def apply_exact_had_to_linear(module, had_dim=-1, output=False):
+     if had_dim == -1:
+         if output:
+             had_K, K = get_hadK(out_features)
+-            W_ = matmul_hadU_cuda(W_.t(), had_K, K).t()
++            if use_fast_hadamard:
++                W_ = matmul_hadU_cuda(W_.t(), had_K, K).t()
++            else:
++                W_ = matmul_hadUt(W_.t()).t().contiguous()
+             if module.bias is not None:
+-                b_ = matmul_hadU_cuda(b_, had_K, K).reshape(b_init_shape)
++                if use_fast_hadamard:
++                    b_ = matmul_hadU_cuda(b_, had_K, K).reshape(b_init_shape)
++                else:
++                    b_ = matmul_hadU(b_).reshape(b_init_shape).contiguous()
+         if not output:
+             had_K, K = get_hadK(in_features)
+-            W_ = matmul_hadU_cuda(W_, had_K, K)
++            if use_fast_hadamard:
++                W_ = matmul_hadU_cuda(W_, had_K, K)
++            else:
++                W_ = matmul_hadU(W_).contiguous()
+     else:
+         # Apply Hadamard to the last had_dim chunks of the weights
+         if output:
+             W_ = W_.t()
+             transposed_shape = W_.shape
+-            W_ = (
+-                fast_hadamard_transform.hadamard_transform( # noqa: F821
+-                    W_.reshape(-1, transposed_shape[-1] // had_dim, had_dim),
+-                    scale=1 / math.sqrt(had_dim),
+-                )
+-                .reshape(transposed_shape)
+-                .t()
+-                .contiguous()
+-            )
+-            if module.bias is not None:
+-                b_ = (
++            if use_fast_hadamard:
++                W_ = (
+                     fast_hadamard_transform.hadamard_transform( # noqa: F821
+-                        b_.reshape(-1, b_.shape[-1] // had_dim, had_dim),
++                        W_.reshape(-1, transposed_shape[-1] // had_dim, had_dim),
+                         scale=1 / math.sqrt(had_dim),
+                     )
+-                    .reshape(b_init_shape)
++                    .reshape(transposed_shape)
++                    .t()
+                     .contiguous()
+                 )
++            else:
++                W_ = _apply_hadamard_last_dim_torch(
++                    W_.reshape(-1, transposed_shape[-1] // had_dim, had_dim),
++                    had_dim,
++                ).reshape(transposed_shape).t().contiguous()
++            if module.bias is not None:
++                if use_fast_hadamard:
++                    b_ = (
++                        fast_hadamard_transform.hadamard_transform( # noqa: F821
++                            b_.reshape(-1, b_.shape[-1] // had_dim, had_dim),
++                            scale=1 / math.sqrt(had_dim),
++                        )
++                        .reshape(b_init_shape)
++                        .contiguous()
++                    )
++                else:
++                    b_ = _apply_hadamard_last_dim_torch(
++                        b_.reshape(-1, b_.shape[-1] // had_dim, had_dim),
++                        had_dim,
++                    ).reshape(b_init_shape).contiguous()
+ 
+         else:
+-            W_ = fast_hadamard_transform.hadamard_transform( # noqa: F821
+-                W_.reshape(-1, init_shape[1] // had_dim, had_dim),
+-                scale=1 / math.sqrt(had_dim),
+-            ).reshape(init_shape)
++            if use_fast_hadamard:
++                W_ = fast_hadamard_transform.hadamard_transform( # noqa: F821
++                    W_.reshape(-1, init_shape[1] // had_dim, had_dim),
++                    scale=1 / math.sqrt(had_dim),
++                ).reshape(init_shape)
++            else:
++                W_ = _apply_hadamard_last_dim_torch(
++                    W_.reshape(-1, init_shape[1] // had_dim, had_dim),
++                    had_dim,
++                ).reshape(init_shape)
+     module.weight.data = W_.to(device=dev, dtype=dtype)
+     if module.bias is not None:
+         module.bias.data = b_.to(device=dev, dtype=b_dtype)

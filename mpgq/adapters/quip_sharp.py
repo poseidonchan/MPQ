@@ -222,6 +222,7 @@ def mpgq_refine_codebook(
         polish_sweeps=int(getattr(args, "mpgq_polish_sweeps", getattr(args, "wmpq_polish_sweeps", 3)) or 3),
         polish_metric=str(getattr(args, "mpgq_polish_metric", getattr(args, "wmpq_polish_metric", "gram")) or "gram"),
         polish_metric_rows_per_chunk=int(getattr(args, "mpgq_metric_rows_per_chunk", getattr(args, "wmpq_metric_rows_per_chunk", 0)) or 0),
+        polish_max_blocks=int(getattr(args, "mpgq_polish_max_blocks", getattr(args, "wmpq_polish_max_blocks", 0)) or 0),
     )
 
     block_rows = _resolve_block_rows(

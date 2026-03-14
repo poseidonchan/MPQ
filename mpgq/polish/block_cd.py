@@ -30,6 +30,7 @@ class BlockCDConfig:
     metric: str = "diag"  # "diag" | "gram"
     accept_tol: float = 0.0
     metric_rows_per_chunk: int = 0  # for large codebooks (optional)
+    max_blocks_per_sweep: int = 0  # if >0, only polish top-K blocks by static importance
 
 
 @torch.inference_mode()
@@ -96,13 +97,17 @@ def block_coordinate_descent_rankspace(
         block_meta.append((start, end, Vs_blk, gram_raw, gram_chol))
         importance[bi] = float(torch.diag(gram_raw).sum().item())
     order = torch.argsort(importance, descending=True)
+    order_list = order.tolist()
+    max_blocks = int(getattr(cfg, "max_blocks_per_sweep", 0) or 0)
+    if max_blocks > 0:
+        order_list = order_list[:max_blocks]
 
     accept_tol = max(float(cfg.accept_tol), 0.0)
     accepted_updates = 0
     idxs_out: Optional[torch.Tensor] = idxs_init.clone() if idxs_init is not None else None
 
     for _ in range(sweeps):
-        for bi in order.tolist():
+        for bi in order_list:
             start, end, Vs_blk, gram_raw, gram_chol = block_meta[bi]
             x_blk = x_work[:, start:end]  # (B, bs)
             rhs = residual_u.matmul(Vs_blk.T)  # (B, bs)

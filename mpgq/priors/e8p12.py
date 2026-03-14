@@ -39,11 +39,8 @@ def resolve_factorized_blocks_per_chunk(batch_rows: int, n_blocks: int, requeste
         return int(n_blocks)
     if device.type != "cuda":
         return int(min(n_blocks, max(requested, 64)))
-
-    try:
-        total_bytes = int(torch.cuda.get_device_properties(device).total_memory)
-    except RuntimeError:
-        return int(min(n_blocks, max(requested, 128)))
+    index = int(device.index) if device.index is not None else int(torch.cuda.current_device())
+    total_bytes = int(torch.cuda.get_device_properties(index).total_memory)
 
     bytes_per_item_base = 4 * 48
     budget = min(max(int(total_bytes // 8), 256 * 1024**2), 4 * 1024**3)
@@ -457,4 +454,3 @@ def vamp_vector_discrete_mmse_e8p12(
         "entropy": float(sum(entropy_values) / len(entropy_values)) if entropy_values else 0.0,
         "margin": float(sum(margin_values) / len(margin_values)) if margin_values else 0.0,
     }
-

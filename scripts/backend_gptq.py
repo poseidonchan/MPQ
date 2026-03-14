@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
+import importlib
+import importlib.util
 import json
 import math
 import os
@@ -127,6 +130,7 @@ def _load_or_build_wikitext2_tokens(tokenizer, *, max_eval_tokens: int, output_d
     return tokens
 
 
+@torch.no_grad()
 def eval_ppl_wikitext2(
     model,
     tokenizer,
@@ -143,7 +147,8 @@ def eval_ppl_wikitext2(
     nsamples = tokens.shape[1] // int(seqlen)
     for i in range(nsamples):
         batch = tokens[:, i * seqlen : (i + 1) * seqlen]
-        outputs = model(batch)
+        # Disable KV cache to keep peak memory bounded during long-run eval.
+        outputs = model(batch, use_cache=False)
         shift_logits = outputs.logits[:, :-1, :].contiguous()
         shift_labels = batch[:, 1:].contiguous()
         loss = torch.nn.functional.cross_entropy(
@@ -286,8 +291,24 @@ def run(args) -> Dict[str, Any]:
     model.quantize(calib_blocks)
     quant_time = float(time.time() - t_quant)
 
+    # Release large quantization intermediates before evaluation.
+    del calib_blocks
+
+    # Best-effort: clear optional workspace caches (may retain large buffers).
+    if importlib.util.find_spec("gptqmodel.quantization.gptq") is not None:
+        gptq_mod = importlib.import_module("gptqmodel.quantization.gptq")
+        workspace_cache = getattr(gptq_mod, "_WORKSPACE_CACHE", None)
+        if hasattr(workspace_cache, "clear"):
+            workspace_cache.clear()
+
     # Evaluate in-process.
     hf_model = getattr(model, "model", model)
+    # Drop wrapper refs (may retain large buffers).
+    if hf_model is not model:
+        del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     hf_model.eval()
     hf_model.to(device)
     ppl = eval_ppl_wikitext2(

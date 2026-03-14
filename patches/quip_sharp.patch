@@ -1,3 +1,66 @@
+diff --git a/eval/eval_ppl.py b/eval/eval_ppl.py
+index 71687c9..842fbea 100644
+--- a/eval/eval_ppl.py
++++ b/eval/eval_ppl.py
+@@ -18,22 +18,37 @@ parser = argparse.ArgumentParser()
+ parser.add_argument('--seed', default=0, type=int)
+ parser.add_argument('--hf_path', default='hfized/quantized_hada_70b', type=str)
+ parser.add_argument('--seqlen', default=4096, type=int)
++parser.add_argument('--datasets',
++                    nargs='*',
++                    default=['wikitext2', 'c4'],
++                    help='Datasets to evaluate (default: wikitext2 c4)')
++parser.add_argument('--max_eval_tokens',
++                    type=int,
++                    default=0,
++                    help='If >0, cap total eval tokens per dataset (rounded down to a multiple of seqlen).')
++parser.add_argument('--json_out', type=str, default=None)
+ parser.add_argument('--no_use_cuda_graph', action='store_true')
+ parser.add_argument('--no_use_flash_attn', action='store_true')
+ 
+ 
+ def main(args):
+-    datasets = ['wikitext2', 'c4']
+     model, model_str = model_from_hf_path(
+         args.hf_path,
+         use_cuda_graph=not args.no_use_cuda_graph,
+         use_flash_attn=not args.no_use_flash_attn)
+ 
+-    for dataset in datasets:
++    ppls = {}
++    for dataset in args.datasets:
+         input_tok = gptq_data_utils.get_test_tokens(dataset,
+                                                     seed=args.seed,
+                                                     seqlen=args.seqlen,
+                                                     model=model_str)
++        if int(args.max_eval_tokens) > 0:
++            max_tokens = int(args.max_eval_tokens)
++            max_tokens = (max_tokens // int(args.seqlen)) * int(args.seqlen)
++            if max_tokens <= 0:
++                raise ValueError('--max_eval_tokens must be >= seqlen when set')
++            input_tok = input_tok[:, :max_tokens]
+         nsamples = input_tok.numel() // args.seqlen
+         input_tok = input_tok[0, :(args.seqlen * nsamples)].view(
+             nsamples, args.seqlen)
+@@ -61,6 +76,18 @@ def main(args):
+ 
+         ppl = torch.exp(torch.tensor(avg_loss)).item()
+         glog.info(f'{dataset} perplexity: {ppl}')
++        ppls[dataset] = float(ppl)
++
++    if args.json_out:
++        payload = {
++            'seed': int(args.seed),
++            'seqlen': int(args.seqlen),
++            'datasets': list(args.datasets),
++            'max_eval_tokens': int(args.max_eval_tokens),
++            'ppl': ppls,
++        }
++        with open(args.json_out, 'w', encoding='utf-8') as fh:
++            json.dump(payload, fh, indent=2, sort_keys=True)
+ 
+ 
+ if __name__ == '__main__':
 diff --git a/lib/algo/quip.py b/lib/algo/quip.py
 index 7ceb211..765587b 100644
 --- a/lib/algo/quip.py
@@ -53,11 +116,647 @@ index 7ceb211..765587b 100644
      if len(scales) == 1:
          # fuse single scale into SV too
          attr['SV'] *= scales[0]
+diff --git a/lib/utils/data_utils.py b/lib/utils/data_utils.py
+index 02d1395..ebdfe30 100644
+--- a/lib/utils/data_utils.py
++++ b/lib/utils/data_utils.py
+@@ -1,4 +1,5 @@
+ import multiprocessing as mp
++import random
+ 
+ import glog
+ import torch
+@@ -55,6 +56,67 @@ def wrap_tokenizer(tokenizer, x, ctx_size):
+                      max_length=ctx_size)
+ 
+ 
++def _iter_text_rows(dataset_name: str, split: str, seed: int):
++    dataset_name = str(dataset_name)
++    split = str(split)
++    seed = int(seed)
++
++    if dataset_name == 'c4':
++        dataset = load_dataset('allenai/c4', 'en', split=split, streaming=True)
++        buffer_size = max(8192, min(65536, 64 * 128))
++        dataset = dataset.shuffle(seed=seed, buffer_size=buffer_size)
++        for row in dataset:
++            text = row.get('text')
++            if isinstance(text, str) and text.strip():
++                yield text
++        return
++
++    if dataset_name in ('wikitext2', 'wikitext-2-raw-v1'):
++        dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split=split).shuffle(seed=seed)
++        for row in dataset:
++            text = row.get('text')
++            if isinstance(text, str) and text.strip():
++                yield text
++        return
++
++    raise ValueError(f"unsupported dataset_name={dataset_name!r}; expected one of {{'c4','wikitext2','rp1t'}}")
++
++
++def sample_token_blocks(tokenizer, dataset_name='c4', split='train', size=128, ctx_size=2048, nproc=1, seed=0):
++    dataset_name = str(dataset_name)
++    if dataset_name == 'rp1t':
++        return sample_rp1t(tokenizer, size=size, ctx_size=ctx_size, nproc=nproc)
++
++    rng = random.Random(int(seed))
++    devset = torch.zeros((int(size), int(ctx_size)), dtype=torch.int64)
++    saved = 0
++    rows_seen = 0
++    for text in _iter_text_rows(dataset_name, split, int(seed)):
++        rows_seen += 1
++        token_ids = tokenizer(
++            text,
++            add_special_tokens=False,
++            return_attention_mask=False,
++            truncation=False,
++        )['input_ids']
++        if len(token_ids) < int(ctx_size):
++            continue
++
++        start = 0 if len(token_ids) == int(ctx_size) else rng.randint(0, len(token_ids) - int(ctx_size))
++        devset[saved] = torch.tensor(token_ids[start:start + int(ctx_size)], dtype=torch.int64)
++        saved += 1
++        if saved >= int(size):
++            break
++
++    if saved < int(size):
++        raise RuntimeError(
++            f"Unable to build {int(size)} token blocks of length {int(ctx_size)} from `{dataset_name}` `{split}`. "
++            f"Only collected {saved} after scanning {rows_seen} rows."
++        )
++
++    return devset
++
++
+ def sample_rp1t(tokenizer, size=128, ctx_size=2048, nproc=1):
+     dataset = load_dataset('togethercomputer/RedPajama-Data-1T-Sample',
+                            split='train')
+@@ -201,14 +263,16 @@ class SimpleDataset(Dataset):
+ 
+ 
+ def split_data(X, Y, args):
+-    split = int(len(X) - args.ft_valid_size)
++    valid_size = max(1, int(args.ft_valid_size))
++    split = int(len(X) - valid_size)
++    split = max(0, min(split, len(X)))
+     glog.info(f'using {split} training seqs, {len(X) - split} validation seqs')
+     train_ds = SimpleDataset(X[:split], Y[:split])
+     valid_ds = SimpleDataset(X[split:], Y[split:])
+     train_dl = DataLoader(train_ds,
+                           batch_size=args.ft_bs,
+                           pin_memory=True,
+-                          shuffle=True)
++                          shuffle=(split > 0))
+     valid_dl = DataLoader(valid_ds,
+                           batch_size=args.ft_bs,
+                           pin_memory=True,
+diff --git a/lib/utils/matmul_had.py b/lib/utils/matmul_had.py
+index 9915d0f..56125e1 100644
+--- a/lib/utils/matmul_had.py
++++ b/lib/utils/matmul_had.py
+@@ -1,8 +1,12 @@
+-import fast_hadamard_transform
+ import torch
+ 
+ from lib import utils
+ 
++try:
++    import fast_hadamard_transform
++except (ImportError, OSError):  # optional; torch fallback supported
++    fast_hadamard_transform = None
++
+ 
+ def get_hadK(n, transpose=False):
+     hadK, K = None, None
+@@ -95,7 +99,62 @@ def hadamard_abstract(x: torch.Tensor, scale: float) -> torch.Tensor:
+ 
+ @torch.library.impl("quip_lib::hadamard", "default")
+ def hadamard(x: torch.Tensor, scale: float) -> torch.Tensor:
+-    return fast_hadamard_transform.hadamard_transform(x, scale)
++    return hadamard_fallback(x, scale)
++
++
++_warned_fast_hadamard_fallback = False
++_disable_fast_hadamard_transform = False
++
++
++def _hadamard_transform_torch(x: torch.Tensor, scale: float) -> torch.Tensor:
++    n = x.shape[-1]
++    assert is_pow2(n), f"Hadamard dim must be power-of-two; got {n}"
++
++    shape = x.shape
++    input = x.contiguous().view(-1, n, 1)
++    output = input.clone()
++    while input.shape[1] > 1:
++        input = input.view(input.shape[0], input.shape[1] // 2, 2,
++                           input.shape[2])
++        output = output.view(input.shape)
++        output[:, :, 0, :] = input[:, :, 0, :] + input[:, :, 1, :]
++        output[:, :, 1, :] = input[:, :, 0, :] - input[:, :, 1, :]
++        output = output.view(input.shape[0], input.shape[1], -1)
++        (input, output) = (output, input)
++    del output
++    utils.clean()
++    return input.view(shape) * scale
++
++
++def _is_fast_hadamard_unsupported(exc: RuntimeError) -> bool:
++    msg = str(exc).lower()
++    needles = (
++        "no kernel image is available",
++        "invalid device function",
++        "not compiled",
++    )
++    return any(needle in msg for needle in needles)
++
++
++def hadamard_fallback(x: torch.Tensor, scale: float) -> torch.Tensor:
++    global _warned_fast_hadamard_fallback, _disable_fast_hadamard_transform
++    if fast_hadamard_transform is None or _disable_fast_hadamard_transform:
++        return _hadamard_transform_torch(x, scale)
++
++    try:
++        return fast_hadamard_transform.hadamard_transform(x, scale)
++    except RuntimeError as exc:
++        if not _is_fast_hadamard_unsupported(exc):
++            raise
++        _disable_fast_hadamard_transform = True
++        if not _warned_fast_hadamard_fallback:
++            cap_str = "unknown"
++            if x.is_cuda:
++                cap = torch.cuda.get_device_capability(x.device)
++                cap_str = f"{cap[0]}.{cap[1]}"
++            print(f"[quip-sharp] fast_hadamard_transform failed on SM {cap_str}; using torch fallback.", flush=True)
++            _warned_fast_hadamard_fallback = True
++        return _hadamard_transform_torch(x, scale)
+ 
+ 
+ def matmul_hadU_cuda(X, hadK, K, transpose=False):
+diff --git a/lib/utils/unsafe_import.py b/lib/utils/unsafe_import.py
+index 0b9b3ac..1f88a43 100644
+--- a/lib/utils/unsafe_import.py
++++ b/lib/utils/unsafe_import.py
+@@ -27,6 +27,8 @@ def model_from_hf_path(path,
+         if model_type == 'llama':
+             model_str = transformers.LlamaConfig.from_pretrained(
+                 path)._name_or_path
++            if not model_str:
++                model_str = path
+             model_cls = LlamaForCausalLM
+         else:
+             raise Exception
+diff --git a/model/llama.py b/model/llama.py
+index 4007a8f..f4ecf4d 100644
+--- a/model/llama.py
++++ b/model/llama.py
+@@ -178,6 +178,33 @@ class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
+         return cos, sin
+ 
+ 
++class LlamaLlama3RotaryEmbedding(LlamaRotaryEmbedding):
++    """LlamaRotaryEmbedding with Llama-3 style RoPE scaling.
++
++    Reference: transformers.modeling_rope_utils._compute_llama3_parameters
++    """
++
++    def __init__(self, dim, *, rope_scaling, max_position_embeddings=2048, base=10000, device=None):
++        super().__init__(dim, max_position_embeddings=max_position_embeddings, base=base, device=device)
++
++        factor = float(rope_scaling["factor"])
++        low_freq_factor = float(rope_scaling["low_freq_factor"])
++        high_freq_factor = float(rope_scaling["high_freq_factor"])
++        old_context_len = int(rope_scaling.get("original_max_position_embeddings", max_position_embeddings))
++
++        inv_freq = self.inv_freq
++        low_freq_wavelen = old_context_len / low_freq_factor
++        high_freq_wavelen = old_context_len / high_freq_factor
++
++        wavelen = 2 * math.pi / inv_freq
++        inv_freq_llama = torch.where(wavelen > low_freq_wavelen, inv_freq / factor, inv_freq)
++        smooth_factor = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
++        smoothed_inv_freq = (1 - smooth_factor) * inv_freq_llama / factor + smooth_factor * inv_freq_llama
++        is_medium_freq = ~(wavelen < high_freq_wavelen) * ~(wavelen > low_freq_wavelen)
++        inv_freq_llama = torch.where(is_medium_freq, smoothed_inv_freq, inv_freq_llama)
++        self.inv_freq = inv_freq_llama
++
++
+ def rotate_half(x):
+     """Rotates half the hidden dims of the input."""
+     x1 = x[..., : x.shape[-1] // 2]
+@@ -342,7 +369,9 @@ class LlamaAttention(nn.Module):
+                 base=self.rope_theta,
+             )
+         else:
+-            scaling_type = self.config.rope_scaling["type"]
++            scaling_type = self.config.rope_scaling.get("type", None)
++            if scaling_type is None:
++                scaling_type = self.config.rope_scaling.get("rope_type", None)
+             scaling_factor = self.config.rope_scaling["factor"]
+             if scaling_type == "linear":
+                 self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
+@@ -358,6 +387,13 @@ class LlamaAttention(nn.Module):
+                     scaling_factor=scaling_factor,
+                     base=self.rope_theta,
+                 )
++            elif scaling_type == "llama3":
++                self.rotary_emb = LlamaLlama3RotaryEmbedding(
++                    self.head_dim,
++                    max_position_embeddings=self.max_position_embeddings,
++                    base=self.rope_theta,
++                    rope_scaling=self.config.rope_scaling,
++                )
+             else:
+                 raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+ 
+diff --git a/quantize_llama/hessian_offline_llama.py b/quantize_llama/hessian_offline_llama.py
+index 24cdf79..259a47f 100644
+--- a/quantize_llama/hessian_offline_llama.py
++++ b/quantize_llama/hessian_offline_llama.py
+@@ -33,6 +33,8 @@ parser.add_argument('--async_copy_speed', default=-1, type=int)
+ parser.add_argument('--act_save_rate', default=4, type=int)
+ parser.add_argument('--save_activations', action='store_true')
+ parser.add_argument('--sample_proc', default=4, type=int)
++parser.add_argument('--calibration_dataset', default='rp1t', type=str)
++parser.add_argument('--calibration_split', default='train', type=str)
+ 
+ 
+ def move_fn(in_q, async_copy_speed):
+@@ -50,10 +52,11 @@ def move_fn(in_q, async_copy_speed):
+         print(f'moved {src} to {tgt}')
+ 
+ 
+-def forward_layer(layer, position_ids, attention_mask, bs, device, in_q,
+-                  out_q):
++def forward_layer(layer, rotary_emb, position_ids, attention_mask, bs, device,
++                  in_q, out_q):
+     torch.set_grad_enabled(False)
+     layer = layer.to(device)
++    rotary_emb = rotary_emb.to(device)
+     position_ids = position_ids.to(device)
+     attention_mask = attention_mask.to(device)
+     done_qkv = utils.register_H_hook(layer.self_attn.q_proj, device)
+@@ -76,13 +79,21 @@ def forward_layer(layer, position_ids, attention_mask, bs, device, in_q,
+             return
+ 
+         assert len(dev_emb) % bs == 0
++        pos_emb = None
+         for i in range(len(dev_emb) // bs):
+-            dev_emb[i * bs:(i + 1) * bs] = layer(
+-                dev_emb[i * bs:(i + 1) * bs].to(device),
++            hidden_states = dev_emb[i * bs:(i + 1) * bs].to(device)
++            if pos_emb is None:
++                pos_emb = rotary_emb(hidden_states, position_ids)
++            out = layer(
++                hidden_states,
+                 position_ids=position_ids,
+                 attention_mask=attention_mask,
+                 use_cache=False,
+-                output_attentions=False)[0].cpu()
++                output_attentions=False,
++                position_embeddings=pos_emb,
++            )
++            out_hidden = out[0] if isinstance(out, (tuple, list)) else out
++            dev_emb[i * bs:(i + 1) * bs] = out_hidden.cpu()
+ 
+ 
+ def accumulate(in_q, move_q, ngpus, args, transformer_layer_index):
+@@ -126,6 +137,31 @@ def accumulate(in_q, move_q, ngpus, args, transformer_layer_index):
+     del Hs, mus, cts, out
+ 
+ 
++def save_hessians(out, move_q, args, transformer_layer_index):
++    keys = list(out.keys())
++    for key in keys:
++        H = out[key][0].clone()
++        mu = out[key][1].clone()
++        ct = int(out[key][2])
++
++        mu.div_(ct)
++        H.div_(ct)
++        H.addmm_(-mu.unsqueeze(-1), mu.unsqueeze(0))
++
++        save_path = f"{args.scratch_path}/{transformer_layer_index}_{key}.pt" if args.scratch_path is not None else f"{args.save_path}/{transformer_layer_index}_{key}.pt"
++        torch.save(
++            {
++                'flatH': utils.sym_to_flat(H.to(torch.float32)),
++                'mu': mu.to(torch.float32),
++                'n': H.shape[0],
++                'ct': ct,
++            }, save_path)
++        if args.scratch_path is not None:
++            move_q.put(
++                (f"{args.scratch_path}/{transformer_layer_index}_{key}.pt",
++                 f"{args.save_path}/{transformer_layer_index}_{key}.pt"))
++
++
+ def main(args):
+     print("loading model...")
+     model = AutoModelForCausalLM.from_pretrained(args.base_model,
+@@ -135,21 +171,39 @@ def main(args):
+     tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=True)
+     tokenizer.pad_token = tokenizer.eos_token
+ 
+-    if os.path.isfile(f"{args.save_path}/dev_activations.pt"):
++    cache_path = f"{args.save_path}/dev_activations.pt"
++    dev_emb = None
++    after_layer = None
++    if os.path.isfile(cache_path):
+         print("loading cached dataset...")
+-        loaded_dev_activations = torch.load(
+-            f"{args.save_path}/dev_activations.pt")
+-        after_layer = loaded_dev_activations['after_layer']
+-        dev_emb = loaded_dev_activations['dev_emb']
+-        print(
+-            f"loaded cached dataset from {loaded_dev_activations['timestamp']}"
++        loaded_dev_activations = torch.load(cache_path)
++        cache_ok = (
++            loaded_dev_activations.get('calibration_dataset') == args.calibration_dataset and
++            loaded_dev_activations.get('calibration_split') == args.calibration_split and
++            int(loaded_dev_activations.get('devset_size', -1)) == int(args.devset_size) and
++            int(loaded_dev_activations.get('ctx_size', -1)) == int(args.ctx_size) and
++            int(loaded_dev_activations.get('seed', -1)) == int(args.seed)
+         )
+-    else:
++        if cache_ok:
++            after_layer = loaded_dev_activations['after_layer']
++            dev_emb = loaded_dev_activations['dev_emb']
++            print(
++                f"loaded cached dataset from {loaded_dev_activations.get('timestamp', 'unknown')}"
++            )
++        else:
++            print("cached activations meta mismatch; ignoring cache and rebuilding dataset")
++
++    if dev_emb is None:
+         print("loading dataset...")
+-        devset = utils.sample_rp1t(tokenizer,
+-                                   args.devset_size,
+-                                   args.ctx_size,
+-                                   nproc=args.sample_proc)
++        devset = utils.sample_token_blocks(
++            tokenizer,
++            dataset_name=args.calibration_dataset,
++            split=args.calibration_split,
++            size=args.devset_size,
++            ctx_size=args.ctx_size,
++            nproc=args.sample_proc,
++            seed=args.seed,
++        )
+         dev_emb = model.model.embed_tokens(devset)
+         after_layer = -1
+         print("loaded dataset!")
+@@ -195,40 +249,81 @@ def main(args):
+         chunk_size = min(args.chunk_size, len(dev_emb))
+         ngpus = min(torch.cuda.device_count(), len(dev_emb) // chunk_size)
+ 
+-        manager = mp.get_context('spawn').Manager()
+-        in_q = manager.Queue()
+-        out_q = manager.Queue()
+-
+-        accumulate_proc = mp.Process(target=accumulate,
+-                                     args=(out_q, move_q, ngpus, args,
+-                                           transformer_layer_index))
+-        accumulate_proc.start()
+-
+-        forward_procs = []
+-        for i in range(ngpus):
+-            p = mp.Process(target=forward_layer,
+-                           args=(transformer_layer, position_ids,
+-                                 attention_mask, args.batch_size, i, in_q,
+-                                 out_q))
+-            p.start()
+-            forward_procs.append(p)
+-
+-        assert len(
+-            dev_emb
+-        ) % args.batch_size == 0 and chunk_size % args.batch_size == 0
+-        i = 0
+-        while i < len(dev_emb):
+-            next = min(i + chunk_size, len(dev_emb))
+-            in_q.put(dev_emb[i:next])
+-            i = next
+-
+-        for i in range(ngpus):
+-            in_q.put(None)
+-
+-        for p in forward_procs:
+-            p.join()
+-
+-        accumulate_proc.join()
++        assert len(dev_emb) % args.batch_size == 0
++        if ngpus <= 1:
++            device = 0
++            transformer_layer = transformer_layer.to(device)
++            rotary_emb = model.model.rotary_emb.to(device)
++            position_ids_dev = position_ids.to(device)
++            attention_mask_dev = attention_mask.to(device)
++            done_qkv = utils.register_H_hook(transformer_layer.self_attn.q_proj,
++                                             device)
++            done_o = utils.register_H_hook(transformer_layer.self_attn.o_proj,
++                                           device)
++            done_up = utils.register_H_hook(transformer_layer.mlp.up_proj,
++                                            device)
++            done_down = utils.register_H_hook(transformer_layer.mlp.down_proj,
++                                              device)
++
++            pos_emb = None
++            bs = int(args.batch_size)
++            for j in range(len(dev_emb) // bs):
++                batch = dev_emb[j * bs:(j + 1) * bs]
++                hidden_states = batch.to(device)
++                if pos_emb is None:
++                    pos_emb = rotary_emb(hidden_states, position_ids_dev)
++                out = transformer_layer(
++                    hidden_states,
++                    position_ids=position_ids_dev,
++                    attention_mask=attention_mask_dev,
++                    use_cache=False,
++                    output_attentions=False,
++                    position_embeddings=pos_emb,
++                )
++                out_hidden = out[0] if isinstance(out, (tuple, list)) else out
++                batch.copy_(out_hidden.cpu())
++
++            out = {
++                'qkv': done_qkv(),
++                'o': done_o(),
++                'up': done_up(),
++                'down': done_down()
++            }
++            save_hessians(out, move_q, args, transformer_layer_index)
++        else:
++            ctx = mp.get_context('spawn')
++            in_q = ctx.Queue()
++            out_q = ctx.Queue()
++
++            accumulate_proc = mp.Process(target=accumulate,
++                                         args=(out_q, move_q, ngpus, args,
++                                               transformer_layer_index))
++            accumulate_proc.start()
++
++            forward_procs = []
++            for i in range(ngpus):
++                p = mp.Process(target=forward_layer,
++                               args=(transformer_layer,
++                                     model.model.rotary_emb, position_ids,
++                                     attention_mask, args.batch_size, i, in_q,
++                                     out_q))
++                p.start()
++                forward_procs.append(p)
++
++            assert chunk_size % args.batch_size == 0
++            i = 0
++            while i < len(dev_emb):
++                next = min(i + chunk_size, len(dev_emb))
++                in_q.put(dev_emb[i:next])
++                i = next
++
++            for i in range(ngpus):
++                in_q.put(None)
++
++            for p in forward_procs:
++                p.join()
++
++            accumulate_proc.join()
+ 
+         transformer_layer.cpu()
+         model.model.layers[transformer_layer_index] = None
+@@ -245,7 +340,12 @@ def main(args):
+                         {
+                             'dev_emb': dev_emb,
+                             'after_layer': transformer_layer_index,
+-                            'timestamp': str(datetime.datetime.now())
++                            'timestamp': str(datetime.datetime.now()),
++                            'calibration_dataset': str(args.calibration_dataset),
++                            'calibration_split': str(args.calibration_split),
++                            'devset_size': int(args.devset_size),
++                            'ctx_size': int(args.ctx_size),
++                            'seed': int(args.seed),
+                         }, f'{args.scratch_path}/dev_activations.pt')
+                     move_q.put((f'{args.scratch_path}/dev_activations.pt',
+                                 f'{args.save_path}/dev_activations.pt'))
+@@ -254,7 +354,12 @@ def main(args):
+                     {
+                         'dev_emb': dev_emb,
+                         'after_layer': transformer_layer_index,
+-                        'timestamp': str(datetime.datetime.now())
++                        'timestamp': str(datetime.datetime.now()),
++                        'calibration_dataset': str(args.calibration_dataset),
++                        'calibration_split': str(args.calibration_split),
++                        'devset_size': int(args.devset_size),
++                        'ctx_size': int(args.ctx_size),
++                        'seed': int(args.seed),
+                     }, f'{args.save_path}/dev_activations.pt')
+ 
+         print(f"done processing layer {transformer_layer_index}")
+@@ -265,7 +370,8 @@ def main(args):
+ 
+ 
+ if __name__ == "__main__":
+-    mp.set_start_method('spawn')
++    if mp.get_start_method(allow_none=True) is None:
++        mp.set_start_method("spawn")
+     torch.set_grad_enabled(False)
+     args = parser.parse_args()
+     torch.manual_seed(args.seed)
+diff --git a/quantize_llama/hfize_llama.py b/quantize_llama/hfize_llama.py
+index 3aa5e03..8719073 100644
+--- a/quantize_llama/hfize_llama.py
++++ b/quantize_llama/hfize_llama.py
+@@ -20,7 +20,9 @@ parser.add_argument('--hf_output_path', type=str)
+ 
+ def main(args):
+     assert os.path.exists(args.quantized_path)
+-    saved_config = torch.load(os.path.join(args.quantized_path, 'config.pt'))
++    saved_config = torch.load(os.path.join(args.quantized_path, 'config.pt'),
++                              weights_only=False,
++                              map_location='cpu')
+     model_config = saved_config['model_config']
+ 
+     codebook_id = codebook.get_id(model_config.quip_params['codebook'])
+@@ -36,6 +38,7 @@ def main(args):
+     cpu = torch.device('cpu')
+     if os.path.exists(f'{args.quantized_path}/lmhead.pt'):
+         lmhead_data = torch.load(f'{args.quantized_path}/lmhead.pt',
++                                 weights_only=False,
+                                  map_location=cpu)
+         model.lm_head.weight.copy_(lmhead_data['lm_head'])
+         model.model.norm.weight.copy_(lmhead_data['norm'])
+@@ -45,12 +48,14 @@ def main(args):
+ 
+         if os.path.exists(f'{args.quantized_path}/{ii}_layernorm.pt'):
+             ln_data = torch.load(f'{args.quantized_path}/{ii}_layernorm.pt',
++                                 weights_only=False,
+                                  map_location=cpu)
+             layer.input_layernorm.weight.copy_(ln_data['input_layernorm'])
+             layer.post_attention_layernorm.weight.copy_(
+                 ln_data['post_attention_layernorm'])
+ 
+         saved_layer = torch.load(f'{args.quantized_path}/{ii}_qkv.pt',
++                                 weights_only=False,
+                                  map_location=cpu)
+         for i in range(len(saved_layer['scales'])):
+             layer.self_attn.qkv_proj.fuse_scales[i].copy_(
+@@ -59,11 +64,13 @@ def main(args):
+                           codesz)
+ 
+         saved_layer = torch.load(f'{args.quantized_path}/{ii}_o.pt',
++                                 weights_only=False,
+                                  map_location=cpu)
+         utils.unpack_quip(layer.self_attn.o_proj, saved_layer, codebook_id,
+                           codesz)
+ 
+         saved_layer = torch.load(f'{args.quantized_path}/{ii}_up.pt',
++                                 weights_only=False,
+                                  map_location=cpu)
+         for i in range(len(saved_layer['scales'])):
+             layer.mlp.upgate_proj.fuse_scales[i].copy_(
+@@ -72,6 +79,7 @@ def main(args):
+                           codesz)
+ 
+         saved_layer = torch.load(f'{args.quantized_path}/{ii}_down.pt',
++                                 weights_only=False,
+                                  map_location=cpu)
+         utils.unpack_quip(layer.mlp.down_proj, saved_layer, codebook_id,
+                           codesz)
+@@ -79,6 +87,7 @@ def main(args):
+ 
+     glog.info(f'saving model...')
+     model.save_pretrained(args.hf_output_path, safe_serialization=True)
++    tokenizer.save_pretrained(args.hf_output_path)
+ 
+     del model
+ 
+@@ -86,6 +95,13 @@ def main(args):
+ 
+     glog.info('successfully loaded hfized model')
+ 
++    if not hasattr(model, "generate"):
++        # Recent `transformers` versions do not guarantee `generate()` on custom
++        # model classes unless they explicitly inherit from `GenerationMixin`.
++        # This smoke step is optional for our benchmark harness; skip if absent.
++        glog.warning("model has no `generate()`; skipping generation smoke test")
++        return
++
+     glog.info('generating some text...')
+ 
+     start = time.time()
 diff --git a/quantize_llama/quantize_finetune_llama.py b/quantize_llama/quantize_finetune_llama.py
-index af33222..945cc25 100644
+index af33222..3fcc291 100644
 --- a/quantize_llama/quantize_finetune_llama.py
 +++ b/quantize_llama/quantize_finetune_llama.py
-@@ -57,6 +57,47 @@ parser.add_argument('--ft_early_stop', default=3, type=int)
+@@ -23,6 +23,8 @@ parser.add_argument('--num_cpu_threads', default=8, type=int)
+ parser.add_argument('--batch_size', default=16, type=int)
+ parser.add_argument('--devset_size', default=384, type=int)
+ parser.add_argument('--ctx_size', default=4096, type=int)
++parser.add_argument('--calibration_dataset', default='rp1t', type=str)
++parser.add_argument('--calibration_split', default='train', type=str)
+ parser.add_argument('--save_path', type=str)
+ parser.add_argument('--hessian_path', type=str)
+ parser.add_argument('--base_model', type=str)
+@@ -57,6 +59,48 @@ parser.add_argument('--ft_early_stop', default=3, type=int)
  parser.add_argument('--ft_train_mode', action='store_true')
  parser.add_argument('--ft_grad_ckpt', action='store_true')
  
@@ -100,8 +799,59 @@ index af33222..945cc25 100644
 +parser.add_argument('--wmpq_block_rows', default=32, type=int)
 +parser.add_argument('--wmpq_polish_sweeps', default=3, type=int)
 +parser.add_argument('--wmpq_polish_metric', default='gram', type=str, choices=['gram', 'isotropic', 'diag'])
++parser.add_argument('--wmpq_polish_max_blocks', default=0, type=int)
 +parser.add_argument('--wmpq_metric_rows_per_chunk', default=0, type=int)
 +
  
  def check_exist(idx, args):
      suffix = ['qkv', 'o', 'up', 'down', 'layernorm']
+@@ -155,8 +199,15 @@ def main(args):
+     tokenizer.pad_token = tokenizer.eos_token
+     glog.info('loaded model')
+ 
+-    devset = utils.sample_rp1t(tokenizer, args.devset_size, args.ctx_size,
+-                               args.sample_proc)
++    devset = utils.sample_token_blocks(
++        tokenizer,
++        dataset_name=args.calibration_dataset,
++        split=args.calibration_split,
++        size=args.devset_size,
++        ctx_size=args.ctx_size,
++        nproc=args.sample_proc,
++        seed=args.seed,
++    )
+     glog.info('loaded dataset and devset')
+ 
+     nproc = torch.cuda.device_count()
+@@ -190,16 +241,23 @@ def main(args):
+             position_ids = position_ids.to(cur_device)
+             attention_mask = attention_mask.to(cur_device)
+             model.model.layers[i].to(cur_device)
++            pos_emb = None
+             for j in range(args.devset_size // args.batch_size):
++                hidden_states = orig_emb_cache[cur_device][
++                    args.batch_size * j : args.batch_size * (j + 1)].to(cur_device)
++                if pos_emb is None:
++                    pos_emb = model.model.rotary_emb(hidden_states, position_ids)
++                out = model.model.layers[i](
++                    hidden_states,
++                    position_ids=position_ids,
++                    attention_mask=attention_mask,
++                    use_cache=False,
++                    output_attentions=False,
++                    position_embeddings=pos_emb,
++                )
++                out_hidden = out[0] if isinstance(out, (tuple, list)) else out
+                 orig_emb_cache[cur_device + 1][
+-                    args.batch_size * j : args.batch_size * (j + 1)] = \
+-                    model.model.layers[i](
+-                        orig_emb_cache[cur_device][
+-                            args.batch_size * j : args.batch_size * (j + 1)].to(cur_device),
+-                        position_ids=position_ids,
+-                        attention_mask=attention_mask,
+-                        use_cache=False,
+-                        output_attentions=False)[0].cpu()
++                    args.batch_size * j : args.batch_size * (j + 1)] = out_hidden.cpu()
+             model.model.layers[i].cpu()
+             orig_msv = orig_emb_cache[cur_device].float().norm(
+             )**2 / orig_emb_cache[cur_device].numel()

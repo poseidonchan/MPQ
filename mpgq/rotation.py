@@ -279,6 +279,17 @@ def sample_hadamard_signs(
 
 
 @torch.inference_mode()
+def _is_fast_hadamard_unsupported(exc: RuntimeError) -> bool:
+    msg = str(exc).lower()
+    needles = (
+        "no kernel image is available",
+        "invalid device function",
+        "not compiled",
+    )
+    return any(needle in msg for needle in needles)
+
+
+@torch.inference_mode()
 def apply_exact_hadamard(
     matrix: torch.Tensor,
     *,
@@ -288,11 +299,14 @@ def apply_exact_hadamard(
     hadK, K = get_hadK(width, transpose=bool(transpose))
     matrix = matrix.to(dtype=torch.float32).contiguous()
 
-    if matrix.is_cuda:
+    use_fast = bool(matrix.is_cuda) and _load_fast_hadamard_transform(required=False)
+    if use_fast:
         try:
             return matmul_hadU_cuda(matrix, hadK, K).contiguous()
-        except Exception as exc:
-            log.debug("Hadamard CUDA path failed; falling back to torch implementation: %s", exc)
+        except RuntimeError as exc:
+            if not _is_fast_hadamard_unsupported(exc):
+                raise
+            log.debug("fast_hadamard_transform unsupported on this CUDA runtime; falling back: %s", exc)
 
     if transpose:
         return matmul_hadUt(matrix).contiguous()

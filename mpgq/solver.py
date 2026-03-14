@@ -71,6 +71,7 @@ class E8P12VampConfig:
     polish_sweeps: int = 3
     polish_metric: str = "gram"  # "gram" | "diag"
     polish_metric_rows_per_chunk: int = 0
+    polish_max_blocks: int = 0
 
 
 @torch.inference_mode()
@@ -798,6 +799,7 @@ def solve_e8p12_rankspace_vamp(
                 metric="gram" if polish_metric == "gram" else "diag",
                 accept_tol=0.0,
                 metric_rows_per_chunk=int(cfg.polish_metric_rows_per_chunk),
+                max_blocks_per_sweep=int(getattr(cfg, "polish_max_blocks", 0) or 0),
             ),
             idxs_init=final_Qidxs,
         )

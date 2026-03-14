@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pickle
 import re
 import subprocess
 import sys
@@ -48,6 +49,26 @@ def _ensure_pythonpath(env: Dict[str, str]) -> Dict[str, str]:
         env["PYTHONPATH"] = f"{prefix}:{existing}"
     else:
         env["PYTHONPATH"] = prefix
+    return env
+
+
+def _ensure_ld_library_path(env: Dict[str, str]) -> Dict[str, str]:
+    """Ensure CUDA extensions can load conda-provided runtime libraries.
+
+    `conda run` does not reliably set `LD_LIBRARY_PATH`, and some editable CUDA
+    extensions (e.g. quiptools_cuda) may link against newer `libstdc++` from
+    the conda env.
+    """
+
+    conda_prefix = env.get("CONDA_PREFIX") or os.environ.get("CONDA_PREFIX")
+    if not conda_prefix:
+        return env
+    lib_dir = str(Path(conda_prefix) / "lib")
+    existing = env.get("LD_LIBRARY_PATH", "")
+    if existing:
+        env["LD_LIBRARY_PATH"] = f"{lib_dir}:{existing}"
+    else:
+        env["LD_LIBRARY_PATH"] = lib_dir
     return env
 
 
@@ -111,7 +132,7 @@ def _collect_mpgq_layer_stats(ckpt_dir: Path) -> Dict[str, Any]:
     for path in ckpt_files:
         try:
             payload = torch.load(path, map_location="cpu")
-        except Exception as exc:
+        except (OSError, RuntimeError, EOFError, ValueError, pickle.UnpicklingError) as exc:
             stats.setdefault("load_errors", []).append({"file": str(path), "error": str(exc)})
             continue
 
@@ -151,10 +172,27 @@ def _collect_mpgq_layer_stats(ckpt_dir: Path) -> Dict[str, Any]:
 
 def _maybe_run_hessians(args, *, hessian_dir: Path, env: Dict[str, str], log_dir: Path) -> float:
     hessian_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = hessian_dir / "meta.json"
     have_any = any(hessian_dir.glob("*.pt"))
-    if have_any and not bool(args.force_hessians):
-        print(f"[hess] cache hit: {hessian_dir}", flush=True)
-        return 0.0
+    expected_meta = {
+        "base_model": str(args.base_model),
+        "seed": int(args.seed),
+        "devset_size": int(args.devset_size),
+        "ctx_size": int(args.ctx_size),
+        "sample_proc": int(args.sample_proc),
+        "hessian_batch_size": int(args.hessian_batch_size),
+        "calibration_dataset": str(args.calibration_dataset),
+        "calibration_split": str(args.calibration_split),
+    }
+    if have_any and not bool(args.force_hessians) and meta_path.exists():
+        try:
+            on_disk = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            on_disk = None
+        if isinstance(on_disk, dict) and on_disk == expected_meta:
+            print(f"[hess] cache hit: {hessian_dir}", flush=True)
+            return 0.0
+        print(f"[hess] cache meta mismatch; recomputing: {hessian_dir}", flush=True)
 
     cmd = [
         sys.executable,
@@ -174,11 +212,16 @@ def _maybe_run_hessians(args, *, hessian_dir: Path, env: Dict[str, str], log_dir
         str(int(args.ctx_size)),
         "--sample_proc",
         str(int(args.sample_proc)),
+        "--calibration_dataset",
+        str(args.calibration_dataset),
+        "--calibration_split",
+        str(args.calibration_split),
     ]
     t0 = time.time()
     rc = _run_logged(cmd, cwd=QUIP_ROOT, env=env, log_path=log_dir / "hessian.log")
     if rc != 0:
         raise RuntimeError(f"hessian_offline_llama failed with code {rc}")
+    meta_path.write_text(json.dumps(expected_meta, indent=2, sort_keys=True), encoding="utf-8")
     return float(time.time() - t0)
 
 
@@ -202,6 +245,7 @@ def run(args) -> Dict[str, Any]:
     hessian_dir.mkdir(parents=True, exist_ok=True)
 
     env = _ensure_pythonpath(dict(os.environ))
+    env = _ensure_ld_library_path(env)
 
     # Ensure Hessians exist once per (seed, base_model, devset).
     hessian_s = _maybe_run_hessians(args, hessian_dir=hessian_dir, env=env, log_dir=log_dir)
@@ -229,6 +273,10 @@ def run(args) -> Dict[str, Any]:
         str(int(args.devset_size)),
         "--ctx_size",
         str(int(args.ctx_size)),
+        "--calibration_dataset",
+        str(args.calibration_dataset),
+        "--calibration_split",
+        str(args.calibration_split),
         "--batch_size",
         str(int(args.batch_size)),
         "--scale_override",
@@ -265,6 +313,8 @@ def run(args) -> Dict[str, Any]:
             str(int(args.wmpq_polish_sweeps)),
             "--wmpq_polish_metric",
             str(args.wmpq_polish_metric),
+            "--wmpq_polish_max_blocks",
+            str(int(getattr(args, "wmpq_polish_max_blocks", 0))),
             "--wmpq_blocks_per_chunk",
             str(int(args.wmpq_blocks_per_chunk)),
             "--wmpq_block_rows",
@@ -304,6 +354,12 @@ def run(args) -> Dict[str, Any]:
         str(int(args.seed)),
         "--seqlen",
         str(int(args.eval_seqlen)),
+        "--datasets",
+        *list(getattr(args, "eval_datasets", ["wikitext2", "c4"])),
+        "--max_eval_tokens",
+        str(int(getattr(args, "eval_max_eval_tokens", 0))),
+        "--json_out",
+        str(log_dir / "eval_ppl.json"),
         "--no_use_cuda_graph",
         "--no_use_flash_attn",
     ]
@@ -327,7 +383,8 @@ def run(args) -> Dict[str, Any]:
         "base_model": str(args.base_model),
         "codebook": str(args.codebook),
         "calibration": {
-            "dataset": "rp1t",
+            "dataset": str(args.calibration_dataset),
+            "split": str(args.calibration_split),
             "devset_size": int(args.devset_size),
             "ctx_size": int(args.ctx_size),
             "batch_size": int(args.batch_size),
@@ -335,8 +392,9 @@ def run(args) -> Dict[str, Any]:
             "scale_override": float(args.scale_override),
         },
         "eval": {
-            "datasets": ["wikitext2", "c4"],
+            "datasets": list(getattr(args, "eval_datasets", ["wikitext2", "c4"])),
             "seqlen": int(args.eval_seqlen),
+            "max_eval_tokens": int(getattr(args, "eval_max_eval_tokens", 0)),
             "ppl": ppls,
         },
         "timing": {
@@ -370,6 +428,7 @@ def run(args) -> Dict[str, Any]:
             "best_iterate_export": bool(args.wmpq_best_iterate_export),
             "polish_sweeps": int(args.wmpq_polish_sweeps),
             "polish_metric": str(args.wmpq_polish_metric),
+            "polish_max_blocks": int(getattr(args, "wmpq_polish_max_blocks", 0)),
             "blocks_per_chunk": int(args.wmpq_blocks_per_chunk),
             "block_rows": int(args.wmpq_block_rows),
             "metric_rows_per_chunk": int(args.wmpq_metric_rows_per_chunk),
@@ -394,6 +453,8 @@ def main() -> None:
     parser.add_argument("--codebook", type=str, default="E8P12")
 
     # Calibration / Hessians
+    parser.add_argument("--calibration-dataset", type=str, default="c4")
+    parser.add_argument("--calibration-split", type=str, default="train")
     parser.add_argument("--devset-size", type=int, default=128)
     parser.add_argument("--ctx-size", type=int, default=2048)
     parser.add_argument("--batch-size", type=int, default=16)
@@ -405,6 +466,8 @@ def main() -> None:
 
     # Eval
     parser.add_argument("--eval-seqlen", type=int, default=2048)
+    parser.add_argument("--eval-datasets", nargs="*", default=["wikitext2", "c4"])
+    parser.add_argument("--eval-max-eval-tokens", type=int, default=131072)
 
     # MPGQ (QUIP side) defaults aligned with Gate B recipe.
     parser.add_argument("--wmpq-init", type=str, default="random", choices=["random", "rtn", "ldlq"])
@@ -424,6 +487,7 @@ def main() -> None:
     parser.add_argument("--wmpq-block-rows", type=int, default=32)
     parser.add_argument("--wmpq-polish-sweeps", type=int, default=3)
     parser.add_argument("--wmpq-polish-metric", type=str, default="gram", choices=["gram", "diag", "isotropic"])
+    parser.add_argument("--wmpq-polish-max-blocks", type=int, default=0)
     parser.add_argument("--wmpq-metric-rows-per-chunk", type=int, default=0)
 
     parser.add_argument("--output-dir", type=str, required=True)

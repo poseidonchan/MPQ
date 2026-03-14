@@ -70,15 +70,10 @@ def _resolve_block_rows(rows: int, cols: int, maxq: int, requested: int, device:
     if device.type != "cuda" or not hasattr(torch.cuda, "mem_get_info"):
         return block_rows
 
-    try:
-        free_bytes, _ = torch.cuda.mem_get_info(device=device)
-    except TypeError:
-        try:
-            free_bytes, _ = torch.cuda.mem_get_info(device.index if device.index is not None else 0)
-        except Exception:
-            return block_rows
-    except Exception:
-        return block_rows
+    # Query memory for the requested device via a device context. This avoids
+    # version-specific `mem_get_info` call signatures.
+    with torch.cuda.device(device):
+        free_bytes, _ = torch.cuda.mem_get_info()
 
     bytes_per_row = 4 * (8 * int(cols) + 4 * int(cols) * (int(maxq) + 1))
     budget = min(4 * 1024**3, int(free_bytes) // 2)
@@ -275,4 +270,3 @@ def run_mpgq_quantization(
         "quant_time_s": float(time.time() - start),
     }
     return Q, q_int_out, scale_out, zero_out, g_idx_out, float(time.time() - start), stats
-
