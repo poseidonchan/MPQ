@@ -150,8 +150,14 @@ def _branch_factorized_stats(
         gamma_eff = gamma_flat.view(n_items, 1, codesz)
 
     a = gamma_eff * y_branch.view(n_items, 1, codesz) * base_abs.view(1, n_bases, codesz)
-    y_norm = y_branch.square().sum(dim=-1, keepdim=True)
-    const = -0.5 * gamma_flat[:, :1] * (y_norm + base_sqnorm.view(1, n_bases))
+    if gamma_flat.shape[1] == 1:
+        y_norm = y_branch.square().sum(dim=-1, keepdim=True)
+        const = -0.5 * gamma_flat[:, :1] * (y_norm + base_sqnorm.view(1, n_bases))
+    else:
+        gamma_vec = gamma_flat.to(dtype=torch.float32)
+        y_norm = (gamma_vec * y_branch.square()).sum(dim=-1, keepdim=True)
+        base_norm = gamma_vec.matmul(base_abs_sq.to(dtype=torch.float32).T)
+        const = -0.5 * (y_norm + base_norm)
     parity_mask = (base_parity.view(1, n_bases) == 0)
 
     logC = torch.logaddexp(a, -a).sum(dim=-1)
@@ -291,8 +297,14 @@ def _branch_factorized_map(
         gamma_eff = gamma_flat.view(n_items, 1, codesz)
 
     a = gamma_eff * y_branch.view(n_items, 1, codesz) * base_abs.view(1, n_bases, codesz)
-    y_norm = y_branch.square().sum(dim=-1, keepdim=True)
-    const = -0.5 * gamma_flat[:, :1] * (y_norm + base_sqnorm.view(1, n_bases))
+    if gamma_flat.shape[1] == 1:
+        y_norm = y_branch.square().sum(dim=-1, keepdim=True)
+        const = -0.5 * gamma_flat[:, :1] * (y_norm + base_sqnorm.view(1, n_bases))
+    else:
+        gamma_vec = gamma_flat.to(dtype=torch.float32)
+        y_norm = (gamma_vec * y_branch.square()).sum(dim=-1, keepdim=True)
+        base_norm = gamma_vec.matmul(cache["base_abs_sq"].to(dtype=torch.float32).T)
+        const = -0.5 * (y_norm + base_norm)
 
     abs_a = a.abs()
     sum_abs = abs_a.sum(dim=-1)
@@ -442,6 +454,188 @@ def vamp_vector_map_e8p12(
     }
     if need_stats:
         out["margin"] = float(sum(margin_values) / len(margin_values)) if margin_values else 0.0
+    return out
+
+
+@torch.inference_mode()
+def gram_metric_map_blocks(
+    *,
+    r1_blocks: torch.Tensor,  # (B, n_blocks, 8)
+    gram_chols: torch.Tensor,  # (n_blocks, 8, 8) lower-triangular Cholesky
+    cb: object,
+    rows_per_chunk: int = 0,
+    prior_center_blocks: Optional[torch.Tensor] = None,
+    prior_scale_blocks: Optional[torch.Tensor] = None,
+    prior_tau: float = 0.0,
+    gamma1: Optional[torch.Tensor] = None,  # (B, 1) -- scalar precision for prior folding
+) -> Dict[str, torch.Tensor]:
+    """MAP-only assignment under per-block Gram metric (no posterior statistics)."""
+    out = gram_metric_denoiser_blocks(
+        r1_blocks=r1_blocks,
+        gamma1_scalar=gamma1 if gamma1 is not None else torch.ones(r1_blocks.shape[0], 1, device=r1_blocks.device),
+        gram_chols=gram_chols,
+        cb=cb,
+        rows_per_chunk=rows_per_chunk,
+        prior_center_blocks=prior_center_blocks,
+        prior_scale_blocks=prior_scale_blocks,
+        prior_tau=prior_tau,
+        need_stats=False,
+    )
+    return {"map_idxs": out["map_idxs"], "map_vals": out["map_vals"]}
+
+
+@torch.inference_mode()
+def gram_metric_denoiser_blocks(
+    *,
+    r1_blocks: torch.Tensor,  # (B, n_blocks, 8)
+    gamma1_scalar: torch.Tensor,  # (B, 1) -- scalar VAMP precision
+    gram_chols: torch.Tensor,  # (n_blocks, 8, 8) lower-triangular Cholesky of G_k
+    cb: object,
+    rows_per_chunk: int = 0,
+    prior_center_blocks: Optional[torch.Tensor] = None,
+    prior_scale_blocks: Optional[torch.Tensor] = None,
+    prior_tau: float = 0.0,
+    need_stats: bool = False,
+) -> Dict[str, torch.Tensor | float]:
+    """Full discrete MMSE denoiser under per-block Gram metric.
+
+    Posterior for block k:
+      p(c | r1_k, gamma1, G_k) ∝ exp(-0.5 * gamma1 * (c - r1_k)^T G_k (c - r1_k))
+
+    This is equivalent to an isotropic channel in the whitened space z = L_k^T x.
+
+    Returns:
+      x1_blocks: (B, n_blocks, 8) -- posterior mean in original space
+      var1:      (B, n_blocks)     -- per-block mean Gram-metric variance / codesz
+      map_idxs:  (B, n_blocks)     -- MAP codeword index
+      map_vals:  (B, n_blocks, 8)  -- MAP codeword values
+      alpha1:    (B, 1)            -- gamma1 * mean(var1), Gram-calibrated
+    """
+    batch, n_blocks, codesz = r1_blocks.shape
+    device = r1_blocks.device
+    grid = cb.grid.to(dtype=torch.float32, device=device)  # (C, 8)
+    C = grid.shape[0]
+
+    x1_blocks = torch.empty(batch, n_blocks, codesz, dtype=torch.float32, device=device)
+    var1 = torch.empty(batch, n_blocks, dtype=torch.float32, device=device)
+    map_idxs = torch.empty(batch, n_blocks, dtype=torch.long, device=device)
+    map_vals = torch.empty(batch, n_blocks, codesz, dtype=r1_blocks.dtype, device=device)
+    entropy_acc = 0.0
+    margin_acc = 0.0
+    stat_count = 0
+
+    # Prior folding: combine channel message with prior into effective target & precision.
+    r1_work = r1_blocks.to(dtype=torch.float32)
+    gamma1_eff = gamma1_scalar.to(dtype=torch.float32)  # (B, 1)
+    # For the Gram-metric denoiser, the prior is isotropic (per-element) while the
+    # channel is Gram-weighted. The combined posterior is:
+    #   score = -0.5 * gamma1 * (c-r1)^T G_k (c-r1) - 0.5 * prior_prec * ||c-center||^2
+    # We handle this as a combined score in the brute-force loop below.
+    has_prior = float(prior_tau) > 0.0 and prior_center_blocks is not None
+    prior_prec_blocks: Optional[torch.Tensor] = None
+    if has_prior:
+        assert prior_center_blocks is not None
+        scale_blocks = prior_scale_blocks
+        if scale_blocks is None:
+            scale_blocks = prior_scale_from_center(prior_center_blocks, "absmax")
+        scale_blocks = scale_blocks.to(dtype=torch.float32, device=device).clamp_min_(1e-12)
+        tau2 = (max(float(prior_tau), 1e-12) * scale_blocks).square()
+        prior_prec_blocks = (1.0 / tau2)  # (B, n_blocks, 1)
+
+    rows_per_chunk = max(int(rows_per_chunk), 0)
+    if rows_per_chunk <= 0:
+        rows_per_chunk = batch
+
+    high_gamma_snap = 1e3
+
+    for bi in range(n_blocks):
+        chol = gram_chols[bi].to(dtype=torch.float32)  # (8, 8)
+        # Pre-transform grid to whitened space for this block.
+        grid_white = grid.matmul(chol)  # (C, 8)
+        grid_white_norm = grid_white.square().sum(dim=-1)  # (C,)
+
+        for rstart in range(0, batch, rows_per_chunk):
+            rend = min(rstart + rows_per_chunk, batch)
+            chunk_B = rend - rstart
+            r1_chunk = r1_work[rstart:rend, bi, :]  # (chunk_B, 8)
+            gamma1_chunk = gamma1_eff[rstart:rend, :]  # (chunk_B, 1)
+
+            # Gram-metric distances: (c - r1)^T G (c - r1) = ||L^T c - L^T r1||^2
+            r1_white = r1_chunk.matmul(chol)  # (chunk_B, 8)
+            r1_white_norm = r1_white.square().sum(dim=-1, keepdim=True)  # (chunk_B, 1)
+            # sq_dist[i,j] = ||grid_white[j] - r1_white[i]||^2
+            sq_dist = r1_white_norm + grid_white_norm.unsqueeze(0) - 2.0 * r1_white.matmul(grid_white.T)
+            # (chunk_B, C)
+
+            # Log-scores: -0.5 * gamma1 * sq_dist
+            log_scores = -0.5 * gamma1_chunk * sq_dist  # (chunk_B, C)
+
+            # Add prior term if present: -0.5 * prior_prec * ||c - center||^2
+            if has_prior and prior_prec_blocks is not None:
+                assert prior_center_blocks is not None
+                center = prior_center_blocks[rstart:rend, bi, :]  # (chunk_B, 8)
+                pp = prior_prec_blocks[rstart:rend, bi, :]  # (chunk_B, 1)
+                # ||c - center||^2 for all C codewords
+                center_norm = center.square().sum(dim=-1, keepdim=True)  # (chunk_B, 1)
+                grid_norm_iso = grid.square().sum(dim=-1).unsqueeze(0)  # (1, C)
+                prior_sq = center_norm + grid_norm_iso - 2.0 * center.matmul(grid.T)  # (chunk_B, C)
+                log_scores = log_scores - 0.5 * pp * prior_sq
+
+            # MAP
+            map_idx = log_scores.argmax(dim=-1)  # (chunk_B,)
+            map_val = grid.index_select(0, map_idx)  # (chunk_B, 8)
+
+            # Posterior probabilities
+            probs = torch.softmax(log_scores, dim=-1)  # (chunk_B, C)
+
+            # Posterior mean: E[c] = sum_c p(c) * c
+            mu = probs.matmul(grid)  # (chunk_B, 8)
+
+            # Gram-metric variance:
+            # V_G = E[(c-mu)^T G (c-mu)] / codesz
+            #     = (E[||L^T c||^2] - ||L^T mu||^2) / codesz
+            mu_white = mu.matmul(chol)  # (chunk_B, 8)
+            mu_white_norm = mu_white.square().sum(dim=-1)  # (chunk_B,)
+            E_white_norm = (probs * grid_white_norm.unsqueeze(0)).sum(dim=-1)  # (chunk_B,)
+            block_var = ((E_white_norm - mu_white_norm) / float(codesz)).clamp_min_(0.0)  # (chunk_B,)
+
+            # High-gamma snap: when posterior is near-deterministic, use MAP directly
+            high_mask = gamma1_chunk.squeeze(-1) >= high_gamma_snap
+            if bool(high_mask.any().item()):
+                mu[high_mask] = map_val[high_mask]
+                block_var[high_mask] = 0.0
+
+            x1_blocks[rstart:rend, bi, :] = mu
+            var1[rstart:rend, bi] = block_var
+            map_idxs[rstart:rend, bi] = map_idx
+            map_vals[rstart:rend, bi, :] = map_val.to(dtype=r1_blocks.dtype)
+
+            if need_stats:
+                log_probs = log_scores - torch.logsumexp(log_scores, dim=-1, keepdim=True)
+                ent = -(probs * log_probs).sum(dim=-1).mean().item()
+                top2 = torch.topk(log_scores, k=min(2, C), dim=-1).values
+                mrg = (top2[:, 0] - top2[:, 1]).mean().item() if top2.shape[-1] >= 2 else float("inf")
+                entropy_acc += float(ent)
+                margin_acc += float(mrg)
+                stat_count += 1
+
+    # Alpha1: gamma1 * mean(var1) -- properly calibrated to Gram metric
+    alpha1 = gamma1_eff * var1.mean(dim=1, keepdim=True)  # (B, 1)
+
+    out: Dict[str, torch.Tensor | float] = {
+        "x1_blocks": x1_blocks,
+        "var1": var1,
+        "var1_diag": None,
+        "map_idxs": map_idxs,
+        "map_vals": map_vals,
+        "alpha1": alpha1,
+    }
+    if need_stats:
+        out["entropy"] = float(entropy_acc / max(stat_count, 1))
+        out["margin"] = float(margin_acc / max(stat_count, 1))
+    else:
+        out["entropy"] = 0.0
+        out["margin"] = 0.0
     return out
 
 
@@ -626,7 +820,7 @@ def vamp_vector_discrete_mmse_e8p12(
         elif var1_diag is not None:
             alpha1 = (gamma1.to(dtype=torch.float32) * var1_diag).mean(dim=(1, 2)).unsqueeze(-1)
         else:
-            alpha1 = (gamma1[..., 0].to(dtype=torch.float32) * var1).mean(dim=1, keepdim=True)
+            alpha1 = (gamma1.to(dtype=torch.float32).mean(dim=-1) * var1).mean(dim=1, keepdim=True)
 
     return {
         "x1_blocks": x1_blocks,

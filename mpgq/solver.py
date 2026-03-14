@@ -6,9 +6,9 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
-from .linear import em_update_obs_precision_rankspace, linear_mmse_exact, vamp_rankspace_error
+from .linear import em_update_obs_precision_rankspace, linear_mmse_block_vamp, linear_mmse_exact, vamp_rankspace_error
 from .polish.block_cd import BlockCDConfig, E8P12Provider, UniformScalarProvider, block_coordinate_descent_rankspace
-from .priors.e8p12 import prior_scale_from_center, vamp_vector_discrete_mmse_e8p12, vamp_vector_map_e8p12
+from .priors.e8p12 import gram_metric_denoiser_blocks, gram_metric_map_blocks, prior_scale_from_center, vamp_vector_discrete_mmse_e8p12, vamp_vector_map_e8p12
 from .priors.uniform import dequant_from_q, discrete_uniform_mmse, nearest_atom_idx, select_x1_for_linear_step
 from .utils import (
     alpha_valid_mask,
@@ -23,7 +23,8 @@ from .utils import (
 class UniformVampConfig:
     iters: int = 10
     damping: float = 0.5
-    x1_mode: str = "mmse"  # "mmse" | "map"
+    x1_mode: str = "mmse"  # "mmse" | "map" | "mix"
+    map_mix: float = 0.0
     final_decision: str = "map"  # "map" | "round_mean" | "nearest_mean"
     init_from: str = "rtn"  # "rtn" | "float" | "zero"
     gamma_start: float = 1.0
@@ -48,8 +49,9 @@ class UniformVampConfig:
 class E8P12VampConfig:
     iters: int = 4
     damping: float = 0.5
-    x1_mode: str = "map"  # "mean" | "map" | "mix"
-    map_mix: float = 0.5
+    x1_mode: str = "mean"  # VAMP iteration always uses MMSE; this field is legacy
+    map_mix: float = 0.0
+    denoiser_metric: str = "isotropic"  # "isotropic" | "gram"
     gamma_start: float = 1.0
     gamma_retry_factor: float = 4.0
     gamma_retry_steps: int = 3
@@ -68,6 +70,7 @@ class E8P12VampConfig:
     adaptive_damping_min: float = 0.1
     adaptive_obs_precision_backoff: float = 0.5
     blocks_per_chunk: int = 16
+    block_vamp: bool = False  # per-block precision VAMP (vs scalar)
     polish_sweeps: int = 3
     polish_metric: str = "gram"  # "gram" | "diag"
     polish_metric_rows_per_chunk: int = 0
@@ -97,6 +100,19 @@ def _positive_schedule(start: float, end: Optional[float], frac: float) -> float
     if frac >= 1.0:
         return end
     return float(math.exp((1.0 - frac) * math.log(start) + frac * math.log(end)))
+
+
+def _resolve_map_mix(*, x1_mode: str, map_mix: float, frac: float) -> float:
+    mode = str(x1_mode or "mmse").strip().lower()
+    if mode in ("mmse", "mean"):
+        return 0.0
+    if mode == "map":
+        return 1.0
+    if mode != "mix":
+        raise ValueError(f"unsupported x1_mode={x1_mode!r}")
+    start = float(max(0.0, min(1.0, map_mix)))
+    frac = float(max(0.0, min(1.0, frac)))
+    return float(start + (1.0 - start) * frac)
 
 
 @torch.inference_mode()
@@ -152,6 +168,7 @@ def solve_uniform_rankspace_vamp(
     damping = float(cfg.damping)
     prior_tau = float(cfg.prior_tau)
     x1_mode = str(cfg.x1_mode or "mmse").strip().lower()
+    map_mix = float(max(0.0, min(1.0, float(getattr(cfg, "map_mix", 0.0) or 0.0))))
     final_decision = str(cfg.final_decision or "map").strip().lower()
     init_from = str(cfg.init_from or "rtn").strip().lower()
 
@@ -217,6 +234,7 @@ def solve_uniform_rankspace_vamp(
         post = None
         alpha1 = None
         x1 = None
+        map_mix_iter = _resolve_map_mix(x1_mode=x1_mode, map_mix=map_mix, frac=0.0 if iters <= 1 else float(iter_idx) / float(iters - 1))
         for retry_idx in range(gamma_retry_steps + 1):
             post_candidate = discrete_uniform_mmse(
                 r1=r1,
@@ -234,7 +252,7 @@ def solve_uniform_rankspace_vamp(
             if bool(valid_alpha1.all().item()):
                 post = post_candidate
                 alpha1 = alpha1_candidate
-                x1 = select_x1_for_linear_step(post_candidate, x1_mode=x1_mode)
+                x1 = select_x1_for_linear_step(post_candidate, x1_mode=x1_mode, map_mix=map_mix_iter)
                 break
 
             if retry_idx >= gamma_retry_steps:
@@ -242,7 +260,7 @@ def solve_uniform_rankspace_vamp(
                     require_valid_alpha("alpha1", alpha1_candidate, eps=alpha_eps)
                 post = post_candidate
                 alpha1 = alpha1_candidate.clamp(min=alpha_eps, max=1.0 - alpha_eps)
-                x1 = select_x1_for_linear_step(post_candidate, x1_mode=x1_mode)
+                x1 = select_x1_for_linear_step(post_candidate, x1_mode=x1_mode, map_mix=map_mix_iter)
                 break
 
             alpha1_retry_count += int((~valid_alpha1).sum().item())
@@ -426,7 +444,7 @@ def solve_uniform_rankspace_vamp(
             Vs=Vs,
             block_size=1,
             provider=UniformScalarProvider(scale=scale_full, zero=zero_full, maxq=maxq),
-            cfg=BlockCDConfig(sweeps=polish_sweeps, metric="diag", accept_tol=0.0),
+            cfg=BlockCDConfig(sweeps=polish_sweeps, metric="diag", accept_tol=0.0, order_mode="greedy_gain"),
         )
         q_polished = nearest_atom_idx(x=x_polished, scale_full=scale_full, zero_full=zero_full, maxq=maxq).to(dtype=torch.int32)
         x_polished = dequant_from_q(q_int=q_polished, scale_full=scale_full, zero_full=zero_full)
@@ -446,6 +464,8 @@ def solve_uniform_rankspace_vamp(
         "iters": int(iters),
         "rank": int(rank),
         "x1_mode": str(x1_mode),
+        "map_mix_start": float(map_mix),
+        "map_mix_end": float(_resolve_map_mix(x1_mode=x1_mode, map_mix=map_mix, frac=1.0)),
         "final_decision": str(final_decision),
         "init_from": str(init_from),
         "damping": float(damping),
@@ -478,6 +498,52 @@ def solve_uniform_rankspace_vamp(
         "rtn_rankspace_error_mean": float(rtn_err.mean().item()) if rtn_err.numel() else 0.0,
     }
     return q_final.to(dtype=torch.int32), x_final, err_final, rtn_err, stats
+
+
+@torch.inference_mode()
+def _resolve_x1_from_post(
+    post: dict,
+    r1: torch.Tensor,
+    x1_mode: str,
+    map_mix_iter: float,
+    gram_chols: Optional[torch.Tensor],
+    cb: object,
+    W_blocks: torch.Tensor,
+    prior_scale_blocks: Optional[torch.Tensor],
+    prior_tau: float,
+    gamma1: torch.Tensor,
+) -> torch.Tensor:
+    """Extract x1 for the linear step, using gram-metric MAP when gram_chols is provided."""
+    B = r1.shape[0]
+    nblocks = int(post["map_vals"].shape[1])
+    codesz = int(post["map_vals"].shape[2])
+
+    if gram_chols is not None and x1_mode in ("map", "mix"):
+        gram_post = gram_metric_map_blocks(
+            r1_blocks=r1.reshape(B, nblocks, codesz),
+            gram_chols=gram_chols,
+            cb=cb,
+            prior_center_blocks=W_blocks if prior_tau > 0.0 else None,
+            prior_scale_blocks=prior_scale_blocks,
+            prior_tau=prior_tau,
+            gamma1=gamma1 if prior_tau > 0.0 else None,
+        )
+        x_map = gram_post["map_vals"].reshape_as(r1)
+        if x1_mode == "map":
+            return x_map
+        # mix: blend gram-metric MAP with isotropic MMSE mean
+        x_mean = post["x1_blocks"].reshape_as(r1)
+        return (1.0 - map_mix_iter) * x_mean + map_mix_iter * x_map
+
+    # Isotropic / diag_hessian path (unchanged)
+    if x1_mode == "map":
+        return post["map_vals"].reshape_as(r1)
+    elif x1_mode == "mix":
+        x_mean = post["x1_blocks"].reshape_as(r1)
+        x_map = post["map_vals"].reshape_as(r1)
+        return (1.0 - map_mix_iter) * x_mean + map_mix_iter * x_map
+    else:
+        return post["x1_blocks"].reshape_as(r1)
 
 
 @torch.inference_mode()
@@ -515,6 +581,13 @@ def solve_e8p12_rankspace_vamp(
     x1_mode = str(cfg.x1_mode or "map").strip().lower()
     map_mix = float(cfg.map_mix)
     map_mix = max(0.0, min(1.0, map_mix))
+    denoiser_metric = str(getattr(cfg, "denoiser_metric", "isotropic") or "isotropic").strip().lower()
+    if denoiser_metric in ("none", "l2", "isotropic"):
+        denoiser_metric = "isotropic"
+    elif denoiser_metric in ("gram", "gram_hessian", "full_hessian"):
+        denoiser_metric = "gram"
+    else:
+        raise ValueError(f"unsupported denoiser_metric={denoiser_metric!r}; expected isotropic|gram.")
 
     W_blocks = Wr.reshape(B, nblocks, codesz)
     prior_scale_blocks = None
@@ -531,6 +604,18 @@ def solve_e8p12_rankspace_vamp(
     obs_precision_end = cfg.obs_precision_end if float(cfg.obs_precision) > 0.0 else None
     obs_precision_local = float(obs_precision_start)
     em_obs_active = bool(cfg.em_obs_precision) and float(cfg.obs_precision) <= 0.0
+
+    gram_chols: Optional[torch.Tensor] = None
+    if denoiser_metric == "gram" and Vs.numel() > 0:
+        from .linear import stabilize_cholesky
+
+        Vs_f32 = Vs.to(dtype=torch.float32)
+        chols_list = []
+        for bi in range(nblocks):
+            Vs_blk = Vs_f32[bi * codesz : (bi + 1) * codesz]  # (8, R)
+            gram_raw = Vs_blk.matmul(Vs_blk.T).contiguous()  # (8, 8)
+            chols_list.append(stabilize_cholesky(gram_raw))
+        gram_chols = torch.stack(chols_list, dim=0).contiguous()  # (nblocks, 8, 8)
 
     r1 = hatWr_init.clone()
     gamma1 = float(cfg.gamma_start) * (0.25 / _rowwise_quant_mse(Wr, hatWr_init))
@@ -567,6 +652,189 @@ def solve_e8p12_rankspace_vamp(
     adaptive_obs_backoff = float(cfg.adaptive_obs_precision_backoff)
 
     blocks_per_chunk = max(int(cfg.blocks_per_chunk), 1)
+    use_block_vamp = bool(cfg.block_vamp) and iters > 0
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  Block-VAMP: per-block precision γ₁_k, γ₂_k, α₁_k, α₂_k
+    # ═══════════════════════════════════════════════════════════════════
+    if use_block_vamp:
+        # γ₁ init: (K,) per-block, derived from per-block quantization MSE
+        hatWr_blocks = hatWr_init.reshape(B, nblocks, codesz)
+        Wr_blocks = Wr.reshape(B, nblocks, codesz)
+        block_mse = (Wr_blocks - hatWr_blocks).square().mean(dim=(0, 2)).clamp_min_(1e-12)  # (K,)
+        gamma1_bv = (float(cfg.gamma_start) * 0.25 / block_mse).clamp(min=1e-6, max=1e6)  # (K,)
+        device = Wr.device
+
+        r1_bv = hatWr_init.clone()  # (B, n)
+        r2_bv_prev: Optional[torch.Tensor] = None
+        gamma2_bv_prev: Optional[torch.Tensor] = None
+
+        for iter_idx in range(iters):
+            step_obs = float(obs_precision_local)
+
+            # ── x1 step: denoiser with per-block gamma1 ──
+            r1_blocks = r1_bv.reshape(B, nblocks, codesz)
+            # Per-block gamma1 → per-element for the factorized denoiser: (1, K, 1)
+            gamma1_for_den = gamma1_bv.view(1, nblocks, 1).expand(B, nblocks, 1)
+            post_bv = vamp_vector_discrete_mmse_e8p12(
+                r1_blocks=r1_blocks,
+                gamma1=gamma1_for_den,
+                cb=cb,
+                blocks_per_chunk=blocks_per_chunk,
+                need_stats=bool(log_stats),
+                need_var_diag=False,
+                prior_center_blocks=W_blocks if prior_tau > 0.0 else None,
+                prior_scale_blocks=prior_scale_blocks,
+                prior_tau=prior_tau,
+                prior_tau_scale_mode=prior_tau_scale_mode,
+            )
+            # Per-block alpha1: α₁_k = γ₁_k * mean_rows(var1[:,k])
+            var1_bv = post_bv["var1"]  # (B, K)
+            alpha1_bv = (gamma1_bv.unsqueeze(0) * var1_bv).mean(dim=0)  # (K,)
+            alpha1_bv = alpha1_bv.clamp(min=alpha_eps, max=1.0 - alpha_eps)
+
+            # x1: always use posterior mean (MMSE) for VAMP self-consistency
+            x1_bv = post_bv["x1_blocks"].reshape_as(r1_bv)
+
+            # ── Extrinsic x1→x2: per-block ──
+            eta1_bv = gamma1_bv / alpha1_bv  # (K,)
+            gamma2_bv = (eta1_bv - gamma1_bv).clamp_min_(1e-12)  # (K,)
+            if not bool(torch.isfinite(gamma2_bv).all().item()):
+                gamma2_invalid_count += 1
+                continue
+
+            # r2 per-block: r2_k = (η₁_k x1_k - γ₁_k r1_k) / γ₂_k
+            eta1_exp = eta1_bv.view(1, nblocks, 1)      # (1, K, 1)
+            gamma1_exp = gamma1_bv.view(1, nblocks, 1)   # (1, K, 1)
+            gamma2_exp = gamma2_bv.view(1, nblocks, 1)    # (1, K, 1)
+            x1_blocks = x1_bv.reshape(B, nblocks, codesz)
+            r1_blk = r1_bv.reshape(B, nblocks, codesz)
+            r2_bv_new = ((eta1_exp * x1_blocks - gamma1_exp * r1_blk) / gamma2_exp).reshape(B, n)
+
+            # Damping on r2, gamma2
+            if r2_bv_prev is not None and gamma2_bv_prev is not None and damping < 1.0:
+                gamma2_bv_try = log_damp_positive(gamma2_bv_prev, gamma2_bv, damping)
+                r2_bv_try = (1.0 - damping) * r2_bv_prev + damping * r2_bv_new
+            else:
+                gamma2_bv_try = gamma2_bv
+                r2_bv_try = r2_bv_new
+
+            # ── x2 step: block-VAMP linear MMSE ──
+            x2_bv, alpha2_bv, residual_bv = linear_mmse_block_vamp(
+                r2_bv_try,
+                gamma2_bv_try,
+                Y_u=Y_u,
+                Vs=Vs,
+                S=S,
+                obs_precision=step_obs,
+                codesz=codesz,
+            )
+
+            # EM obs precision update
+            if em_obs_active and rank > 0:
+                obs_precision_local = em_update_obs_precision_rankspace(
+                    residual_u=residual_bv,
+                    gamma2=gamma2_bv_try.mean().unsqueeze(0).unsqueeze(0),  # scalar approx for EM
+                    S=S,
+                    obs_precision=step_obs,
+                    num_obs=rank,
+                    damping=float(cfg.em_obs_precision_damping),
+                    min_value=float(cfg.em_obs_precision_min),
+                    max_value=float(cfg.em_obs_precision_max),
+                )
+
+            # ── Extrinsic x2→x1: per-block ──
+            alpha2_bv = alpha2_bv.clamp(min=alpha_eps, max=1.0 - alpha_eps)  # (K,)
+            eta2_bv = gamma2_bv_try / alpha2_bv  # (K,)
+            gamma1_bv_new = (eta2_bv - gamma2_bv_try).clamp_min_(1e-12)  # (K,)
+
+            # r1 per-block
+            eta2_exp = eta2_bv.view(1, nblocks, 1)
+            gamma2_try_exp = gamma2_bv_try.view(1, nblocks, 1)
+            gamma1_new_exp = gamma1_bv_new.view(1, nblocks, 1)
+            x2_blocks = x2_bv.reshape(B, nblocks, codesz)
+            r2_blk = r2_bv_try.reshape(B, nblocks, codesz)
+            r1_bv_new = ((eta2_exp * x2_blocks - gamma2_try_exp * r2_blk) / gamma1_new_exp).reshape(B, n)
+
+            # Damping on r1, gamma1
+            if damping < 1.0 and iter_idx > 0:
+                gamma1_bv_candidate = log_damp_positive(gamma1_bv, gamma1_bv_new, damping)
+                r1_bv_candidate = (1.0 - damping) * r1_bv + damping * r1_bv_new
+            else:
+                gamma1_bv_candidate = gamma1_bv_new
+                r1_bv_candidate = r1_bv_new
+
+
+            # Accept/reject: quantize from candidate r1 and check error
+            if adaptive_accept_reject:
+                trial_post_bv = vamp_vector_map_e8p12(
+                    r1_blocks=r1_bv_candidate.reshape(B, nblocks, codesz),
+                    gamma1=gamma1_bv_candidate.view(1, nblocks, 1).expand(B, nblocks, 1),
+                    cb=cb,
+                    blocks_per_chunk=blocks_per_chunk,
+                    need_stats=False,
+                    prior_center_blocks=W_blocks if prior_tau > 0.0 else None,
+                    prior_scale_blocks=prior_scale_blocks,
+                    prior_tau=prior_tau,
+                    prior_tau_scale_mode=prior_tau_scale_mode,
+                )
+                trial_hatWr_bv = trial_post_bv["map_vals"].reshape_as(r1_bv)
+                trial_err_bv = vamp_rankspace_error(Y_u=Y_u, x=trial_hatWr_bv, Vs=Vs)
+                if float(trial_err_bv.mean().item()) <= float(current_err.mean().item()) * (1.0 + adaptive_accept_tol):
+                    # Accept
+                    gamma1_bv = gamma1_bv_candidate
+                    r1_bv = r1_bv_candidate
+                    r2_bv_prev = r2_bv_try
+                    gamma2_bv_prev = gamma2_bv_try
+                    current_err = trial_err_bv
+                    last_hatWr = trial_hatWr_bv
+                    last_Qidxs = trial_post_bv["map_idxs"].to(dtype=getattr(cb, "idx_dtype", torch.int64))
+                    if bool(cfg.best_iterate_export):
+                        improved = current_err < best_err
+                        if bool(improved.any().item()):
+                            mask = improved.unsqueeze(-1)
+                            best_hatWr = torch.where(mask, trial_hatWr_bv, best_hatWr)
+                            best_Qidxs = torch.where(improved.unsqueeze(-1), last_Qidxs, best_Qidxs)
+                            best_err = torch.minimum(best_err, current_err)
+                else:
+                    step_reject_count += 1
+            else:
+                # No accept/reject: always accept
+                gamma1_bv = gamma1_bv_candidate
+                r1_bv = r1_bv_candidate
+                r2_bv_prev = r2_bv_try
+                gamma2_bv_prev = gamma2_bv_try
+
+            # Stats
+            alpha1_values.append(float(alpha1_bv.mean().item()))
+            alpha2_values.append(float(alpha2_bv.mean().item()))
+            obs_precision_values.append(float(obs_precision_local))
+
+        # Final MAP quantization from VAMP-optimized r1
+        final_map_post = vamp_vector_map_e8p12(
+            r1_blocks=r1_bv.reshape(B, nblocks, codesz),
+            gamma1=gamma1_bv.view(1, nblocks, 1).expand(B, nblocks, 1),
+            cb=cb,
+            blocks_per_chunk=blocks_per_chunk,
+            need_stats=False,
+            prior_center_blocks=W_blocks if prior_tau > 0.0 else None,
+            prior_scale_blocks=prior_scale_blocks,
+            prior_tau=prior_tau,
+            prior_tau_scale_mode=prior_tau_scale_mode,
+        )
+        last_hatWr = final_map_post["map_vals"].reshape_as(r1_bv)
+        last_Qidxs = final_map_post["map_idxs"].to(dtype=getattr(cb, "idx_dtype", torch.int64))
+        current_err = vamp_rankspace_error(Y_u=Y_u, x=last_hatWr, Vs=Vs)
+        if bool(cfg.best_iterate_export):
+            improved = current_err < best_err
+            if bool(improved.any().item()):
+                mask = improved.unsqueeze(-1)
+                best_hatWr = torch.where(mask, last_hatWr, best_hatWr)
+                best_Qidxs = torch.where(improved.unsqueeze(-1), last_Qidxs, best_Qidxs)
+                best_err = torch.minimum(best_err, current_err)
+
+        # Block-VAMP done — skip the scalar loop below
+        iters = 0
 
     for iter_idx in range(iters):
         frac = 1.0 if iters <= 1 else float(iter_idx) / float(iters - 1)
@@ -580,55 +848,72 @@ def solve_e8p12_rankspace_vamp(
         post = None
         alpha1 = None
         x1 = None
-        for retry_idx in range(gamma_retry_steps + 1):
-            post_candidate = vamp_vector_discrete_mmse_e8p12(
+        map_mix_iter = _resolve_map_mix(x1_mode=x1_mode, map_mix=map_mix, frac=frac)
+        if gram_chols is not None:
+            # ── Full Gram-metric denoiser: alpha1 is Gram-calibrated ──
+            post_candidate = gram_metric_denoiser_blocks(
                 r1_blocks=r1.reshape(B, nblocks, codesz),
-                gamma1=gamma1_work,
+                gamma1_scalar=gamma1_work,
+                gram_chols=gram_chols,
                 cb=cb,
-                blocks_per_chunk=blocks_per_chunk,
-                need_stats=bool(log_stats),
-                need_var_diag=False,
+                rows_per_chunk=0,
                 prior_center_blocks=W_blocks if prior_tau > 0.0 else None,
                 prior_scale_blocks=prior_scale_blocks,
                 prior_tau=prior_tau,
-                prior_tau_scale_mode=prior_tau_scale_mode,
+                need_stats=bool(log_stats),
             )
-            alpha1_candidate = post_candidate["alpha1"]  # type: ignore[assignment]
+            alpha1_candidate = post_candidate["alpha1"]
             valid_alpha1 = alpha_valid_mask(alpha1_candidate, eps=alpha_eps)
             if bool(valid_alpha1.all().item()):
                 post = post_candidate
                 alpha1 = alpha1_candidate
-                if x1_mode == "map":
-                    x1 = post_candidate["map_vals"].reshape_as(r1)  # type: ignore[assignment]
-                elif x1_mode == "mix":
-                    x_mean = post_candidate["x1_blocks"].reshape_as(r1)  # type: ignore[assignment]
-                    x_map = post_candidate["map_vals"].reshape_as(r1)  # type: ignore[assignment]
-                    x1 = (1.0 - map_mix) * x_mean + map_mix * x_map
-                else:
-                    x1 = post_candidate["x1_blocks"].reshape_as(r1)  # type: ignore[assignment]
-                break
-
-            if retry_idx >= gamma_retry_steps:
-                if not torch.isfinite(alpha1_candidate).all():
-                    require_valid_alpha("alpha1", alpha1_candidate, eps=alpha_eps)
+            else:
+                alpha1_retry_count += int((~valid_alpha1).sum().item())
                 post = post_candidate
                 alpha1 = torch.nan_to_num(alpha1_candidate, nan=0.5, posinf=1.0 - alpha_eps, neginf=alpha_eps).clamp(
                     min=alpha_eps, max=1.0 - alpha_eps
                 )
-                if x1_mode == "map":
-                    x1 = post_candidate["map_vals"].reshape_as(r1)  # type: ignore[assignment]
-                elif x1_mode == "mix":
-                    x_mean = post_candidate["x1_blocks"].reshape_as(r1)  # type: ignore[assignment]
-                    x_map = post_candidate["map_vals"].reshape_as(r1)  # type: ignore[assignment]
-                    x1 = (1.0 - map_mix) * x_mean + map_mix * x_map
-                else:
-                    x1 = post_candidate["x1_blocks"].reshape_as(r1)  # type: ignore[assignment]
-                break
+            # Always use MMSE (posterior mean) for VAMP self-consistency
+            x1 = post_candidate["x1_blocks"].reshape_as(r1)
+        else:
+            # ── Factorized isotropic denoiser (original path) ──
+            for retry_idx in range(gamma_retry_steps + 1):
+                post_candidate = vamp_vector_discrete_mmse_e8p12(
+                    r1_blocks=r1.reshape(B, nblocks, codesz),
+                    gamma1=gamma1_work,
+                    cb=cb,
+                    blocks_per_chunk=blocks_per_chunk,
+                    need_stats=bool(log_stats),
+                    need_var_diag=False,
+                    prior_center_blocks=W_blocks if prior_tau > 0.0 else None,
+                    prior_scale_blocks=prior_scale_blocks,
+                    prior_tau=prior_tau,
+                    prior_tau_scale_mode=prior_tau_scale_mode,
+                )
+                alpha1_candidate = post_candidate["alpha1"]  # type: ignore[assignment]
+                valid_alpha1 = alpha_valid_mask(alpha1_candidate, eps=alpha_eps)
+                if bool(valid_alpha1.all().item()):
+                    post = post_candidate
+                    alpha1 = alpha1_candidate
+                    # Always use MMSE (posterior mean) for VAMP self-consistency
+                    x1 = post_candidate["x1_blocks"].reshape_as(r1)
+                    break
 
-            alpha1_retry_count += int((~valid_alpha1).sum().item())
-            gamma1_work = torch.where(alpha1_candidate <= alpha_eps, gamma1_work / gamma_retry_factor, gamma1_work)
-            gamma1_work = torch.where(alpha1_candidate >= 1.0 - alpha_eps, gamma1_work * gamma_retry_factor, gamma1_work)
-            gamma1_work = gamma1_work.clamp_min_(1e-12)
+                if retry_idx >= gamma_retry_steps:
+                    if not torch.isfinite(alpha1_candidate).all():
+                        require_valid_alpha("alpha1", alpha1_candidate, eps=alpha_eps)
+                    post = post_candidate
+                    alpha1 = torch.nan_to_num(alpha1_candidate, nan=0.5, posinf=1.0 - alpha_eps, neginf=alpha_eps).clamp(
+                        min=alpha_eps, max=1.0 - alpha_eps
+                    )
+                    # Always use MMSE (posterior mean) for VAMP self-consistency
+                    x1 = post_candidate["x1_blocks"].reshape_as(r1)
+                    break
+
+                alpha1_retry_count += int((~valid_alpha1).sum().item())
+                gamma1_work = torch.where(alpha1_candidate <= alpha_eps, gamma1_work / gamma_retry_factor, gamma1_work)
+                gamma1_work = torch.where(alpha1_candidate >= 1.0 - alpha_eps, gamma1_work * gamma_retry_factor, gamma1_work)
+                gamma1_work = gamma1_work.clamp_min_(1e-12)
 
         assert post is not None and alpha1 is not None and x1 is not None
         eta1 = gamma1_work / alpha1
@@ -699,7 +984,7 @@ def solve_e8p12_rankspace_vamp(
                 r1_candidate = r1_new
             else:
                 gamma1_candidate = log_damp_positive(gamma1, gamma1_new, step_damping)
-                r1_candidate = (1.0 - step_damping) * r1 + step_damping * r1_new
+            r1_candidate = (1.0 - step_damping) * r1 + step_damping * r1_new
             gamma1_valid = bool(torch.isfinite(gamma1_candidate).all().item() and (gamma1_candidate > 1e-12).all().item())
 
             trial_err = current_err
@@ -708,17 +993,28 @@ def solve_e8p12_rankspace_vamp(
             trial_hatWr = None
             trial_Qidxs = None
             if gamma1_valid:
-                trial_post = vamp_vector_map_e8p12(
-                    r1_blocks=r1_candidate.reshape(B, nblocks, codesz),
-                    gamma1=gamma1_candidate,
-                    cb=cb,
-                    blocks_per_chunk=blocks_per_chunk,
-                    need_stats=False,
-                    prior_center_blocks=W_blocks if prior_tau > 0.0 else None,
-                    prior_scale_blocks=prior_scale_blocks,
-                    prior_tau=prior_tau,
-                    prior_tau_scale_mode=prior_tau_scale_mode,
-                )
+                if gram_chols is not None:
+                    trial_post = gram_metric_map_blocks(
+                        r1_blocks=r1_candidate.reshape(B, nblocks, codesz),
+                        gram_chols=gram_chols,
+                        cb=cb,
+                        prior_center_blocks=W_blocks if prior_tau > 0.0 else None,
+                        prior_scale_blocks=prior_scale_blocks,
+                        prior_tau=prior_tau,
+                        gamma1=gamma1_candidate if prior_tau > 0.0 else None,
+                    )
+                else:
+                    trial_post = vamp_vector_map_e8p12(
+                        r1_blocks=r1_candidate.reshape(B, nblocks, codesz),
+                        gamma1=gamma1_candidate,
+                        cb=cb,
+                        blocks_per_chunk=blocks_per_chunk,
+                        need_stats=False,
+                        prior_center_blocks=W_blocks if prior_tau > 0.0 else None,
+                        prior_scale_blocks=prior_scale_blocks,
+                        prior_tau=prior_tau,
+                        prior_tau_scale_mode=prior_tau_scale_mode,
+                    )
                 trial_hatWr = trial_post["map_vals"].reshape_as(r1)  # type: ignore[assignment]
                 trial_Qidxs = trial_post["map_idxs"].to(dtype=getattr(cb, "idx_dtype", torch.int64))  # type: ignore[assignment]
                 trial_err = vamp_rankspace_error(Y_u=Y_u, x=trial_hatWr, Vs=Vs)
@@ -799,6 +1095,7 @@ def solve_e8p12_rankspace_vamp(
                 accept_tol=0.0,
                 metric_rows_per_chunk=int(cfg.polish_metric_rows_per_chunk),
                 max_blocks_per_sweep=int(getattr(cfg, "polish_max_blocks", 0) or 0),
+                order_mode="greedy_gain",
             ),
             idxs_init=final_Qidxs,
         )
@@ -815,6 +1112,8 @@ def solve_e8p12_rankspace_vamp(
         "nblocks": int(nblocks),
         "x1_mode": str(x1_mode),
         "map_mix": float(map_mix),
+        "map_mix_end": float(_resolve_map_mix(x1_mode=x1_mode, map_mix=map_mix, frac=1.0)),
+        "denoiser_metric": str(denoiser_metric),
         "damping": float(damping),
         "prior_tau": float(prior_tau),
         "prior_tau_scale_mode": str(prior_tau_scale_mode),

@@ -157,6 +157,27 @@ def _rtn_e8p12_init(
 
 
 @torch.inference_mode()
+def _zero_e8p12_init(
+    *,
+    Wr: torch.Tensor,
+    cb: Any,
+    resid_scale_override: float | None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    m, n = Wr.shape
+    codesz = int(getattr(cb, "codesz", 8))
+    if codesz != 8 or (n % codesz) != 0:
+        raise ValueError(f"mpgq zero init expects E8P12 codesz=8; got codesz={codesz}, n={n}.")
+    nblocks = n // codesz
+    zero_blocks = Wr.new_zeros((int(m) * int(nblocks), int(codesz)))
+    kwargs: Dict[str, Any] = {}
+    if resid_scale_override is not None:
+        kwargs["resid_scale_override"] = float(resid_scale_override)
+    _, idxs = cb.quantize(zero_blocks, return_idx=True, **kwargs)
+    idxs = idxs.to(device=Wr.device, dtype=getattr(cb, "idx_dtype", torch.int64)).view(int(m), int(nblocks))
+    return Wr.new_zeros((int(m), int(n))), idxs
+
+
+@torch.inference_mode()
 def mpgq_refine_codebook(
     Wr: torch.Tensor,
     Hr: torch.Tensor,
@@ -198,11 +219,13 @@ def mpgq_refine_codebook(
         )
     elif init_mode == "rtn":
         hatWr_init, Qidxs_init = _rtn_e8p12_init(Wr=Wr, cb=cb, resid_scale_override=resid_scale_override)
+    elif init_mode == "zero":
+        hatWr_init, Qidxs_init = _zero_e8p12_init(Wr=Wr, cb=cb, resid_scale_override=resid_scale_override)
     elif init_mode == "ldlq":
         hatWr_init = hatWr0.to(dtype=torch.float32)
         Qidxs_init = Qidxs0.to(dtype=getattr(cb, "idx_dtype", torch.int64))
     else:
-        raise ValueError(f"unknown mpgq_init={init_mode!r} (expected 'random', 'rtn', or 'ldlq').")
+        raise ValueError(f"unknown mpgq_init={init_mode!r} (expected 'random', 'rtn', 'zero', or 'ldlq').")
 
     eigenvalues, V, rank, eigen_floor = _vamp_hessian_eigen(
         Hr,
@@ -237,6 +260,7 @@ def mpgq_refine_codebook(
         damping=float(getattr(args, "mpgq_damping", 0.5) or 0.5),
         x1_mode=str(getattr(args, "mpgq_vamp_x1_mode", "map") or "map"),
         map_mix=float(getattr(args, "mpgq_vamp_map_mix", 0.5) or 0.5),
+        denoiser_metric=str(getattr(args, "mpgq_denoiser_metric", "isotropic") or "isotropic"),
         gamma_start=float(getattr(args, "mpgq_gamma_start", 1.0) or 1.0),
         gamma_retry_factor=float(getattr(args, "mpgq_gamma_retry_factor", 4.0) or 4.0),
         gamma_retry_steps=int(getattr(args, "mpgq_gamma_retry_steps", 3) or 3),
