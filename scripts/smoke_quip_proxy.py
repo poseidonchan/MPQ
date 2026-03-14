@@ -199,7 +199,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--sample-proc", type=int, default=1)
     parser.add_argument("--scale-override", type=float, default=0.9)
-    parser.add_argument("--mpgq-init", type=str, default="ldlq", choices=["random", "rtn", "ldlq"])
+    parser.add_argument("--mpgq-init", type=str, default="rtn", choices=["random", "rtn", "ldlq"])
     parser.add_argument("--mpgq-iters", type=int, default=4)
     parser.add_argument("--mpgq-damping", type=float, default=0.5)
     parser.add_argument("--mpgq-prior-tau", type=float, default=0.0)
