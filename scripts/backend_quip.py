@@ -121,6 +121,25 @@ def _parse_ppl_from_log(log_path: Path) -> Dict[str, float]:
     return out
 
 
+def _load_ppl_from_json(json_path: Path) -> Dict[str, float]:
+    if not json_path.exists():
+        return {}
+    try:
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    ppl = payload.get("ppl")
+    if not isinstance(ppl, dict):
+        return {}
+    out: Dict[str, float] = {}
+    for k, v in ppl.items():
+        try:
+            out[str(k).lower()] = float(v)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def _collect_mpgq_layer_stats(ckpt_dir: Path) -> Dict[str, Any]:
     """Collect lightweight surrogate-gate stats from per-layer checkpoints."""
     stats: Dict[str, Any] = {"modules": [], "violations": []}
@@ -369,7 +388,9 @@ def run(args) -> Dict[str, Any]:
         raise RuntimeError(f"eval_ppl failed with code {rc}")
     eval_s = float(time.time() - t2)
 
-    ppls = _parse_ppl_from_log(log_dir / "eval.log")
+    ppls = _load_ppl_from_json(log_dir / "eval_ppl.json")
+    if not ppls:
+        ppls = _parse_ppl_from_log(log_dir / "eval.log")
     mpgq_layer_stats = _collect_mpgq_layer_stats(ckpt_dir) if solver == "mpgq" else {}
 
     return {
