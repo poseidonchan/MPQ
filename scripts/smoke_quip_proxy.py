@@ -106,6 +106,13 @@ def _estimate_quant_times(overhead_s: float, quip_total_s: float, mpgq_total_s: 
     )
 
 
+def _load_reference_json(path: Path) -> Dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"invalid reference json: {path}")
+    return payload
+
+
 def _collect_mpgq_stats(save_dir: Path, *, layers: Sequence[int]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for idx in layers:
@@ -199,6 +206,7 @@ def main() -> None:
     parser.add_argument("--mpgq-vamp-x1-mode", type=str, default="map", choices=["mean", "map", "mix"])
     parser.add_argument("--mpgq-polish-sweeps", type=int, default=3)
     parser.add_argument("--mpgq-polish-metric", type=str, default="gram", choices=["gram", "isotropic", "diag"])
+    parser.add_argument("--reference-json", type=str, default=None, help="Reuse overhead/quip timing from a previous smoke json and only rerun MPGQ.")
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--json-out", type=str, default=None)
     args = parser.parse_args()
@@ -218,9 +226,6 @@ def main() -> None:
     overhead_dir = out_root / "overhead_all_skipped"
     quip_dir = out_root / "quip_layers"
     mpgq_dir = out_root / "mpgq_layers"
-
-    _touch_skip_files(overhead_dir, skip_layers=range(num_layers))
-    _touch_skip_files(quip_dir, skip_layers=skip_layers)
     _touch_skip_files(mpgq_dir, skip_layers=skip_layers)
 
     base_cmd = [
@@ -253,8 +258,20 @@ def main() -> None:
         str(Path(args.hessian_dir).resolve()),
     ]
 
-    overhead_s = _run(base_cmd + ["--solver", "quip", "--save_path", str(overhead_dir)], cwd=QUIP_ROOT, env=env)
-    quip_total_s = _run(base_cmd + ["--solver", "quip", "--save_path", str(quip_dir)], cwd=QUIP_ROOT, env=env)
+    if args.reference_json:
+        reference = _load_reference_json(Path(args.reference_json).resolve())
+        timing_ref = reference.get("timing", {})
+        paths_ref = reference.get("paths", {})
+        overhead_s = float(timing_ref["overhead_s"])
+        quip_total_s = float(timing_ref["quip_total_s"])
+        overhead_dir = Path(paths_ref["overhead_dir"])
+        quip_dir = Path(paths_ref["quip_dir"])
+    else:
+        _touch_skip_files(overhead_dir, skip_layers=range(num_layers))
+        _touch_skip_files(quip_dir, skip_layers=skip_layers)
+        overhead_s = _run(base_cmd + ["--solver", "quip", "--save_path", str(overhead_dir)], cwd=QUIP_ROOT, env=env)
+        quip_total_s = _run(base_cmd + ["--solver", "quip", "--save_path", str(quip_dir)], cwd=QUIP_ROOT, env=env)
+
     mpgq_cmd = base_cmd + [
         "--solver",
         "mpgq",

@@ -8,7 +8,7 @@ import torch
 
 from .linear import em_update_obs_precision_rankspace, linear_mmse_exact, vamp_rankspace_error
 from .polish.block_cd import BlockCDConfig, E8P12Provider, UniformScalarProvider, block_coordinate_descent_rankspace
-from .priors.e8p12 import prior_scale_from_center, vamp_vector_discrete_mmse_e8p12
+from .priors.e8p12 import prior_scale_from_center, vamp_vector_discrete_mmse_e8p12, vamp_vector_map_e8p12
 from .priors.uniform import dequant_from_q, discrete_uniform_mmse, nearest_atom_idx, select_x1_for_linear_step
 from .utils import (
     alpha_valid_mask,
@@ -708,13 +708,12 @@ def solve_e8p12_rankspace_vamp(
             trial_hatWr = None
             trial_Qidxs = None
             if gamma1_valid:
-                trial_post = vamp_vector_discrete_mmse_e8p12(
+                trial_post = vamp_vector_map_e8p12(
                     r1_blocks=r1_candidate.reshape(B, nblocks, codesz),
                     gamma1=gamma1_candidate,
                     cb=cb,
                     blocks_per_chunk=blocks_per_chunk,
                     need_stats=False,
-                    need_var_diag=False,
                     prior_center_blocks=W_blocks if prior_tau > 0.0 else None,
                     prior_scale_blocks=prior_scale_blocks,
                     prior_tau=prior_tau,
