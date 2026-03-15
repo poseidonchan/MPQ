@@ -271,6 +271,10 @@ def main() -> None:
         overhead_s = _run(base_cmd + ["--solver", "quip", "--save_path", str(overhead_dir)], cwd=QUIP_ROOT, env=env)
         quip_total_s = _run(base_cmd + ["--solver", "quip", "--save_path", str(quip_dir)], cwd=QUIP_ROOT, env=env)
 
+    # Quantize only the requested layers for MPGQ as well; otherwise QUIP# will
+    # happily run the full-model pass.
+    _touch_skip_files(mpgq_dir, skip_layers=skip_layers)
+
     mpgq_cmd = base_cmd + [
         "--solver",
         "mpgq",
