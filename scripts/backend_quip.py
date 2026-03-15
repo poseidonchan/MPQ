@@ -323,10 +323,6 @@ def run(args) -> Dict[str, Any]:
             str(int(args.mpgq_gamma_retry_steps)),
             "--mpgq_obs_precision",
             str(float(args.mpgq_obs_precision)),
-            "--mpgq_vamp_x1_mode",
-            str(args.mpgq_vamp_x1_mode),
-            "--mpgq_vamp_map_mix",
-            str(float(args.mpgq_vamp_map_mix)),
             "--mpgq_polish_sweeps",
             str(int(args.mpgq_polish_sweeps)),
             "--mpgq_polish_metric",
@@ -341,10 +337,6 @@ def run(args) -> Dict[str, Any]:
             str(int(args.mpgq_metric_rows_per_chunk)),
         ]
         quant_cmd.append("--mpgq_em_obs_precision" if bool(args.mpgq_em_obs_precision) else "--no-mpgq_em_obs_precision")
-        if not bool(args.mpgq_adaptive_accept_reject):
-            quant_cmd.append("--no-mpgq_adaptive_accept_reject")
-        if not bool(args.mpgq_best_iterate_export):
-            quant_cmd.append("--no-mpgq_best_iterate_export")
 
     t0 = time.time()
     rc = _run_logged(quant_cmd, cwd=QUIP_ROOT, env=env, log_path=log_dir / "quantize.log")
@@ -443,10 +435,6 @@ def run(args) -> Dict[str, Any]:
             "gamma_retry_factor": float(args.mpgq_gamma_retry_factor),
             "gamma_retry_steps": int(args.mpgq_gamma_retry_steps),
             "obs_precision": float(args.mpgq_obs_precision),
-            "vamp_x1_mode": str(args.mpgq_vamp_x1_mode),
-            "vamp_map_mix": float(args.mpgq_vamp_map_mix),
-            "adaptive_accept_reject": bool(args.mpgq_adaptive_accept_reject),
-            "best_iterate_export": bool(args.mpgq_best_iterate_export),
             "polish_sweeps": int(args.mpgq_polish_sweeps),
             "polish_metric": str(args.mpgq_polish_metric),
             "polish_max_blocks": int(getattr(args, "mpgq_polish_max_blocks", 0)),
@@ -492,19 +480,15 @@ def main() -> None:
 
     # MPGQ (QUIP side) defaults aligned with Gate B recipe.
     parser.add_argument("--mpgq-init", type=str, default="random", choices=["random", "rtn", "ldlq"])
-    parser.add_argument("--mpgq-iters", type=int, default=4)
+    parser.add_argument("--mpgq-iters", type=int, default=16)
     parser.add_argument("--mpgq-damping", type=float, default=0.5)
-    parser.add_argument("--mpgq-prior-tau", type=float, default=0.0)
+    parser.add_argument("--mpgq-prior-tau", type=float, default=0.25)
     parser.add_argument("--mpgq-prior-tau-scale-mode", type=str, default="absmax", choices=["none", "absmax", "rms", "mean_abs"])
     parser.add_argument("--mpgq-gamma-start", type=float, default=1.0)
     parser.add_argument("--mpgq-gamma-retry-factor", type=float, default=4.0)
     parser.add_argument("--mpgq-gamma-retry-steps", type=int, default=3)
     parser.add_argument("--mpgq-obs-precision", type=float, default=0.0)
     parser.add_argument("--mpgq-em-obs-precision", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--mpgq-vamp-x1-mode", type=str, default="map", choices=["mean", "map", "mix"])
-    parser.add_argument("--mpgq-vamp-map-mix", type=float, default=0.5)
-    parser.add_argument("--mpgq-adaptive-accept-reject", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--mpgq-best-iterate-export", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--mpgq-blocks-per-chunk", type=int, default=16)
     parser.add_argument("--mpgq-block-rows", type=int, default=32)
     parser.add_argument("--mpgq-polish-sweeps", type=int, default=3)

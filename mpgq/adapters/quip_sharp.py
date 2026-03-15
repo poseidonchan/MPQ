@@ -256,37 +256,23 @@ def mpgq_refine_codebook(
         obs_precision = 1.0 / float(mse)
 
     vamp_cfg = E8P12VampConfig(
-        iters=int(getattr(args, "mpgq_iters", 4) or 4),
-        damping=float(getattr(args, "mpgq_damping", 0.5) or 0.5),
-        x1_mode=str(getattr(args, "mpgq_vamp_x1_mode", "map") or "map"),
-        map_mix=float(getattr(args, "mpgq_vamp_map_mix", 0.5) or 0.5),
-        denoiser_metric=str(getattr(args, "mpgq_denoiser_metric", "isotropic") or "isotropic"),
-        gamma_start=float(getattr(args, "mpgq_gamma_start", 1.0) or 1.0),
-        gamma_retry_factor=float(getattr(args, "mpgq_gamma_retry_factor", 4.0) or 4.0),
-        gamma_retry_steps=int(getattr(args, "mpgq_gamma_retry_steps", 3) or 3),
-        prior_tau=float(getattr(args, "mpgq_prior_tau", 0.0) or 0.0),
-        prior_tau_scale_mode=str(getattr(args, "mpgq_prior_tau_scale_mode", "absmax") or "absmax"),
+        iters=int(getattr(args, "mpgq_iters", 16)),
+        damping=float(getattr(args, "mpgq_damping", 0.5)),
+        gamma_start=float(getattr(args, "mpgq_gamma_start", 1.0)),
+        gamma_retry_factor=float(getattr(args, "mpgq_gamma_retry_factor", 4.0)),
+        gamma_retry_steps=int(getattr(args, "mpgq_gamma_retry_steps", 3)),
+        prior_tau=float(getattr(args, "mpgq_prior_tau", 0.25)),
+        prior_tau_scale_mode=str(getattr(args, "mpgq_prior_tau_scale_mode", "absmax")),
         obs_precision=float(requested_obs),
-        obs_precision_end=(
-            None
-            if getattr(args, "mpgq_obs_precision_end", None) is None
-            else float(getattr(args, "mpgq_obs_precision_end", None))
-        ),
         em_obs_precision=bool(getattr(args, "mpgq_em_obs_precision", True)),
-        em_obs_precision_damping=float(getattr(args, "mpgq_em_obs_precision_damping", 0.3) or 0.3),
-        em_obs_precision_min=float(getattr(args, "mpgq_em_obs_precision_min", 1e-4) or 1e-4),
-        em_obs_precision_max=float(getattr(args, "mpgq_em_obs_precision_max", 1e8) or 1e8),
-        best_iterate_export=bool(getattr(args, "mpgq_best_iterate_export", True)),
-        adaptive_accept_reject=bool(getattr(args, "mpgq_adaptive_accept_reject", True)),
-        adaptive_retry_steps=int(getattr(args, "mpgq_adaptive_retry_steps", 3) or 3),
-        adaptive_accept_tol=float(getattr(args, "mpgq_adaptive_accept_tol", 1e-4) or 1e-4),
-        adaptive_damping_min=float(getattr(args, "mpgq_adaptive_damping_min", 0.1) or 0.1),
-        adaptive_obs_precision_backoff=float(getattr(args, "mpgq_adaptive_obs_backoff", 0.5) or 0.5),
-        blocks_per_chunk=int(getattr(args, "mpgq_blocks_per_chunk", 16) or 16),
-        polish_sweeps=int(getattr(args, "mpgq_polish_sweeps", 3) or 3),
-        polish_metric=str(getattr(args, "mpgq_polish_metric", "gram") or "gram"),
-        polish_metric_rows_per_chunk=int(getattr(args, "mpgq_metric_rows_per_chunk", 0) or 0),
-        polish_max_blocks=int(getattr(args, "mpgq_polish_max_blocks", 0) or 0),
+        em_obs_precision_damping=float(getattr(args, "mpgq_em_obs_precision_damping", 0.3)),
+        em_obs_precision_min=float(getattr(args, "mpgq_em_obs_precision_min", 1e-4)),
+        em_obs_precision_max=float(getattr(args, "mpgq_em_obs_precision_max", 1e8)),
+        blocks_per_chunk=int(getattr(args, "mpgq_blocks_per_chunk", 16)),
+        polish_sweeps=int(getattr(args, "mpgq_polish_sweeps", 3)),
+        polish_metric=str(getattr(args, "mpgq_polish_metric", "gram")),
+        polish_metric_rows_per_chunk=int(getattr(args, "mpgq_metric_rows_per_chunk", 0)),
+        polish_max_blocks=int(getattr(args, "mpgq_polish_max_blocks", 0)),
     )
 
     block_rows = _resolve_block_rows(
@@ -310,7 +296,6 @@ def mpgq_refine_codebook(
         hat_chunk, idx_chunk, _err_chunk, stats_chunk = solve_e8p12_rankspace_vamp(
             Wr=Wr[rb],
             hatWr_init=final_hatWr[rb],
-            Qidxs_init=final_Qidxs[rb],
             cb=cb,
             V=V,
             Vh=Vh,

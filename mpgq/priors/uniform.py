@@ -70,16 +70,6 @@ def discrete_uniform_mmse(
 
 
 @torch.inference_mode()
-def select_x1_for_linear_step(post: Dict[str, torch.Tensor | float], *, x1_mode: str) -> torch.Tensor:
-    mode = str(x1_mode or "mmse").lower().strip()
-    if mode in ("mmse", "mean"):
-        return post["mean"]  # type: ignore[return-value]
-    if mode == "map":
-        return post["map_value"]  # type: ignore[return-value]
-    raise ValueError(f"unsupported x1_mode={x1_mode!r}")
-
-
-@torch.inference_mode()
 def nearest_atom_idx(
     *,
     x: torch.Tensor,  # (B, n)

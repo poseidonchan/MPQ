@@ -17,6 +17,7 @@ dist/
 runs/
 logs/
 gptq_log_*.log
+vendor/
 
 # Editors
 .vscode/

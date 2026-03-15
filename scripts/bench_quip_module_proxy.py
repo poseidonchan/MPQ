@@ -107,22 +107,11 @@ def _build_quip_args(base: argparse.Namespace) -> Any:
     args.mpgq_gamma_retry_factor = float(base.mpgq_gamma_retry_factor)
     args.mpgq_gamma_retry_steps = int(base.mpgq_gamma_retry_steps)
     args.mpgq_obs_precision = float(base.mpgq_obs_precision)
-    args.mpgq_obs_precision_end = base.mpgq_obs_precision_end
     args.mpgq_em_obs_precision = bool(base.mpgq_em_obs_precision)
     args.mpgq_em_obs_precision_damping = float(base.mpgq_em_obs_precision_damping)
     args.mpgq_em_obs_precision_min = float(base.mpgq_em_obs_precision_min)
     args.mpgq_em_obs_precision_max = float(base.mpgq_em_obs_precision_max)
-    args.mpgq_vamp_x1_mode = str(base.mpgq_vamp_x1_mode)
-    args.mpgq_vamp_map_mix = float(base.mpgq_vamp_map_mix)
-    args.mpgq_denoiser_metric = str(base.mpgq_denoiser_metric)
-    args.mpgq_adaptive_accept_reject = bool(base.mpgq_adaptive_accept_reject)
-    args.mpgq_adaptive_retry_steps = int(base.mpgq_adaptive_retry_steps)
-    args.mpgq_adaptive_accept_tol = float(base.mpgq_adaptive_accept_tol)
-    args.mpgq_adaptive_damping_min = float(base.mpgq_adaptive_damping_min)
-    args.mpgq_adaptive_obs_backoff = float(base.mpgq_adaptive_obs_backoff)
-    args.mpgq_best_iterate_export = bool(base.mpgq_best_iterate_export)
     args.mpgq_blocks_per_chunk = int(base.mpgq_blocks_per_chunk)
-    args.mpgq_block_vamp = bool(base.mpgq_block_vamp)
     args.mpgq_block_rows = int(base.mpgq_block_rows)
     args.mpgq_polish_sweeps = int(base.mpgq_polish_sweeps)
     args.mpgq_polish_metric = str(base.mpgq_polish_metric)
@@ -164,6 +153,10 @@ def _quip_prepare_processed(
     W = W.to(device)
     cb = quip_codebook.get_codebook(str(cb_name))
     cb = cb.to(dtype_).to(device)
+
+    # QUIP# uses randomized incoherence preprocessing (Hadamard signs / butterfly factors).
+    # Seed torch so proxy runs are reproducible for a fixed `--seed`.
+    torch.manual_seed(int(getattr(args, "seed", 0)))
 
     incoh_out = quip.incoherence_preprocess(H, W, args)
     if incoh_out is None and not bool(args.use_fp64):
@@ -289,38 +282,23 @@ def _run_mpgq_refine_cached(
         obs_precision = 1.0 / mse
 
     vamp_cfg = E8P12VampConfig(
-        iters=int(getattr(args, "mpgq_iters", 4) or 4),
-        damping=float(getattr(args, "mpgq_damping", 0.5) or 0.5),
-        x1_mode=str(getattr(args, "mpgq_vamp_x1_mode", "map") or "map"),
-        map_mix=float(getattr(args, "mpgq_vamp_map_mix", 0.5) or 0.5),
-        denoiser_metric=str(getattr(args, "mpgq_denoiser_metric", "isotropic") or "isotropic"),
-        gamma_start=float(getattr(args, "mpgq_gamma_start", 1.0) or 1.0),
-        gamma_retry_factor=float(getattr(args, "mpgq_gamma_retry_factor", 4.0) or 4.0),
-        gamma_retry_steps=int(getattr(args, "mpgq_gamma_retry_steps", 3) or 3),
-        prior_tau=float(getattr(args, "mpgq_prior_tau", 0.0) or 0.0),
-        prior_tau_scale_mode=str(getattr(args, "mpgq_prior_tau_scale_mode", "absmax") or "absmax"),
+        iters=int(getattr(args, "mpgq_iters", 16)),
+        damping=float(getattr(args, "mpgq_damping", 0.5)),
+        gamma_start=float(getattr(args, "mpgq_gamma_start", 1.0)),
+        gamma_retry_factor=float(getattr(args, "mpgq_gamma_retry_factor", 4.0)),
+        gamma_retry_steps=int(getattr(args, "mpgq_gamma_retry_steps", 3)),
+        prior_tau=float(getattr(args, "mpgq_prior_tau", 0.25)),
+        prior_tau_scale_mode=str(getattr(args, "mpgq_prior_tau_scale_mode", "absmax")),
         obs_precision=float(requested_obs),
-        obs_precision_end=(
-            None
-            if getattr(args, "mpgq_obs_precision_end", None) is None
-            else float(getattr(args, "mpgq_obs_precision_end", None))
-        ),
         em_obs_precision=bool(getattr(args, "mpgq_em_obs_precision", True)),
-        em_obs_precision_damping=float(getattr(args, "mpgq_em_obs_precision_damping", 0.3) or 0.3),
-        em_obs_precision_min=float(getattr(args, "mpgq_em_obs_precision_min", 1e-4) or 1e-4),
-        em_obs_precision_max=float(getattr(args, "mpgq_em_obs_precision_max", 1e8) or 1e8),
-        best_iterate_export=bool(getattr(args, "mpgq_best_iterate_export", True)),
-        adaptive_accept_reject=bool(getattr(args, "mpgq_adaptive_accept_reject", True)),
-        adaptive_retry_steps=int(getattr(args, "mpgq_adaptive_retry_steps", 3) or 3),
-        adaptive_accept_tol=float(getattr(args, "mpgq_adaptive_accept_tol", 1e-4) or 1e-4),
-        adaptive_damping_min=float(getattr(args, "mpgq_adaptive_damping_min", 0.1) or 0.1),
-        adaptive_obs_precision_backoff=float(getattr(args, "mpgq_adaptive_obs_backoff", 0.5) or 0.5),
-        blocks_per_chunk=int(getattr(args, "mpgq_blocks_per_chunk", 16) or 16),
-        block_vamp=bool(getattr(args, "mpgq_block_vamp", False)),
+        em_obs_precision_damping=float(getattr(args, "mpgq_em_obs_precision_damping", 0.3)),
+        em_obs_precision_min=float(getattr(args, "mpgq_em_obs_precision_min", 1e-4)),
+        em_obs_precision_max=float(getattr(args, "mpgq_em_obs_precision_max", 1e8)),
+        blocks_per_chunk=int(getattr(args, "mpgq_blocks_per_chunk", 16)),
         polish_sweeps=int(getattr(args, "mpgq_polish_sweeps", 3)),
-        polish_metric=str(getattr(args, "mpgq_polish_metric", "gram") or "gram"),
-        polish_metric_rows_per_chunk=int(getattr(args, "mpgq_metric_rows_per_chunk", 0) or 0),
-        polish_max_blocks=int(getattr(args, "mpgq_polish_max_blocks", 0) or 0),
+        polish_metric=str(getattr(args, "mpgq_polish_metric", "gram")),
+        polish_metric_rows_per_chunk=int(getattr(args, "mpgq_metric_rows_per_chunk", 0)),
+        polish_max_blocks=int(getattr(args, "mpgq_polish_max_blocks", 0)),
     )
 
     block_rows = min(int(m), max(int(getattr(args, "mpgq_block_rows", 32) or 32), 1))
@@ -337,7 +315,6 @@ def _run_mpgq_refine_cached(
         hat_chunk, idx_chunk, _err_chunk, stats_chunk = solve_e8p12_rankspace_vamp(
             Wr=Wr[rb],
             hatWr_init=final_hatWr[rb],
-            Qidxs_init=final_Qidxs[rb],
             cb=cb,
             V=V,
             Vh=Vh,
@@ -393,9 +370,9 @@ def main() -> None:
     parser.add_argument("--rescale-wh", action="store_true")
 
     parser.add_argument("--mpgq-init", type=str, default="rtn", choices=["random", "rtn", "zero", "ldlq"])
-    parser.add_argument("--mpgq-iters", type=int, default=4)
+    parser.add_argument("--mpgq-iters", type=int, default=16)
     parser.add_argument("--mpgq-damping", type=float, default=0.5)
-    parser.add_argument("--mpgq-prior-tau", type=float, default=0.0)
+    parser.add_argument("--mpgq-prior-tau", type=float, default=0.25)
     parser.add_argument(
         "--mpgq-prior-tau-scale-mode",
         type=str,
@@ -406,36 +383,16 @@ def main() -> None:
     parser.add_argument("--mpgq-gamma-retry-factor", type=float, default=4.0)
     parser.add_argument("--mpgq-gamma-retry-steps", type=int, default=3)
     parser.add_argument("--mpgq-obs-precision", type=float, default=0.0)
-    parser.add_argument("--mpgq-obs-precision-end", type=float, default=None)
     parser.add_argument("--mpgq-em-obs-precision", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--mpgq-em-obs-precision-damping", type=float, default=0.3)
     parser.add_argument("--mpgq-em-obs-precision-min", type=float, default=1e-4)
     parser.add_argument("--mpgq-em-obs-precision-max", type=float, default=1e8)
-    parser.add_argument("--mpgq-vamp-x1-mode", type=str, default="map", choices=["mean", "map", "mix"])
-    parser.add_argument("--mpgq-vamp-map-mix", type=float, default=0.5)
-    parser.add_argument(
-        "--mpgq-denoiser-metric",
-        type=str,
-        default="isotropic",
-        choices=["isotropic", "gram"],
-        help="E8P12 x1/MMSE metric: isotropic or gram (full block Hessian).",
-    )
-    parser.add_argument("--mpgq-denoiser-diag-hessian-clamp", type=float, default=10.0)
-    parser.add_argument("--mpgq-adaptive-accept-reject", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--mpgq-adaptive-retry-steps", type=int, default=3)
-    parser.add_argument("--mpgq-adaptive-accept-tol", type=float, default=1e-4)
-    parser.add_argument("--mpgq-adaptive-damping-min", type=float, default=0.1)
-    parser.add_argument("--mpgq-adaptive-obs-backoff", type=float, default=0.5)
-    parser.add_argument("--mpgq-best-iterate-export", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--mpgq-blocks-per-chunk", type=int, default=16)
-    parser.add_argument("--mpgq-block-vamp", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--mpgq-block-rows", type=int, default=32)
     parser.add_argument("--mpgq-polish-sweeps", type=int, default=3)
     parser.add_argument("--mpgq-polish-metric", type=str, default="gram", choices=["gram", "isotropic", "diag"])
     parser.add_argument("--mpgq-polish-max-blocks", type=int, default=0)
     parser.add_argument("--mpgq-metric-rows-per-chunk", type=int, default=0)
-    parser.add_argument("--mpgq-ldlq-tune-sweeps", type=int, default=0,
-                        help="Post-VAMP LDLQ-style L2 BCD tune sweeps (fast alternative to Gram polish)")
 
     parser.add_argument("--json-out", type=str, default=None)
     args = parser.parse_args()
@@ -493,30 +450,6 @@ def main() -> None:
         args=quip_args,
         module_name=f"{int(args.layer)}_{args.suffix}",
     )
-
-    # Optional LDLQ-style tune (fast L2 BCD) as post-VAMP polish
-    ldlq_tune_sweeps = int(getattr(args, "mpgq_ldlq_tune_sweeps", 0) or 0)
-    if ldlq_tune_sweeps > 0:
-        from mpgq.adapters.quip_sharp import _exact_surrogate_chunk_means as _esc
-        _br = min(Wr.shape[0], max(int(getattr(args, "mpgq_block_rows", 32) or 32), 1))
-        mpgq_hatWr = mpgq_hatWr.clone()
-        mpgq_Qidxs = mpgq_Qidxs.clone()
-        _e_pre, _ = _esc(Wr, mpgq_hatWr.float(), Hr, block_rows=_br)
-        codesz_t = int(getattr(cb, "codesz", 8))
-        nblocks_t = Wr.shape[1] // codesz_t
-        resid_scale = float(getattr(quip_args, "resid_scale_override", 0.9) or 0.9)
-        Hr_f = Hr.float()
-        Hr_blk_invs = [torch.linalg.inv(Hr_f[codesz_t*k:codesz_t*(k+1), codesz_t*k:codesz_t*(k+1)].double()).float() for k in range(nblocks_t)]
-        for _sw in range(ldlq_tune_sweeps):
-            for k in reversed(range(nblocks_t)):
-                s, e = codesz_t * k, codesz_t * (k + 1)
-                res = (Wr - mpgq_hatWr.to(dtype=Wr.dtype)).float()
-                tgt = mpgq_hatWr[:, s:e].float() + res.matmul(Hr_f[:, s:e]).matmul(Hr_blk_invs[k])
-                mpgq_hatWr[:, s:e], mpgq_Qidxs[:, k] = cb.quantize(tgt, resid_scale_override=resid_scale)
-        _e_post, _ = _esc(Wr, mpgq_hatWr.float(), Hr, block_rows=_br)
-        print(f"[ldlq-tune] {ldlq_tune_sweeps} sweeps: {float(_e_pre):.2f} -> {float(_e_post):.2f} (delta {float(_e_post-_e_pre):+.2f})")
-        mpgq_stats["exact_surrogate_after_mean"] = float(_e_post)
-        mpgq_stats["ldlq_tune_sweeps"] = ldlq_tune_sweeps
 
     out = {
         "base_model": str(args.base_model),

@@ -31,6 +31,7 @@ class BlockCDConfig:
     accept_tol: float = 0.0
     metric_rows_per_chunk: int = 0  # for large codebooks (optional)
     max_blocks_per_sweep: int = 0  # if >0, only polish top-K blocks by static importance
+    order_mode: str = "greedy_gain"  # "static" | "greedy_gain"
 
 
 @torch.inference_mode()
@@ -74,6 +75,9 @@ def block_coordinate_descent_rankspace(
         raise ValueError(f"unsupported metric={metric!r}; expected 'diag'|'gram'.")
     if metric == "isotropic":
         metric = "diag"
+    order_mode = str(getattr(cfg, "order_mode", "greedy_gain") or "greedy_gain").strip().lower()
+    if order_mode not in ("static", "greedy_gain"):
+        raise ValueError(f"unsupported order_mode={order_mode!r}; expected 'static'|'greedy_gain'.")
 
     B, n = x.shape
     blocks = _resolve_blocks(n, int(block_size))
@@ -96,17 +100,30 @@ def block_coordinate_descent_rankspace(
             gram_chol = None
         block_meta.append((start, end, Vs_blk, gram_raw, gram_chol))
         importance[bi] = float(torch.diag(gram_raw).sum().item())
-    order = torch.argsort(importance, descending=True)
-    order_list = order.tolist()
+    static_order_list = torch.argsort(importance, descending=True).tolist()
     max_blocks = int(getattr(cfg, "max_blocks_per_sweep", 0) or 0)
-    if max_blocks > 0:
-        order_list = order_list[:max_blocks]
 
     accept_tol = max(float(cfg.accept_tol), 0.0)
     accepted_updates = 0
     idxs_out: Optional[torch.Tensor] = idxs_init.clone() if idxs_init is not None else None
 
     for _ in range(sweeps):
+        if order_mode == "greedy_gain":
+            gain = torch.empty(len(blocks), dtype=torch.float32, device=x_work.device)
+            for bi, (start, end, Vs_blk, gram_raw, gram_chol) in enumerate(block_meta):
+                rhs = residual_u.matmul(Vs_blk.T)
+                if metric == "gram":
+                    assert gram_chol is not None
+                    delta_star = torch.cholesky_solve(rhs.T.contiguous(), gram_chol).T
+                    gain[bi] = float((rhs * delta_star).sum(dim=1).mean().item())
+                else:
+                    diag = torch.diag(gram_raw).clamp_min_(1e-12).unsqueeze(0)
+                    gain[bi] = float((rhs.square() / diag).sum(dim=1).mean().item())
+            order_list = torch.argsort(gain, descending=True).tolist()
+        else:
+            order_list = list(static_order_list)
+        if max_blocks > 0:
+            order_list = order_list[:max_blocks]
         for bi in order_list:
             start, end, Vs_blk, gram_raw, gram_chol = block_meta[bi]
             x_blk = x_work[:, start:end]  # (B, bs)

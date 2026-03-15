@@ -49,7 +49,6 @@ def _json_load(path: Path) -> Dict[str, Any]:
 
 @dataclass(frozen=True)
 class AblationSpec:
-    x1_mode: str
     polish_sweeps: int
     em_obs_precision: bool
     damping: float
@@ -57,8 +56,7 @@ class AblationSpec:
 
     def label(self) -> str:
         return (
-            f"x1_{self.x1_mode}"
-            f"_polish{int(self.polish_sweeps)}"
+            f"polish{int(self.polish_sweeps)}"
             f"_em{int(self.em_obs_precision)}"
             f"_damp{self.damping:g}"
             f"_tau{self.prior_tau:g}"
@@ -67,20 +65,18 @@ class AblationSpec:
 
 def _grid() -> List[AblationSpec]:
     out: List[AblationSpec] = []
-    for x1_mode in ("mmse", "map"):
-        for polish in (0, 3):
-            for em in (False, True):
-                for damping in (1.0, 0.5):
-                    for tau in (0.0, 0.2):
-                        out.append(
-                            AblationSpec(
-                                x1_mode=x1_mode,
-                                polish_sweeps=int(polish),
-                                em_obs_precision=bool(em),
-                                damping=float(damping),
-                                prior_tau=float(tau),
-                            )
+    for polish in (0, 3):
+        for em in (False, True):
+            for damping in (1.0, 0.5):
+                for tau in (0.0, 0.2):
+                    out.append(
+                        AblationSpec(
+                            polish_sweeps=int(polish),
+                            em_obs_precision=bool(em),
+                            damping=float(damping),
+                            prior_tau=float(tau),
                         )
+                    )
     return out
 
 
@@ -165,8 +161,6 @@ def main() -> None:
                 str(float(spec.damping)),
                 "--mpgq-prior-tau",
                 str(float(spec.prior_tau)),
-                "--mpgq-x1-mode",
-                str(spec.x1_mode),
                 "--mpgq-polish-sweeps",
                 str(int(spec.polish_sweeps)),
                 "--mpgq-em-obs-precision" if bool(spec.em_obs_precision) else "--no-mpgq-em-obs-precision",
@@ -187,7 +181,6 @@ def main() -> None:
             _run_logged(cmd, log_path=log_path, cwd=REPO_ROOT)
             payload = _json_load(json_out)
             payload["ablation"] = {
-                "x1_mode": spec.x1_mode,
                 "polish_sweeps": int(spec.polish_sweeps),
                 "em_obs_precision": bool(spec.em_obs_precision),
                 "damping": float(spec.damping),
@@ -199,7 +192,6 @@ def main() -> None:
     grouped: Dict[str, List[float]] = {}
     for row in results:
         label = AblationSpec(
-            x1_mode=str(row["ablation"]["x1_mode"]),
             polish_sweeps=int(row["ablation"]["polish_sweeps"]),
             em_obs_precision=bool(row["ablation"]["em_obs_precision"]),
             damping=float(row["ablation"]["damping"]),
@@ -248,4 +240,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

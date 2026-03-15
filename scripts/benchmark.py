@@ -14,6 +14,31 @@ from typing import Any, Dict, List, Optional
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _conda_run_prefix(env_name: str) -> List[str]:
+    current = os.environ.get("CONDA_DEFAULT_ENV")
+    if current and str(current) == str(env_name):
+        return []
+    return ["conda", "run", "-n", str(env_name)]
+
+
+def _tail_text(path: Path, *, max_bytes: int = 16384) -> str:
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            start = max(0, size - int(max_bytes))
+            fh.seek(start, os.SEEK_SET)
+            data = fh.read()
+        return data.decode("utf-8", errors="replace")
+    except FileNotFoundError:
+        return ""
+
+
+def _looks_like_transient_cuda_error(log_path: Path) -> bool:
+    tail = _tail_text(log_path).lower()
+    return "cudagetdevicecount" in tail and ("error 304" in tail or " 304:" in tail)
+
+
 def _git_head(path: Path) -> str:
     proc = subprocess.run(
         ["git", "-C", str(path), "rev-parse", "HEAD"],
@@ -35,21 +60,31 @@ def _sanitize_path_component(text: str) -> str:
     return str(text).replace("/", "_").replace(":", "_")
 
 
-def _run_logged(cmd: List[str], *, log_path: Path, cwd: Path) -> None:
+def _run_logged(cmd: List[str], *, log_path: Path, cwd: Path, retries: int = 0, retry_sleep_s: float = 2.0) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("w", encoding="utf-8") as fh:
-        fh.write("$ " + " ".join(shlex.quote(x) for x in cmd) + "\n")
-        fh.flush()
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(cwd),
-            stdout=fh,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        rc = proc.wait()
-        if rc != 0:
-            raise RuntimeError(f"command failed ({rc}): {' '.join(cmd)} (see {log_path})")
+    retries = max(int(retries), 0)
+    for attempt in range(retries + 1):
+        mode = "w" if attempt == 0 else "a"
+        with log_path.open(mode, encoding="utf-8") as fh:
+            if attempt > 0:
+                fh.write("\n")
+                fh.write(f"# RETRY {attempt}/{retries}\n")
+            fh.write("$ " + " ".join(shlex.quote(x) for x in cmd) + "\n")
+            fh.flush()
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(cwd),
+                stdout=fh,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            rc = proc.wait()
+        if rc == 0:
+            return
+        if attempt < retries and _looks_like_transient_cuda_error(log_path):
+            time.sleep(float(retry_sleep_s))
+            continue
+        raise RuntimeError(f"command failed ({rc}): {' '.join(cmd)} (see {log_path})")
 
 
 def _json_load(path: Path) -> Dict[str, Any]:
@@ -95,12 +130,17 @@ def main() -> None:
     parser.add_argument("--eval-seqlen", type=int, default=2048)
     parser.add_argument("--eval-max-eval-tokens", type=int, default=131072)
     parser.add_argument("--eval-datasets", nargs="*", default=["wikitext2", "c4"])
+    parser.add_argument(
+        "--gptqmodel-extra-site-packages",
+        type=str,
+        default=None,
+        help="Optional extra site-packages path for GPTQModel deps when running backend_gptq without installing GPTQModel.",
+    )
 
     # MPGQ (GPTQ side) defaults (Gate A recipe)
     parser.add_argument("--mpgq-iters", type=int, default=10)
     parser.add_argument("--mpgq-damping", type=float, default=0.5)
     parser.add_argument("--mpgq-prior-tau", type=float, default=0.2)
-    parser.add_argument("--mpgq-x1-mode", type=str, default="mmse", choices=["mmse", "map"])
     parser.add_argument("--mpgq-polish-sweeps", type=int, default=3)
     parser.add_argument("--mpgq-em-obs-precision", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--mpgq-block-rows", type=int, default=32)
@@ -129,10 +169,6 @@ def main() -> None:
     parser.add_argument("--mpgq-gamma-retry-factor", type=float, default=4.0)
     parser.add_argument("--mpgq-gamma-retry-steps", type=int, default=3)
     parser.add_argument("--mpgq-obs-precision", type=float, default=0.0)
-    parser.add_argument("--mpgq-vamp-x1-mode", type=str, default="map", choices=["mean", "map", "mix"])
-    parser.add_argument("--mpgq-vamp-map-mix", type=float, default=0.5)
-    parser.add_argument("--mpgq-adaptive-accept-reject", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--mpgq-best-iterate-export", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--mpgq-blocks-per-chunk", type=int, default=16)
     parser.add_argument("--mpgq-polish-metric", type=str, default="gram", choices=["gram", "diag", "isotropic"])
     parser.add_argument("--mpgq-polish-max-blocks", type=int, default=0)
@@ -143,6 +179,8 @@ def main() -> None:
     parser.add_argument("--run-id", type=str, default=None)
     parser.add_argument("--gptq-env", type=str, default="mpgq-gptq")
     parser.add_argument("--quip-env", type=str, default="mpgq-quip")
+    parser.add_argument("--backend-retries", type=int, default=5)
+    parser.add_argument("--backend-retry-sleep", type=float, default=2.0)
     parser.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args()
@@ -186,10 +224,7 @@ def main() -> None:
             if bits == 2:
                 hess_dir = seed_dir / f"hess_{_sanitize_path_component(args.calibration_dataset)}_{_sanitize_path_component(args.calibration_split)}"
                 cmd = [
-                    "conda",
-                    "run",
-                    "-n",
-                    str(args.quip_env),
+                    *_conda_run_prefix(str(args.quip_env)),
                     "python",
                     str(REPO_ROOT / "scripts" / "backend_quip.py"),
                     "--method",
@@ -244,12 +279,6 @@ def main() -> None:
                     "--mpgq-obs-precision",
                     str(float(args.mpgq_obs_precision)),
                     "--mpgq-em-obs-precision" if bool(args.mpgq_em_obs_precision) else "--no-mpgq-em-obs-precision",
-                    "--mpgq-vamp-x1-mode",
-                    str(args.mpgq_vamp_x1_mode),
-                    "--mpgq-vamp-map-mix",
-                    str(float(args.mpgq_vamp_map_mix)),
-                    "--mpgq-adaptive-accept-reject" if bool(args.mpgq_adaptive_accept_reject) else "--no-mpgq-adaptive-accept-reject",
-                    "--mpgq-best-iterate-export" if bool(args.mpgq_best_iterate_export) else "--no-mpgq-best-iterate-export",
                     "--mpgq-blocks-per-chunk",
                     str(int(args.mpgq_blocks_per_chunk)),
                     "--mpgq-block-rows",
@@ -269,10 +298,7 @@ def main() -> None:
                 ]
             else:
                 cmd = [
-                    "conda",
-                    "run",
-                    "-n",
-                    str(args.gptq_env),
+                    *_conda_run_prefix(str(args.gptq_env)),
                     "python",
                     str(REPO_ROOT / "scripts" / "backend_gptq.py"),
                     "--method",
@@ -306,8 +332,6 @@ def main() -> None:
                     str(float(args.mpgq_damping)),
                     "--mpgq-prior-tau",
                     str(float(args.mpgq_prior_tau)),
-                    "--mpgq-x1-mode",
-                    str(args.mpgq_x1_mode),
                     "--mpgq-polish-sweeps",
                     str(int(args.mpgq_polish_sweeps)),
                     "--mpgq-em-obs-precision" if bool(args.mpgq_em_obs_precision) else "--no-mpgq-em-obs-precision",
@@ -323,6 +347,7 @@ def main() -> None:
                     "--ojbkq-alpha-scale",
                     str(float(args.ojbkq_alpha_scale)),
                     *(["--ojbkq-sample-topk", str(int(args.ojbkq_sample_topk))] if args.ojbkq_sample_topk is not None else []),
+                    *(["--gptqmodel-extra-site-packages", str(args.gptqmodel_extra_site_packages)] if args.gptqmodel_extra_site_packages else []),
                     "--output-dir",
                     str(seed_dir),
                     "--json-out",
@@ -333,7 +358,13 @@ def main() -> None:
                 print("$ " + " ".join(shlex.quote(x) for x in cmd))
                 continue
 
-            _run_logged(cmd, log_path=log_path, cwd=REPO_ROOT)
+            _run_logged(
+                cmd,
+                log_path=log_path,
+                cwd=REPO_ROOT,
+                retries=int(args.backend_retries),
+                retry_sleep_s=float(args.backend_retry_sleep),
+            )
             all_results.append(_json_load(json_out))
 
     payload: Dict[str, Any] = {

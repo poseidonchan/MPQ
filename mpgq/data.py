@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
+import json
 import os
 import random
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List
 
 import torch
-from datasets import load_dataset
 
 
 def _sanitize_name(name: str) -> str:
@@ -36,6 +37,63 @@ def _calibration_cache_path(
 
 def _iter_text_rows(dataset_name: str, split: str, seed: int) -> Iterator[str]:
     if dataset_name == "c4":
+        # Prefer an offline-friendly path by reading directly from cached HF Hub snapshots.
+        # `datasets` streaming mode requires network access for remote shard URLs.
+        hub_cache = Path(os.environ.get("HF_HUB_CACHE") or (Path.home() / ".cache" / "huggingface" / "hub"))
+        repo = hub_cache / "datasets--allenai--c4"
+        snapshots = repo / "snapshots"
+        snapshot: Path | None = None
+        if snapshots.exists():
+            ref = repo / "refs" / "main"
+            if ref.exists():
+                snap_id = ref.read_text(encoding="utf-8", errors="replace").strip()
+                cand = snapshots / snap_id
+                if cand.exists():
+                    snapshot = cand
+            if snapshot is None:
+                snap_dirs = [p for p in snapshots.iterdir() if p.is_dir()]
+                if snap_dirs:
+                    snap_dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                    snapshot = snap_dirs[0]
+
+        if snapshot is not None:
+            lang_dir = snapshot / "en"
+            split_key = str(split).strip().lower()
+            if split_key in {"valid"}:
+                split_key = "validation"
+            patterns = [
+                f"c4-{split_key}.*.json.gz",
+                f"c4-{split_key}.json.gz",
+            ]
+            files: List[Path] = []
+            for pat in patterns:
+                files = sorted(lang_dir.glob(pat))
+                if files:
+                    break
+            if not files:
+                raise RuntimeError(
+                    f"C4 cache snapshot found but no shard files matched split={split!r} under: {lang_dir}"
+                )
+
+            rng = random.Random(int(seed))
+            rng.shuffle(files)
+            for shard in files:
+                with gzip.open(shard, "rt", encoding="utf-8", errors="ignore") as fh:
+                    for line in fh:
+                        if not line.strip():
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        text = row.get("text")
+                        if isinstance(text, str) and text.strip():
+                            yield text
+            return
+
+        # Fallback: online streaming path (may fail under offline mode).
+        from datasets import load_dataset
+
         ds = load_dataset("allenai/c4", "en", split=split, streaming=True)
         buffer_size = max(8192, min(65536, 64 * 128))
         ds = ds.shuffle(seed=seed, buffer_size=buffer_size)
@@ -46,6 +104,8 @@ def _iter_text_rows(dataset_name: str, split: str, seed: int) -> Iterator[str]:
         return
 
     if dataset_name in ("wikitext2", "wikitext-2-raw-v1"):
+        from datasets import load_dataset
+
         ds = load_dataset("wikitext", "wikitext-2-raw-v1", split=split).shuffle(seed=seed)
         for row in ds:
             text = row.get("text")
@@ -119,4 +179,3 @@ def load_or_build_calibration_blocks(
 
 
 __all__ = ["load_or_build_calibration_blocks"]
-

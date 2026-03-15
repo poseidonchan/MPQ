@@ -203,7 +203,6 @@ def main() -> None:
     parser.add_argument("--mpgq-iters", type=int, default=4)
     parser.add_argument("--mpgq-damping", type=float, default=0.5)
     parser.add_argument("--mpgq-prior-tau", type=float, default=0.0)
-    parser.add_argument("--mpgq-vamp-x1-mode", type=str, default="map", choices=["mean", "map", "mix"])
     parser.add_argument("--mpgq-polish-sweeps", type=int, default=3)
     parser.add_argument("--mpgq-polish-metric", type=str, default="gram", choices=["gram", "isotropic", "diag"])
     parser.add_argument("--reference-json", type=str, default=None, help="Reuse overhead/quip timing from a previous smoke json and only rerun MPGQ.")
@@ -285,8 +284,6 @@ def main() -> None:
         str(float(args.mpgq_damping)),
         "--mpgq_prior_tau",
         str(float(args.mpgq_prior_tau)),
-        "--mpgq_vamp_x1_mode",
-        str(args.mpgq_vamp_x1_mode),
         "--mpgq_polish_sweeps",
         str(int(args.mpgq_polish_sweeps)),
         "--mpgq_polish_metric",

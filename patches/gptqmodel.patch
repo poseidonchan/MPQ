@@ -93,10 +93,10 @@ index 7d16f5ae..1353e15e 100644
          # init processor with default GPTQ processor
          from ..looper.tensorparallel_weight_processor import TensorParallelWeightProcessor
 diff --git a/gptqmodel/quantization/config.py b/gptqmodel/quantization/config.py
-index 97998f41..96d9719b 100644
+index 97998f41..f355b344 100644
 --- a/gptqmodel/quantization/config.py
 +++ b/gptqmodel/quantization/config.py
-@@ -324,6 +324,56 @@ class HessianConfig:
+@@ -324,6 +324,47 @@ class HessianConfig:
              raise ValueError("HessianConfig: `staging_dtype` must be a torch.dtype or string.")
  
  
@@ -115,7 +115,6 @@ index 97998f41..96d9719b 100644
 +    # VAMP loop
 +    iters: int = 10
 +    damping: float = 0.5
-+    x1_mode: str = "mmse"  # "mmse" | "map"
 +    final_decision: str = "map"
 +    gamma_start: float = 1.0
 +    gamma_retry_factor: float = 4.0
@@ -128,14 +127,6 @@ index 97998f41..96d9719b 100644
 +    em_obs_precision_damping: float = 0.3
 +    em_obs_precision_min: float = 1e-4
 +    em_obs_precision_max: float = 1e8
-+
-+    # Adaptive accept/reject
-+    best_iterate_export: bool = True
-+    adaptive_accept_reject: bool = True
-+    adaptive_retry_steps: int = 3
-+    adaptive_accept_tol: float = 1e-4
-+    adaptive_damping_min: float = 0.1
-+    adaptive_obs_precision_backoff: float = 0.5
 +
 +    # Greedy polish
 +    polish_sweeps: int = 3
@@ -153,7 +144,7 @@ index 97998f41..96d9719b 100644
  @dataclass
  class GPTAQConfig:
      alpha: float = field(default=0.25)
-@@ -693,6 +743,9 @@ class QuantizeConfig():
+@@ -693,6 +734,9 @@ class QuantizeConfig():
      # Hessian accumulation controls (GPTQ only)
      hessian: Optional[HessianConfig] = field(default_factory=HessianConfig)
  
@@ -164,10 +155,10 @@ index 97998f41..96d9719b 100644
      # Takes a list of devices and returns either the original list or a filtered subset
      compute_device_filter: Optional[callable] = field(
 diff --git a/gptqmodel/quantization/gptq.py b/gptqmodel/quantization/gptq.py
-index ae0921aa..123f3929 100644
+index ae0921aa..edea3752 100644
 --- a/gptqmodel/quantization/gptq.py
 +++ b/gptqmodel/quantization/gptq.py
-@@ -935,6 +935,78 @@ class GPTQ:
+@@ -935,6 +935,71 @@ class GPTQ:
              W = self.module_copy.to(device=self.H.device)
              del self.module_copy
  
@@ -179,7 +170,6 @@ index ae0921aa..123f3929 100644
 +            vamp_cfg = UniformVampConfig(
 +                iters=int(getattr(mpgq_cfg, "iters", 10)),
 +                damping=float(getattr(mpgq_cfg, "damping", 0.5)),
-+                x1_mode=str(getattr(mpgq_cfg, "x1_mode", "mmse") or "mmse"),
 +                final_decision=str(getattr(mpgq_cfg, "final_decision", "map") or "map"),
 +                init_from="rtn",
 +                gamma_start=float(getattr(mpgq_cfg, "gamma_start", 1.0)),
@@ -191,12 +181,6 @@ index ae0921aa..123f3929 100644
 +                em_obs_precision_damping=float(getattr(mpgq_cfg, "em_obs_precision_damping", 0.3)),
 +                em_obs_precision_min=float(getattr(mpgq_cfg, "em_obs_precision_min", 1e-4)),
 +                em_obs_precision_max=float(getattr(mpgq_cfg, "em_obs_precision_max", 1e8)),
-+                best_iterate_export=bool(getattr(mpgq_cfg, "best_iterate_export", True)),
-+                adaptive_accept_reject=bool(getattr(mpgq_cfg, "adaptive_accept_reject", True)),
-+                adaptive_retry_steps=int(getattr(mpgq_cfg, "adaptive_retry_steps", 3)),
-+                adaptive_accept_tol=float(getattr(mpgq_cfg, "adaptive_accept_tol", 1e-4)),
-+                adaptive_damping_min=float(getattr(mpgq_cfg, "adaptive_damping_min", 0.1)),
-+                adaptive_obs_precision_backoff=float(getattr(mpgq_cfg, "adaptive_obs_precision_backoff", 0.5)),
 +                polish_sweeps=int(getattr(mpgq_cfg, "polish_sweeps", 3)),
 +            )
 +            adapter_cfg = GPTQAdapterConfig(
@@ -246,7 +230,7 @@ index ae0921aa..123f3929 100644
          self.quantizer.find_params(W, weight=True)
  
          # H = self.H.to(device=self.H.device)
-@@ -990,6 +1062,51 @@ class GPTQ:
+@@ -990,6 +1055,51 @@ class GPTQ:
          else:
              Hinv, damp = None, 0.0
  
@@ -436,3 +420,133 @@ index a58ad7fa..f23263dc 100644
      module.weight.data = W_.to(device=dev, dtype=dtype)
      if module.bias is not None:
          module.bias.data = b_.to(device=dev, dtype=b_dtype)
+
+diff --git a/gptqmodel/quantization/rotation/rotation.py b/gptqmodel/quantization/rotation/rotation.py
+--- a/gptqmodel/quantization/rotation/rotation.py
++++ b/gptqmodel/quantization/rotation/rotation.py
+@@ -185,7 +185,7 @@ def rotate_model(model: PreTrainedModel, rotate_mode: str, device: torch.device,
+     )
+     config = model.config
+     num_heads = config.num_attention_heads
+     model_dim = config.hidden_size
+-    head_dim = model_dim // num_heads
++    head_dim = int(getattr(config, "head_dim", None) or (model_dim // num_heads))
+ 
+     rotate_embeddings(model, Q, device)
+     rotate_head(model, Q, device, lm_head_name)
+diff --git a/gptqmodel/adapter/adapter.py b/gptqmodel/adapter/adapter.py
+index 7a054508..5d5c8554 100644
+--- a/gptqmodel/adapter/adapter.py
++++ b/gptqmodel/adapter/adapter.py
+@@ -4,7 +4,10 @@
+ # Contact: qubitium@modelcloud.ai, x.com/qubitium
+ 
+ 
+-import pcre as re
++try:
++    import pcre as re
++except Exception:  # pragma: no cover
++    import re
+ from dataclasses import dataclass
+ from typing import Dict, List, Optional, Tuple, Union
+ 
+diff --git a/gptqmodel/models/writer.py b/gptqmodel/models/writer.py
+index 0767fcc2..58a0b12a 100644
+--- a/gptqmodel/models/writer.py
++++ b/gptqmodel/models/writer.py
+@@ -13,7 +13,10 @@ import shutil
+ from os.path import isfile, join
+ from typing import Any, Dict, Optional, Union
+ 
+-import pcre as re
++try:
++    import pcre as re
++except Exception:  # pragma: no cover
++    import re
+ import torch
+ import transformers
+ from safetensors import safe_open
+diff --git a/gptqmodel/quantization/config.py b/gptqmodel/quantization/config.py
+index 97998f41..77130e6a 100644
+--- a/gptqmodel/quantization/config.py
++++ b/gptqmodel/quantization/config.py
+@@ -10,7 +10,10 @@ from enum import Enum
+ from os.path import join
+ from typing import Any, Dict, List, Optional, Tuple, Union
+ 
+-import pcre as re
++try:
++    import pcre as re
++except Exception:  # pragma: no cover
++    import re
+ import torch
+ from packaging import version
+ 
+diff --git a/gptqmodel/utils/mmlupro.py b/gptqmodel/utils/mmlupro.py
+index 65661642..76deb5fd 100644
+--- a/gptqmodel/utils/mmlupro.py
++++ b/gptqmodel/utils/mmlupro.py
+@@ -9,7 +9,10 @@ import os
+ import random
+ import time
+ 
+-import pcre as re
++try:
++    import pcre as re
++except Exception:  # pragma: no cover
++    import re
+ import torch
+ from datasets import load_dataset
+ from torch.utils.data import DataLoader
+@@ -294,4 +297,3 @@ def mmlupro(model: PreTrainedModel,
+         summary = file.read()
+ 
+     return summary
+-
+diff --git a/gptqmodel/utils/model.py b/gptqmodel/utils/model.py
+index 3ba42dde..01544647 100644
+--- a/gptqmodel/utils/model.py
++++ b/gptqmodel/utils/model.py
+@@ -21,7 +21,10 @@ from enum import Enum
+ from typing import Any, Dict, List, Optional, Tuple, Type, Union
+ 
+ import accelerate
+-import pcre as re
++try:
++    import pcre as re
++except Exception:  # pragma: no cover
++    import re
+ import torch
+ import torch.nn as nn
+ import transformers
+diff --git a/gptqmodel/utils/structure.py b/gptqmodel/utils/structure.py
+index 6889c7f3..c567f41c 100644
+--- a/gptqmodel/utils/structure.py
++++ b/gptqmodel/utils/structure.py
+@@ -26,7 +26,10 @@ Notes:
+ 
+ from typing import Dict, Iterable, Optional, Set, Tuple
+ 
+-import pcre as re
++try:
++    import pcre as re
++except Exception:  # pragma: no cover
++    import re
+ import torch
+ from torch import nn
+
+diff --git a/gptqmodel/nn_modules/qlinear/__init__.py b/gptqmodel/nn_modules/qlinear/__init__.py
+--- a/gptqmodel/nn_modules/qlinear/__init__.py
++++ b/gptqmodel/nn_modules/qlinear/__init__.py
+@@ -149,8 +149,11 @@ class BaseQuantLinear(nn.Module):
+             if bias:
+                 self.register_buffer("bias", t.zeros(out_features, dtype=t.float16))
+             else:
+                 self.bias = None
++
++        if not hasattr(self, "bias"):
++            self.bias = None
+ 
+         # load adapter if any
+         if adapter is not None:
+             if adapter.path in LORA_MERGED_WEIGHT_PATHS:
