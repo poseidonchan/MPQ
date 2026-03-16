@@ -47,6 +47,33 @@ conda run -n mpgq-quip python scripts/bench_quip_module_proxy.py \
 - LDLQ mean proxy: **48.0162**
 - MPGQ (VAMP + polish) mean proxy: **48.6637**
 
+### QUIP proxy with GPTQ-style solver params (iters=10, prior_tau=0.2)
+
+These are the defaults used in `scripts/bench_qwen3_0p6b_3bit.py` (GPTQModel backend),
+applied to the QUIP# proxy fixture above.
+
+**No polish**
+```
+conda run -n mpgq-quip python scripts/bench_quip_module_proxy.py \
+  --base-model meta-llama/Llama-3.2-1B \
+  --hessian-path /home/cys/mpgq-unified/runs/20260313_214017_b2/seed0/hess_c4_train/0_qkv.pt \
+  --layer 0 --suffix qkv --codebook E8P12 --seed 0 \
+  --mpgq-init rtn --mpgq-iters 10 --mpgq-prior-tau 0.2 --mpgq-polish-sweeps 0
+```
+- LDLQ mean proxy: **48.0162**
+- MPGQ mean proxy: **78.9062**
+
+**3-sweep polish**
+```
+conda run -n mpgq-quip python scripts/bench_quip_module_proxy.py \
+  --base-model meta-llama/Llama-3.2-1B \
+  --hessian-path /home/cys/mpgq-unified/runs/20260313_214017_b2/seed0/hess_c4_train/0_qkv.pt \
+  --layer 0 --suffix qkv --codebook E8P12 --seed 0 \
+  --mpgq-init rtn --mpgq-iters 10 --mpgq-prior-tau 0.2 --mpgq-polish-sweeps 3
+```
+- LDLQ mean proxy: **48.0162**
+- MPGQ (VAMP + polish) mean proxy: **49.4240**
+
 ## Solver notes (what “clean VAMP” means here)
 
 - VAMP iterations use the **MMSE denoiser mean** (`x₁ = E[x|r₁,γ₁]`) and a scalar-precision
