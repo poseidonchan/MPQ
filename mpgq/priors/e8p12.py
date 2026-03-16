@@ -652,7 +652,15 @@ def vamp_vector_discrete_mmse_e8p12(
     prior_scale_blocks: Optional[torch.Tensor] = None,
     prior_tau: float = 0.0,
     prior_tau_scale_mode: str = "absmax",
+    return_logZ_blocks: bool = False,
+    return_margin_blocks: bool = False,
+    return_entropy_blocks: bool = False,
 ) -> Dict[str, torch.Tensor | float]:
+    return_logZ_blocks = bool(return_logZ_blocks)
+    return_margin_blocks = bool(return_margin_blocks)
+    return_entropy_blocks = bool(return_entropy_blocks)
+    need_stats = bool(need_stats) or return_margin_blocks or return_entropy_blocks
+
     batch, n_blocks, codesz = r1_blocks.shape
     if int(codesz) != 8:
         raise ValueError(f"E8P12 posterior expects codesz=8, got {codesz}.")
@@ -698,6 +706,9 @@ def vamp_vector_discrete_mmse_e8p12(
     map_vals = torch.empty_like(r1_blocks)
     entropy_values = []
     margin_values = []
+    logZ_blocks = torch.empty(batch, n_blocks, dtype=torch.float32, device=r1_blocks.device) if return_logZ_blocks else None
+    margin_blocks = torch.empty(batch, n_blocks, dtype=torch.float32, device=r1_blocks.device) if return_margin_blocks else None
+    entropy_blocks = torch.empty(batch, n_blocks, dtype=torch.float32, device=r1_blocks.device) if return_entropy_blocks else None
 
     high_gamma_snap = 1e3
 
@@ -739,10 +750,11 @@ def vamp_vector_discrete_mmse_e8p12(
             )
 
         log_component = torch.stack([out["log_component"] for out in branch_outputs], dim=1)
-        log_weights = log_component - torch.logsumexp(
-            log_component.reshape(batch * chunk_size, -1), dim=-1, keepdim=True
-        ).view(batch * chunk_size, 1, 1)
+        logZ_flat = torch.logsumexp(log_component.reshape(batch * chunk_size, -1), dim=-1)  # (batch*chunk_size,)
+        log_weights = log_component - logZ_flat.view(batch * chunk_size, 1, 1)
         weights = torch.exp(log_weights)
+        if logZ_blocks is not None:
+            logZ_blocks[:, bstart:bend] = logZ_flat.view(batch, chunk_size).to(dtype=torch.float32)
 
         mu = torch.zeros((batch * chunk_size, codesz), dtype=torch.float32, device=r1_blocks.device)
         second_moment = torch.zeros((batch * chunk_size,), dtype=torch.float32, device=r1_blocks.device)
@@ -801,16 +813,21 @@ def vamp_vector_discrete_mmse_e8p12(
             weight_log_term = torch.where(
                 torch.isfinite(log_weights), weights * log_weights, torch.zeros_like(log_weights)
             )
-            entropy = (-(weight_log_term).sum(dim=(1, 2)) + (weights * sign_entropy).sum(dim=(1, 2))).mean()
-            entropy_values.append(float(entropy.item()))
+            entropy_flat = (-(weight_log_term).sum(dim=(1, 2)) + (weights * sign_entropy).sum(dim=(1, 2)))
+            if entropy_blocks is not None:
+                entropy_blocks[:, bstart:bend] = entropy_flat.view(batch, chunk_size).to(dtype=torch.float32)
+            entropy_values.append(float(entropy_flat.mean().item()))
 
             second_logscore = torch.stack([out["second_logscore"] for out in branch_outputs], dim=1)
             top_candidates = torch.stack([best_logscore, second_logscore], dim=-1).reshape(batch * chunk_size, -1)
             top2 = torch.topk(top_candidates, k=min(2, top_candidates.shape[-1]), dim=-1).values
             if top2.shape[-1] == 1:
-                margin_values.append(float("inf"))
+                margin_flat = torch.full((batch * chunk_size,), float("inf"), device=r1_blocks.device, dtype=torch.float32)
             else:
-                margin_values.append(float((top2[:, 0] - top2[:, 1]).mean().item()))
+                margin_flat = (top2[:, 0] - top2[:, 1]).to(dtype=torch.float32)
+            if margin_blocks is not None:
+                margin_blocks[:, bstart:bend] = margin_flat.view(batch, chunk_size)
+            margin_values.append(float(margin_flat.mean().item()))
 
     if gamma1.ndim == 2:
         alpha1 = gamma1.to(dtype=torch.float32) * var1.mean(dim=1, keepdim=True)
@@ -831,4 +848,7 @@ def vamp_vector_discrete_mmse_e8p12(
         "alpha1": alpha1,
         "entropy": float(sum(entropy_values) / len(entropy_values)) if entropy_values else 0.0,
         "margin": float(sum(margin_values) / len(margin_values)) if margin_values else 0.0,
+        **({"logZ_blocks": logZ_blocks} if logZ_blocks is not None else {}),
+        **({"margin_blocks": margin_blocks} if margin_blocks is not None else {}),
+        **({"entropy_blocks": entropy_blocks} if entropy_blocks is not None else {}),
     }

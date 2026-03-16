@@ -3,8 +3,9 @@
 Date: 2026-03-15
 
 This repo intentionally keeps a **clean, scalar-precision VAMP** implementation and a
-minimal, reproducible QUIP# proxy benchmark. Experimental solvers (EP / block-VAMP /
-adaptive accept-reject / best-iterate export) are removed.
+minimal, reproducible QUIP# proxy benchmark. In addition, it includes a **VAMP/VASP-like**
+block solver (RS-VAMP / LRS-VASP) for research comparisons. Other experimental solvers
+(EP / adaptive accept-reject / best-iterate export) are removed.
 
 ## QUIP# E8P12 proxy baseline (deterministic)
 
@@ -46,6 +47,64 @@ conda run -n mpgq-quip python scripts/bench_quip_module_proxy.py \
 ```
 - LDLQ mean proxy: **48.0162**
 - MPGQ (VAMP + polish) mean proxy: **48.6637**
+
+## RS-VAMP / LRS-VASP (block RS denoiser; non-greedy)
+
+These solvers are **VAMP/VASP-like** (two-module extrinsic recursion). They operate on a
+trace-normalized Hessian `Hbar = H / (tr(H)/n)` and use:
+- exact finite-codebook RS block posterior moments (E8P12 factorized backend)
+- final hard decision = per-block MAP
+- optional `polish` = separate rank-space block coordinate descent
+
+### QUIP proxy, seed=0, no polish
+
+**LRS-VASP (auto lambda grid; default `0.25,1.0,4.0`)**
+```
+conda run -n mpgq-quip python scripts/bench_quip_module_proxy.py \
+  --base-model meta-llama/Llama-3.2-1B \
+  --hessian-path /home/cys/mpgq-unified/runs/20260313_214017_b2/seed0/hess_c4_train/0_qkv.pt \
+  --layer 0 --suffix qkv --codebook E8P12 --seed 0 \
+  --mpgq-init rtn --mpgq-method lrs-vasp --mpgq-iters 16 --mpgq-prior-tau 0.25 \
+  --mpgq-polish-sweeps 0
+```
+- MPGQ (LRS-VASP) mean proxy: **74.9640**
+
+**LRS-VASP (fixed `lambda_eff≈58.40`)**
+```
+conda run -n mpgq-quip python scripts/bench_quip_module_proxy.py \
+  --base-model meta-llama/Llama-3.2-1B \
+  --hessian-path /home/cys/mpgq-unified/runs/20260313_214017_b2/seed0/hess_c4_train/0_qkv.pt \
+  --layer 0 --suffix qkv --codebook E8P12 --seed 0 \
+  --mpgq-init rtn --mpgq-method lrs-vasp --mpgq-iters 16 --mpgq-prior-tau 0.25 \
+  --mpgq-polish-sweeps 0 --mpgq-lambda-eff-grid 58.4025 --mpgq-lambda-eff-scale-mode none
+```
+- MPGQ (LRS-VASP) mean proxy: **74.1353**
+
+**RS-VAMP (fixed `lambda_eff=59.0`)**
+```
+conda run -n mpgq-quip python scripts/bench_quip_module_proxy.py \
+  --base-model meta-llama/Llama-3.2-1B \
+  --hessian-path /home/cys/mpgq-unified/runs/20260313_214017_b2/seed0/hess_c4_train/0_qkv.pt \
+  --layer 0 --suffix qkv --codebook E8P12 --seed 0 \
+  --mpgq-init rtn --mpgq-method rs-vamp --mpgq-iters 16 --mpgq-prior-tau 0.25 \
+  --mpgq-polish-sweeps 0 --mpgq-lambda-eff-grid 59.0 --mpgq-lambda-eff-scale-mode none
+```
+- MPGQ (RS-VAMP) mean proxy: **74.3988**
+
+### QUIP proxy, seed=0, 3-sweep polish
+
+With a good `lambda_eff`, all MPGQ methods get close to LDLQ on this fixture:
+- LDLQ mean proxy: **48.0162**
+- MPGQ (VAMP + polish, default settings): **48.6637**
+- MPGQ (VAMP + polish, fixed obs_precision=59, no EM): **48.1284**
+- MPGQ (RS-VAMP + polish, fixed lambda_eff=59): **48.1460**
+- MPGQ (LRS-VASP + polish, fixed lambda_eff=59): **48.1633**
+
+### Note: lambda grid is resolved once per module (chunk-stable)
+
+For `--mpgq-method rs-vamp|lrs-vasp` with `--mpgq-lambda-eff-scale-mode auto`, the
+benchmark now resolves an **absolute** `lambda_eff_grid` once per module before the
+row-chunk loop, so row chunking does not change the lambda scale across chunks.
 
 ### QUIP proxy with GPTQ-style solver params (iters=10, prior_tau=0.2)
 

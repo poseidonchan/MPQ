@@ -16,4 +16,4 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["mpgq*"]
+include = ["mpgq*", "lrs_vasp_ptq*"]

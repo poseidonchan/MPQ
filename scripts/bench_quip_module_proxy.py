@@ -117,6 +117,19 @@ def _build_quip_args(base: argparse.Namespace) -> Any:
     args.mpgq_polish_metric = str(base.mpgq_polish_metric)
     args.mpgq_polish_max_blocks = int(base.mpgq_polish_max_blocks)
     args.mpgq_metric_rows_per_chunk = int(base.mpgq_metric_rows_per_chunk)
+    # Optional solver selection / LRS-VASP knobs (consumed by MPGQ wrapper, not QUIP# proper).
+    args.mpgq_method = str(getattr(base, "mpgq_method", "vamp"))
+    args.mpgq_lambda_eff_grid = str(getattr(base, "mpgq_lambda_eff_grid", "0.25,1.0,4.0"))
+    args.mpgq_lambda_eff_scale_mode = str(getattr(base, "mpgq_lambda_eff_scale_mode", "auto"))
+    args.mpgq_rs_warmup_iters = int(getattr(base, "mpgq_rs_warmup_iters", 4))
+    args.mpgq_survey_L = float(getattr(base, "mpgq_survey_L", 2.0))
+    args.mpgq_survey_Q = int(getattr(base, "mpgq_survey_Q", 9))
+    args.mpgq_survey_v1_init = float(getattr(base, "mpgq_survey_v1_init", 0.0))
+    args.mpgq_survey_v1_min = float(getattr(base, "mpgq_survey_v1_min", 1e-6))
+    args.mpgq_hard_gap_thresh = float(getattr(base, "mpgq_hard_gap_thresh", 0.5))
+    args.mpgq_hard_var_mult = float(getattr(base, "mpgq_hard_var_mult", 2.0))
+    args.mpgq_hard_max_frac = float(getattr(base, "mpgq_hard_max_frac", 0.25))
+    args.mpgq_lrs_backend = str(getattr(base, "mpgq_lrs_backend", "factorized"))
     return args
 
 
@@ -228,7 +241,13 @@ def _run_mpgq_refine_cached(
         _zero_e8p12_init,
         _vamp_hessian_eigen,
     )
-    from mpgq.solver import E8P12VampConfig, solve_e8p12_rankspace_vamp
+    from mpgq.solver import (
+        E8P12LrsVaspConfig,
+        E8P12VampConfig,
+        resolve_e8p12_lrs_lambda_eff_grid,
+        solve_e8p12_rankspace_lrs_vasp,
+        solve_e8p12_rankspace_vamp,
+    )
 
     device = Wr.device
     m, n = Wr.shape
@@ -281,6 +300,10 @@ def _run_mpgq_refine_cached(
         mse = float(diff_u.square().mean().clamp_min_(1e-12).item())
         obs_precision = 1.0 / mse
 
+    method = str(getattr(args, "mpgq_method", "vamp") or "vamp").strip().lower()
+    if method not in {"vamp", "rs-vamp", "lrs-vasp"}:
+        raise ValueError(f"unknown mpgq_method={method!r}")
+
     vamp_cfg = E8P12VampConfig(
         iters=int(getattr(args, "mpgq_iters", 16)),
         damping=float(getattr(args, "mpgq_damping", 0.5)),
@@ -301,6 +324,59 @@ def _run_mpgq_refine_cached(
         polish_max_blocks=int(getattr(args, "mpgq_polish_max_blocks", 0)),
     )
 
+    lambda_grid_str = str(getattr(args, "mpgq_lambda_eff_grid", "0.25,1.0,4.0") or "").strip()
+    lambda_grid = []
+    for tok in lambda_grid_str.split(","):
+        tok = tok.strip()
+        if tok:
+            lambda_grid.append(float(tok))
+    if not lambda_grid:
+        lambda_grid = [1.0]
+    lrs_cfg = E8P12LrsVaspConfig(
+        method="rs-vamp" if method == "rs-vamp" else "lrs-vasp",
+        iters=int(getattr(args, "mpgq_iters", 16)),
+        rs_warmup_iters=int(getattr(args, "mpgq_rs_warmup_iters", 4)),
+        damping=float(getattr(args, "mpgq_damping", 0.5)),
+        gamma_start=float(getattr(args, "mpgq_gamma_start", 1.0)),
+        gamma_retry_factor=float(getattr(args, "mpgq_gamma_retry_factor", 4.0)),
+        gamma_retry_steps=int(getattr(args, "mpgq_gamma_retry_steps", 3)),
+        alpha_eps=1e-6,
+        blocks_per_chunk=int(getattr(args, "mpgq_blocks_per_chunk", 16)),
+        tol=1e-4,
+        prior_tau=float(getattr(args, "mpgq_prior_tau", 0.25)),
+        prior_tau_scale_mode=str(getattr(args, "mpgq_prior_tau_scale_mode", "absmax")),
+        lambda_eff_grid=tuple(lambda_grid),
+        lambda_eff_scale_mode=str(getattr(args, "mpgq_lambda_eff_scale_mode", "auto")),
+        enable_survey=(method == "lrs-vasp"),
+        survey_L=float(getattr(args, "mpgq_survey_L", 2.0)),
+        survey_Q=int(getattr(args, "mpgq_survey_Q", 9)),
+        survey_v1_init=float(getattr(args, "mpgq_survey_v1_init", 0.0)),
+        survey_v1_min=float(getattr(args, "mpgq_survey_v1_min", 1e-6)),
+        hard_gap_thresh=float(getattr(args, "mpgq_hard_gap_thresh", 0.5)),
+        hard_var_mult=float(getattr(args, "mpgq_hard_var_mult", 2.0)),
+        hard_max_frac=float(getattr(args, "mpgq_hard_max_frac", 0.25)),
+        backend=str(getattr(args, "mpgq_lrs_backend", "factorized")),
+        polish_sweeps=int(getattr(args, "mpgq_polish_sweeps", 3)),
+        polish_metric=str(getattr(args, "mpgq_polish_metric", "gram")),
+        polish_metric_rows_per_chunk=int(getattr(args, "mpgq_metric_rows_per_chunk", 0)),
+        polish_max_blocks=int(getattr(args, "mpgq_polish_max_blocks", 0)),
+    )
+
+    # Resolve absolute lambda grid once per module so all row chunks share the same scale.
+    if method in {"rs-vamp", "lrs-vasp"} and str(lrs_cfg.lambda_eff_scale_mode).strip().lower() == "auto":
+        from dataclasses import replace
+
+        abs_grid, _lambda_stats = resolve_e8p12_lrs_lambda_eff_grid(
+            Wr=Wr,
+            hatWr_init=hatWr_init,
+            cb=cb,
+            S=S,
+            Vs=Vs,
+            cfg=lrs_cfg,
+            sample_rows=int(getattr(args, "mpgq_block_rows", 32) or 32),
+        )
+        lrs_cfg = replace(lrs_cfg, lambda_eff_grid=abs_grid, lambda_eff_scale_mode="none")
+
     block_rows = min(int(m), max(int(getattr(args, "mpgq_block_rows", 32) or 32), 1))
     exact_ldlq, _ = _exact_surrogate_chunk_means(Wr, hatWr0.to(dtype=torch.float32), Hr, block_rows=block_rows)
     exact_before, _ = _exact_surrogate_chunk_means(Wr, hatWr_init, Hr, block_rows=block_rows)
@@ -312,23 +388,39 @@ def _run_mpgq_refine_cached(
     for row_start in range(0, int(m), block_rows):
         row_end = min(row_start + block_rows, int(m))
         rb = slice(row_start, row_end)
-        hat_chunk, idx_chunk, _err_chunk, stats_chunk = solve_e8p12_rankspace_vamp(
-            Wr=Wr[rb],
-            hatWr_init=final_hatWr[rb],
-            cb=cb,
-            V=V,
-            Vh=Vh,
-            S=S,
-            Vs=Vs,
-            cfg=vamp_cfg,
-            module_name=module_name,
-            obs_precision_init=obs_precision_block,
-            log_stats=True,
-        )
-        final_hatWr[rb] = hat_chunk
-        final_Qidxs[rb] = idx_chunk
-        if bool(vamp_cfg.em_obs_precision) and float(vamp_cfg.obs_precision) <= 0.0:
-            obs_precision_block = float(stats_chunk.get("obs_precision_final", obs_precision_block))
+        if method == "vamp":
+            hat_chunk, idx_chunk, _err_chunk, stats_chunk = solve_e8p12_rankspace_vamp(
+                Wr=Wr[rb],
+                hatWr_init=final_hatWr[rb],
+                cb=cb,
+                V=V,
+                Vh=Vh,
+                S=S,
+                Vs=Vs,
+                cfg=vamp_cfg,
+                module_name=module_name,
+                obs_precision_init=obs_precision_block,
+                log_stats=True,
+            )
+            final_hatWr[rb] = hat_chunk
+            final_Qidxs[rb] = idx_chunk
+            if bool(vamp_cfg.em_obs_precision) and float(vamp_cfg.obs_precision) <= 0.0:
+                obs_precision_block = float(stats_chunk.get("obs_precision_final", obs_precision_block))
+        else:
+            hat_chunk, idx_chunk, _err_chunk, stats_chunk = solve_e8p12_rankspace_lrs_vasp(
+                Wr=Wr[rb],
+                hatWr_init=final_hatWr[rb],
+                cb=cb,
+                V=V,
+                Vh=Vh,
+                S=S,
+                Vs=Vs,
+                cfg=lrs_cfg,
+                module_name=module_name,
+                log_per_iter=False,
+            )
+            final_hatWr[rb] = hat_chunk
+            final_Qidxs[rb] = idx_chunk
 
     exact_after, _ = _exact_surrogate_chunk_means(Wr, final_hatWr, Hr, block_rows=block_rows)
     stats = {
@@ -370,6 +462,7 @@ def main() -> None:
     parser.add_argument("--rescale-wh", action="store_true")
 
     parser.add_argument("--mpgq-init", type=str, default="rtn", choices=["random", "rtn", "zero", "ldlq"])
+    parser.add_argument("--mpgq-method", type=str, default="vamp", choices=["vamp", "rs-vamp", "lrs-vasp"])
     parser.add_argument("--mpgq-iters", type=int, default=16)
     parser.add_argument("--mpgq-damping", type=float, default=0.5)
     parser.add_argument("--mpgq-prior-tau", type=float, default=0.25)
@@ -393,6 +486,19 @@ def main() -> None:
     parser.add_argument("--mpgq-polish-metric", type=str, default="gram", choices=["gram", "isotropic", "diag"])
     parser.add_argument("--mpgq-polish-max-blocks", type=int, default=0)
     parser.add_argument("--mpgq-metric-rows-per-chunk", type=int, default=0)
+
+    # LRS-VASP options (used when --mpgq-method is rs-vamp or lrs-vasp)
+    parser.add_argument("--mpgq-lambda-eff-grid", type=str, default="0.25,1.0,4.0")
+    parser.add_argument("--mpgq-lambda-eff-scale-mode", type=str, default="auto", choices=["auto", "none"])
+    parser.add_argument("--mpgq-rs-warmup-iters", type=int, default=4)
+    parser.add_argument("--mpgq-survey-L", type=float, default=2.0)
+    parser.add_argument("--mpgq-survey-Q", type=int, default=9)
+    parser.add_argument("--mpgq-survey-v1-init", type=float, default=0.0)
+    parser.add_argument("--mpgq-survey-v1-min", type=float, default=1e-6)
+    parser.add_argument("--mpgq-hard-gap-thresh", type=float, default=0.5)
+    parser.add_argument("--mpgq-hard-var-mult", type=float, default=2.0)
+    parser.add_argument("--mpgq-hard-max-frac", type=float, default=0.25)
+    parser.add_argument("--mpgq-lrs-backend", type=str, default="factorized", choices=["factorized", "bruteforce"])
 
     parser.add_argument("--json-out", type=str, default=None)
     args = parser.parse_args()
