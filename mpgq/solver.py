@@ -62,6 +62,7 @@ class E8P12VampConfig:
     gamma_retry_steps: int = 3
     prior_tau: float = 0.25
     prior_tau_scale_mode: str = "absmax"
+    compile_prior: bool = True
     obs_precision: float = 0.0
     em_obs_precision: bool = True
     em_obs_precision_damping: float = 0.3
@@ -695,6 +696,7 @@ def solve_e8p12_rankspace_vamp(
     damping = float(cfg.damping)
     prior_tau = float(cfg.prior_tau)
     prior_tau_scale_mode = str(cfg.prior_tau_scale_mode or "absmax").strip().lower()
+    compile_prior = bool(getattr(cfg, "compile_prior", True))
     blocks_per_chunk = max(int(cfg.blocks_per_chunk), 1)
 
     W_blocks = Wr.reshape(B, nblocks, codesz)
@@ -752,6 +754,7 @@ def solve_e8p12_rankspace_vamp(
                 prior_scale_blocks=prior_scale_blocks,
                 prior_tau=prior_tau,
                 prior_tau_scale_mode=prior_tau_scale_mode,
+                compile_prior=compile_prior,
             )
             alpha1_candidate = post_candidate["alpha1"]  # type: ignore[assignment]
             valid_alpha1 = alpha_valid_mask(alpha1_candidate, eps=alpha_eps)
@@ -922,7 +925,7 @@ def solve_e8p12_rankspace_vamp(
             polish_metric=polish_metric,
             metric_rows_per_chunk=int(cfg.polish_metric_rows_per_chunk),
             polish_max_blocks=int(getattr(cfg, "polish_max_blocks", 0) or 0),
-            topk_idxs=None if topk is None else topk["topk_idxs"].to(device="cpu", dtype=torch.long),
+            topk_idxs=None if topk is None else topk["topk_idxs"].to(device=final_hatWr.device, dtype=torch.long),
         )
         polish_gain = float((err_before - err_after).mean().item())
         polish_updates = float(polish_stats.get("accepted_updates", 0.0))
@@ -946,6 +949,7 @@ def solve_e8p12_rankspace_vamp(
         "damping": float(damping),
         "prior_tau": float(prior_tau),
         "prior_tau_scale_mode": str(prior_tau_scale_mode),
+        "compile_prior": bool(compile_prior),
         "gamma_start": float(cfg.gamma_start),
         "gamma_retry_factor": float(gamma_retry_factor),
         "gamma_retry_steps": int(gamma_retry_steps),

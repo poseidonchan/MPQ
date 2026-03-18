@@ -300,6 +300,7 @@ def _build_vamp_cfg(args: Any, *, polish_mode: str) -> E8P12VampConfig:
         gamma_retry_steps=int(getattr(args, "mpgq_gamma_retry_steps", 3)),
         prior_tau=float(getattr(args, "mpgq_prior_tau", 0.25)),
         prior_tau_scale_mode=str(getattr(args, "mpgq_prior_tau_scale_mode", "absmax")),
+        compile_prior=bool(getattr(args, "mpgq_compile_prior", True)),
         obs_precision=float(getattr(args, "mpgq_obs_precision", 0.0)),
         em_obs_precision=bool(getattr(args, "mpgq_em_obs_precision", True)),
         em_obs_precision_damping=float(getattr(args, "mpgq_em_obs_precision_damping", 0.3)),
@@ -540,7 +541,7 @@ def mpgq_refine_codebook(
                     polish_metric=str(getattr(args, "mpgq_polish_metric", "gram")),
                     metric_rows_per_chunk=int(getattr(args, "mpgq_metric_rows_per_chunk", 0)),
                     polish_max_blocks=int(getattr(args, "mpgq_polish_max_blocks", 0)),
-                    topk_idxs=topk["topk_idxs"].to(device="cpu", dtype=torch.long),
+                    topk_idxs=topk["topk_idxs"].to(device=Wr.device, dtype=torch.long),
                 )
                 if bool(aux_cfg.em_obs_precision) and float(aux_cfg.obs_precision) <= 0.0:
                     obs_precision_block = float(aux_stats.get("obs_precision_final", obs_precision_block))

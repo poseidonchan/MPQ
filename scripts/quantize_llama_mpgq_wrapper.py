@@ -22,6 +22,7 @@ def main() -> None:
     parser.add_argument("--mpgq-solver", type=str, default=None)
     parser.add_argument("--mpgq-polish-mode", type=str, default=None)
     parser.add_argument("--mpgq-topk-k", type=int, default=8)
+    parser.add_argument("--mpgq-compile-prior", "--mpgq_compile_prior", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--quant-backend", type=str, default=None)
     parser.add_argument("--quant-codebook", type=str, default=None)
     parser.add_argument("--quant-preprocess", type=str, default=None)
@@ -63,6 +64,7 @@ def main() -> None:
     if wrapper_args.mpgq_polish_mode is not None:
         setattr(args, "mpgq_polish_mode", str(wrapper_args.mpgq_polish_mode))
     setattr(args, "mpgq_topk_k", int(wrapper_args.mpgq_topk_k))
+    setattr(args, "mpgq_compile_prior", bool(wrapper_args.mpgq_compile_prior))
     quip_quant.main(args)
 
 

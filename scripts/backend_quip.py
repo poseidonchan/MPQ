@@ -427,6 +427,7 @@ def run(args) -> Dict[str, Any]:
             str(int(getattr(args, "mpgq_topk_k", 8))),
         ]
         quant_cmd.append("--mpgq_em_obs_precision" if bool(args.mpgq_em_obs_precision) else "--no-mpgq_em_obs_precision")
+        quant_cmd.append("--mpgq_compile_prior" if bool(getattr(args, "mpgq_compile_prior", True)) else "--no-mpgq_compile_prior")
 
     t0 = time.time()
     rc = _run_logged(quant_cmd, cwd=QUIP_ROOT, env=env, log_path=log_dir / "quantize.log")
@@ -530,6 +531,7 @@ def run(args) -> Dict[str, Any]:
             "prior_tau_scale_mode": str(args.mpgq_prior_tau_scale_mode),
             "damping": float(args.mpgq_damping),
             "em_obs_precision": bool(args.mpgq_em_obs_precision),
+            "compile_prior": bool(getattr(args, "mpgq_compile_prior", True)),
             "gamma_start": float(args.mpgq_gamma_start),
             "gamma_retry_factor": float(args.mpgq_gamma_retry_factor),
             "gamma_retry_steps": int(args.mpgq_gamma_retry_steps),
@@ -599,6 +601,7 @@ def main() -> None:
     parser.add_argument("--mpgq-gamma-retry-steps", type=int, default=3)
     parser.add_argument("--mpgq-obs-precision", type=float, default=0.0)
     parser.add_argument("--mpgq-em-obs-precision", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--mpgq-compile-prior", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--mpgq-blocks-per-chunk", type=int, default=16)
     parser.add_argument("--mpgq-block-rows", type=int, default=32)
     parser.add_argument("--mpgq-polish-sweeps", type=int, default=3)

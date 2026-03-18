@@ -1,9 +1,40 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 import torch
+
+
+_COMPILED_BRANCH_FACTORIZED_STATS: Optional[Callable[..., Dict[str, torch.Tensor]]] = None
+_COMPILED_BRANCH_FACTORIZED_STATS_FAILED = False
+
+
+def _disable_compiled_branch_factorized_stats() -> None:
+    global _COMPILED_BRANCH_FACTORIZED_STATS, _COMPILED_BRANCH_FACTORIZED_STATS_FAILED
+    _COMPILED_BRANCH_FACTORIZED_STATS = None
+    _COMPILED_BRANCH_FACTORIZED_STATS_FAILED = True
+
+
+def _get_compiled_branch_factorized_stats() -> Optional[Callable[..., Dict[str, torch.Tensor]]]:
+    global _COMPILED_BRANCH_FACTORIZED_STATS, _COMPILED_BRANCH_FACTORIZED_STATS_FAILED
+    if _COMPILED_BRANCH_FACTORIZED_STATS_FAILED:
+        return None
+    if _COMPILED_BRANCH_FACTORIZED_STATS is None:
+        compile_fn = getattr(torch, "compile", None)
+        if compile_fn is None:
+            _COMPILED_BRANCH_FACTORIZED_STATS_FAILED = True
+            return None
+        try:
+            _COMPILED_BRANCH_FACTORIZED_STATS = compile_fn(
+                _branch_factorized_stats_compilable,
+                mode="max-autotune-no-cudagraphs",
+                fullgraph=False,
+            )
+        except Exception:
+            _disable_compiled_branch_factorized_stats()
+            return None
+    return _COMPILED_BRANCH_FACTORIZED_STATS
 
 
 @torch.inference_mode()
@@ -104,22 +135,27 @@ def get_e8p12_factor_cache(cb: object, *, device: Optional[torch.device] = None)
         "device": target_device,
         "codesz": torch.tensor(codesz, device=target_device),
         "abs_count": torch.tensor(abs_count, device=target_device),
+        "base_ids": torch.arange(abs_count, device=target_device, dtype=torch.long).view(1, abs_count),
         "base_sign_mask": base_sign_mask,
         "base_parity": base_parity,
+        "base_parity_even": (base_parity == 0).view(1, abs_count),
         "base_abs": base_abs,
+        "base_abs_view": base_abs.view(1, abs_count, codesz),
         "base_abs_sq": base_abs_sq,
+        "base_abs_sq_t": base_abs_sq.T.contiguous(),
         "base_sqnorm": base_sqnorm,
+        "base_sqnorm_view": base_sqnorm.view(1, abs_count),
         "idx_lut": idx_lut,
         "valid_even_sign": valid_even_sign,
         "bit_values": bit_values,
+        "bit_values_view": bit_values.view(1, 1, codesz),
         "branch_offsets": branch_offsets,
     }
     setattr(cb, "_mpgq_factor_cache", cache)
     return cache
 
 
-@torch.inference_mode()
-def _branch_factorized_stats(
+def _branch_factorized_stats_impl(
     *,
     y_branch: torch.Tensor,  # (N, 8)
     gamma_flat: torch.Tensor,  # (N, 1) or (N, 8)
@@ -127,12 +163,17 @@ def _branch_factorized_stats(
     branch_idx: int,
     cache: Dict[str, torch.Tensor],
     need_stats: bool,
+    validate_map_idx: bool,
 ) -> Dict[str, torch.Tensor]:
     base_abs = cache["base_abs"]
-    base_abs_sq = cache["base_abs_sq"]
-    base_sqnorm = cache["base_sqnorm"]
+    base_abs_view = cache["base_abs_view"]
+    base_abs_sq_t = cache["base_abs_sq_t"]
+    base_sqnorm_view = cache["base_sqnorm_view"]
     base_parity = cache["base_parity"]
+    parity_mask = cache["base_parity_even"]
     bit_values = cache["bit_values"]
+    bit_values_view = cache["bit_values_view"]
+    base_ids = cache["base_ids"]
     idx_lut_branch = cache["idx_lut"][branch_idx]
 
     n_items = int(y_branch.shape[0])
@@ -149,16 +190,15 @@ def _branch_factorized_stats(
     else:
         gamma_eff = gamma_flat.view(n_items, 1, codesz)
 
-    a = gamma_eff * y_branch.view(n_items, 1, codesz) * base_abs.view(1, n_bases, codesz)
+    a = gamma_eff * y_branch.view(n_items, 1, codesz) * base_abs_view
     if gamma_flat.shape[1] == 1:
         y_norm = y_branch.square().sum(dim=-1, keepdim=True)
-        const = -0.5 * gamma_flat[:, :1] * (y_norm + base_sqnorm.view(1, n_bases))
+        const = -0.5 * gamma_flat[:, :1] * (y_norm + base_sqnorm_view)
     else:
-        gamma_vec = gamma_flat.to(dtype=torch.float32)
+        gamma_vec = gamma_flat
         y_norm = (gamma_vec * y_branch.square()).sum(dim=-1, keepdim=True)
-        base_norm = gamma_vec.matmul(base_abs_sq.to(dtype=torch.float32).T)
+        base_norm = gamma_vec.matmul(base_abs_sq_t)
         const = -0.5 * (y_norm + base_norm)
-    parity_mask = (base_parity.view(1, n_bases) == 0)
 
     logC = torch.logaddexp(a, -a).sum(dim=-1)
     t = torch.tanh(a)
@@ -214,10 +254,10 @@ def _branch_factorized_stats(
         suffix = suffix * t_coord
     sign_mean = torch.nan_to_num(sign_mean, nan=0.0, posinf=0.0, neginf=0.0)
 
-    mu_core = sign_mean * base_abs.view(1, n_bases, codesz)
+    mu_core = sign_mean * base_abs_view
     mu_component = mu_core + float(offset)
     second_component = (
-        base_sqnorm.view(1, n_bases)
+        base_sqnorm_view
         + codesz * (float(offset) ** 2)
         + 2.0 * float(offset) * mu_core.sum(dim=-1)
     )
@@ -230,15 +270,14 @@ def _branch_factorized_stats(
     min_pos = abs_a.argmin(dim=-1)
     min_abs = abs_a.gather(-1, min_pos.unsqueeze(-1)).squeeze(-1)
     mismatch = best_parity != base_parity.view(1, n_bases)
-    best_sign_id = (best_sign_bits.to(dtype=torch.long) * bit_values.view(1, 1, codesz)).sum(dim=-1)
+    best_sign_id = (best_sign_bits.to(dtype=torch.long) * bit_values_view).sum(dim=-1)
     min_bit = bit_values[min_pos]
     best_sign_id = torch.where(mismatch, torch.bitwise_xor(best_sign_id, min_bit), best_sign_id)
     best_linear = sum_abs - 2.0 * mismatch.to(dtype=dtype) * min_abs
     best_logscore = const + best_linear
 
-    base_ids = torch.arange(n_bases, device=device, dtype=torch.long).view(1, n_bases).expand(n_items, -1)
-    map_idx = idx_lut_branch[base_ids, best_sign_id]
-    if not torch.all(map_idx >= 0):
+    map_idx = idx_lut_branch[base_ids.expand(n_items, -1), best_sign_id]
+    if validate_map_idx and not torch.all(map_idx >= 0):
         raise RuntimeError("failed to map factorized E8P12 MAP sign patterns back to full codebook indices.")
 
     out = {
@@ -267,6 +306,62 @@ def _branch_factorized_stats(
     return out
 
 
+def _branch_factorized_stats_compilable(
+    *,
+    y_branch: torch.Tensor,  # (N, 8)
+    gamma_flat: torch.Tensor,  # (N, 1) or (N, 8)
+    offset: float,
+    branch_idx: int,
+    cache: Dict[str, torch.Tensor],
+    need_stats: bool,
+) -> Dict[str, torch.Tensor]:
+    return _branch_factorized_stats_impl(
+        y_branch=y_branch,
+        gamma_flat=gamma_flat,
+        offset=offset,
+        branch_idx=branch_idx,
+        cache=cache,
+        need_stats=need_stats,
+        validate_map_idx=False,
+    )
+
+
+@torch.inference_mode()
+def _branch_factorized_stats(
+    *,
+    y_branch: torch.Tensor,  # (N, 8)
+    gamma_flat: torch.Tensor,  # (N, 1) or (N, 8)
+    offset: float,
+    branch_idx: int,
+    cache: Dict[str, torch.Tensor],
+    need_stats: bool,
+    use_compiled: bool = False,
+) -> Dict[str, torch.Tensor]:
+    if bool(use_compiled) and y_branch.is_cuda:
+        compiled_fn = _get_compiled_branch_factorized_stats()
+        if compiled_fn is not None:
+            try:
+                return compiled_fn(
+                    y_branch=y_branch,
+                    gamma_flat=gamma_flat,
+                    offset=offset,
+                    branch_idx=branch_idx,
+                    cache=cache,
+                    need_stats=need_stats,
+                )
+            except Exception:
+                _disable_compiled_branch_factorized_stats()
+    return _branch_factorized_stats_impl(
+        y_branch=y_branch,
+        gamma_flat=gamma_flat,
+        offset=offset,
+        branch_idx=branch_idx,
+        cache=cache,
+        need_stats=need_stats,
+        validate_map_idx=True,
+    )
+
+
 @torch.inference_mode()
 def _branch_factorized_map(
     *,
@@ -277,9 +372,13 @@ def _branch_factorized_map(
     need_stats: bool,
 ) -> Dict[str, torch.Tensor]:
     base_abs = cache["base_abs"]
-    base_sqnorm = cache["base_sqnorm"]
+    base_abs_view = cache["base_abs_view"]
+    base_abs_sq_t = cache["base_abs_sq_t"]
+    base_sqnorm_view = cache["base_sqnorm_view"]
     base_parity = cache["base_parity"]
     bit_values = cache["bit_values"]
+    bit_values_view = cache["bit_values_view"]
+    base_ids = cache["base_ids"]
     idx_lut_branch = cache["idx_lut"][branch_idx]
 
     n_items = int(y_branch.shape[0])
@@ -296,14 +395,14 @@ def _branch_factorized_map(
     else:
         gamma_eff = gamma_flat.view(n_items, 1, codesz)
 
-    a = gamma_eff * y_branch.view(n_items, 1, codesz) * base_abs.view(1, n_bases, codesz)
+    a = gamma_eff * y_branch.view(n_items, 1, codesz) * base_abs_view
     if gamma_flat.shape[1] == 1:
         y_norm = y_branch.square().sum(dim=-1, keepdim=True)
-        const = -0.5 * gamma_flat[:, :1] * (y_norm + base_sqnorm.view(1, n_bases))
+        const = -0.5 * gamma_flat[:, :1] * (y_norm + base_sqnorm_view)
     else:
-        gamma_vec = gamma_flat.to(dtype=torch.float32)
+        gamma_vec = gamma_flat
         y_norm = (gamma_vec * y_branch.square()).sum(dim=-1, keepdim=True)
-        base_norm = gamma_vec.matmul(cache["base_abs_sq"].to(dtype=torch.float32).T)
+        base_norm = gamma_vec.matmul(base_abs_sq_t)
         const = -0.5 * (y_norm + base_norm)
 
     abs_a = a.abs()
@@ -313,14 +412,13 @@ def _branch_factorized_map(
     min_pos = abs_a.argmin(dim=-1)
     min_abs = abs_a.gather(-1, min_pos.unsqueeze(-1)).squeeze(-1)
     mismatch = best_parity != base_parity.view(1, n_bases)
-    best_sign_id = (best_sign_bits.to(dtype=torch.long) * bit_values.view(1, 1, codesz)).sum(dim=-1)
+    best_sign_id = (best_sign_bits.to(dtype=torch.long) * bit_values_view).sum(dim=-1)
     min_bit = bit_values[min_pos]
     best_sign_id = torch.where(mismatch, torch.bitwise_xor(best_sign_id, min_bit), best_sign_id)
     best_linear = sum_abs - 2.0 * mismatch.to(dtype=dtype) * min_abs
     best_logscore = const + best_linear
 
-    base_ids = torch.arange(n_bases, device=device, dtype=torch.long).view(1, n_bases).expand(n_items, -1)
-    map_idx = idx_lut_branch[base_ids, best_sign_id]
+    map_idx = idx_lut_branch[base_ids.expand(n_items, -1), best_sign_id]
     if not torch.all(map_idx >= 0):
         raise RuntimeError("failed to map factorized E8P12 MAP sign patterns back to full codebook indices.")
 
@@ -348,7 +446,7 @@ def _branch_factorized_map(
         #     bit; the second-best flips the second-smallest |a_i| bit.
         #   - if s0 parity already matches, the second-best valid sign flips the two smallest
         #     |a_i| bits (to keep parity).
-        orig_sign_id = (best_sign_bits.to(dtype=torch.long) * bit_values.view(1, 1, codesz)).sum(dim=-1)
+        orig_sign_id = (best_sign_bits.to(dtype=torch.long) * bit_values_view).sum(dim=-1)
         min_bit = bit_values[min_pos]
         second_bit = bit_values[second_pos]
         flip2 = torch.bitwise_xor(min_bit, second_bit)
@@ -783,6 +881,7 @@ def vamp_vector_discrete_mmse_e8p12(
     prior_scale_blocks: Optional[torch.Tensor] = None,
     prior_tau: float = 0.0,
     prior_tau_scale_mode: str = "absmax",
+    compile_prior: bool = True,
     return_logZ_blocks: bool = False,
     return_margin_blocks: bool = False,
     return_entropy_blocks: bool = False,
@@ -825,6 +924,7 @@ def vamp_vector_discrete_mmse_e8p12(
     cache = get_e8p12_factor_cache(cb, device=r1_blocks.device)
     branch_offsets = cache["branch_offsets"]
     base_abs_sq = cache["base_abs_sq"]
+    use_compiled_prior = bool(compile_prior) and r1_blocks.is_cuda
 
     x1_blocks = torch.empty_like(r1_blocks)
     var1 = torch.empty(batch, n_blocks, dtype=torch.float32, device=r1_blocks.device)
@@ -877,6 +977,7 @@ def vamp_vector_discrete_mmse_e8p12(
                     branch_idx=int(branch_idx),
                     cache=cache,
                     need_stats=need_stats,
+                    use_compiled=use_compiled_prior,
                 )
             )
 
