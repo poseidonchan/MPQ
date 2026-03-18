@@ -20,7 +20,7 @@ from ..solver import (
 @dataclass(frozen=True)
 class GPTQAdapterConfig:
     hessian_scale: float = 0.5  # GPTQModel upstream stores H = 2/m X^T X; divide by 2 to match X^T X / m.
-    block_rows: int = 32
+    block_rows: int = 128
     jitter_base: float = 1e-6
     eigen_floor_scale: float = 1e-6
     rotation_seed: int = 0
@@ -96,41 +96,41 @@ def _resolve_block_rows(rows: int, cols: int, maxq: int, requested: int, device:
 
 @torch.inference_mode()
 def _uniform_vamp_cfg_from_qcfg(qcfg: Any) -> UniformVampConfig:
-    mpgq_cfg = getattr(qcfg, "mpgq", None)
+    mpq_cfg = getattr(qcfg, "mpq", None)
     return UniformVampConfig(
-        iters=int(getattr(mpgq_cfg, "iters", 10)),
-        damping=float(getattr(mpgq_cfg, "damping", 0.5)),
-        final_decision=str(getattr(mpgq_cfg, "final_decision", "map") or "map"),
+        iters=int(getattr(mpq_cfg, "iters", 10)),
+        damping=float(getattr(mpq_cfg, "damping", 0.5)),
+        final_decision=str(getattr(mpq_cfg, "final_decision", "map") or "map"),
         init_from="rtn",
-        gamma_start=float(getattr(mpgq_cfg, "gamma_start", 1.0)),
-        gamma_retry_factor=float(getattr(mpgq_cfg, "gamma_retry_factor", 4.0)),
-        gamma_retry_steps=int(getattr(mpgq_cfg, "gamma_retry_steps", 3)),
-        prior_tau=float(getattr(mpgq_cfg, "prior_tau", 0.2)),
-        obs_precision=float(getattr(mpgq_cfg, "obs_precision", 0.0)),
-        em_obs_precision=bool(getattr(mpgq_cfg, "em_obs_precision", True)),
-        em_obs_precision_damping=float(getattr(mpgq_cfg, "em_obs_precision_damping", 0.3)),
-        em_obs_precision_min=float(getattr(mpgq_cfg, "em_obs_precision_min", 1e-4)),
-        em_obs_precision_max=float(getattr(mpgq_cfg, "em_obs_precision_max", 1e8)),
-        polish_sweeps=int(getattr(mpgq_cfg, "polish_sweeps", 3)),
-        polish_mode=str(getattr(mpgq_cfg, "polish_mode", "block_cd") or "block_cd"),
-        topk_k=int(getattr(mpgq_cfg, "topk_k", 8) or 8),
+        gamma_start=float(getattr(mpq_cfg, "gamma_start", 1.0)),
+        gamma_retry_factor=float(getattr(mpq_cfg, "gamma_retry_factor", 4.0)),
+        gamma_retry_steps=int(getattr(mpq_cfg, "gamma_retry_steps", 3)),
+        prior_tau=float(getattr(mpq_cfg, "prior_tau", 0.2)),
+        obs_precision=float(getattr(mpq_cfg, "obs_precision", 0.0)),
+        em_obs_precision=bool(getattr(mpq_cfg, "em_obs_precision", True)),
+        em_obs_precision_damping=float(getattr(mpq_cfg, "em_obs_precision_damping", 0.3)),
+        em_obs_precision_min=float(getattr(mpq_cfg, "em_obs_precision_min", 1e-4)),
+        em_obs_precision_max=float(getattr(mpq_cfg, "em_obs_precision_max", 1e8)),
+        polish_sweeps=int(getattr(mpq_cfg, "polish_sweeps", 3)),
+        polish_mode=str(getattr(mpq_cfg, "polish_mode", "block_cd") or "block_cd"),
+        topk_k=int(getattr(mpq_cfg, "topk_k", 8) or 8),
     )
 
 
 @torch.inference_mode()
 def _adapter_cfg_from_qcfg(qcfg: Any) -> GPTQAdapterConfig:
-    mpgq_cfg = getattr(qcfg, "mpgq", None)
+    mpq_cfg = getattr(qcfg, "mpq", None)
     return GPTQAdapterConfig(
-        hessian_scale=float(getattr(mpgq_cfg, "hessian_scale", 0.5)),
-        block_rows=int(getattr(mpgq_cfg, "block_rows", 32)),
-        jitter_base=float(getattr(mpgq_cfg, "eigen_jitter", 1e-6)),
-        eigen_floor_scale=float(getattr(mpgq_cfg, "eigen_floor_scale", 1e-6)),
-        rotation_seed=int(getattr(mpgq_cfg, "rotation_seed", 0)),
+        hessian_scale=float(getattr(mpq_cfg, "hessian_scale", 0.5)),
+        block_rows=int(getattr(mpq_cfg, "block_rows", 32)),
+        jitter_base=float(getattr(mpq_cfg, "eigen_jitter", 1e-6)),
+        eigen_floor_scale=float(getattr(mpq_cfg, "eigen_floor_scale", 1e-6)),
+        rotation_seed=int(getattr(mpq_cfg, "rotation_seed", 0)),
     )
 
 
 @torch.inference_mode()
-def run_mpgq_quantization(
+def run_mpq_quantization(
     *,
     W: torch.Tensor,
     H: torch.Tensor,
@@ -148,7 +148,7 @@ def run_mpgq_quantization(
     float,
     Dict[str, Any],
 ]:
-    """Run MPGQ on a GPTQModel layer given weights and accumulated Hessian.
+    """Run MPQ on a GPTQModel layer given weights and accumulated Hessian.
 
     Returns:
       Q: (rows, cols) dense float32 weights (research path)
@@ -173,10 +173,10 @@ def run_mpgq_quantization(
 
     rotation = str(getattr(qcfg, "rotation", None) or "none").strip().lower()
     if rotation not in ("none", "hadamard", "random", ""):
-        raise ValueError(f"mpgq only supports rotation in {{none, hadamard, random}}; got rotation={rotation!r}.")
+        raise ValueError(f"mpq only supports rotation in {{none, hadamard, random}}; got rotation={rotation!r}.")
     use_hadamard = rotation == "hadamard"
     if bool(getattr(qcfg, "desc_act", False)):
-        raise ValueError("mpgq exact-full path does not support desc_act=True.")
+        raise ValueError("mpq exact-full path does not support desc_act=True.")
 
     H_work = float(adapter_cfg.hessian_scale) * H
     eigenvalues, V, eigen_floor = _vamp_hessian_eigen(
@@ -300,9 +300,9 @@ def run_mpgq_quantization(
         g_idx_out = g_idx
 
     stats: Dict[str, Any] = {
-        "method": "mpgq",
-        "solver": str(getattr(getattr(qcfg, "mpgq", None), "solver", "vamp") or "vamp"),
-        "polish_mode": str(getattr(getattr(qcfg, "mpgq", None), "polish_mode", getattr(vamp_cfg, "polish_mode", "block_cd"))),
+        "method": "mpq",
+        "solver": str(getattr(getattr(qcfg, "mpq", None), "solver", "vamp") or "vamp"),
+        "polish_mode": str(getattr(getattr(qcfg, "mpq", None), "polish_mode", getattr(vamp_cfg, "polish_mode", "block_cd"))),
         "module": str(module_name),
         "bits": int(bits),
         "group_size": int(group_size),
@@ -379,9 +379,9 @@ def postprocess_gptq_quantization(
     Vs = V * S.unsqueeze(0)
     Y_u = W.matmul(Vs)
 
-    mpgq_cfg = getattr(qcfg, "mpgq", None)
-    polish_mode = str(getattr(mpgq_cfg, "polish_mode", "none") or "none").strip().lower()
-    polish_sweeps = int(getattr(mpgq_cfg, "polish_sweeps", 0))
+    mpq_cfg = getattr(qcfg, "mpq", None)
+    polish_mode = str(getattr(mpq_cfg, "polish_mode", "none") or "none").strip().lower()
+    polish_sweeps = int(getattr(mpq_cfg, "polish_sweeps", 0))
     vamp_cfg = _uniform_vamp_cfg_from_qcfg(qcfg)
 
     err_before = vamp_rankspace_error(Y_u=Y_u, x=Q_init, Vs=Vs)
@@ -454,7 +454,7 @@ def postprocess_gptq_quantization(
         q_final = q_init
 
     stats: Dict[str, Any] = {
-        "method": "mpgq",
+        "method": "mpq",
         "solver": "gptq",
         "polish_mode": str(polish_mode),
         "module": str(module_name),
@@ -466,7 +466,7 @@ def postprocess_gptq_quantization(
         "eigen_floor": float(eigen_floor),
         "block_rows": int(block_rows),
         "polish_sweeps": int(polish_sweeps),
-        "topk_k": int(getattr(mpgq_cfg, "topk_k", 8) or 8),
+        "topk_k": int(getattr(mpq_cfg, "topk_k", 8) or 8),
         "rankspace_error_mean_before": float(err_before.mean().item()) if err_before.numel() else 0.0,
         "rankspace_error_mean_after": float(err_after.mean().item()) if err_after.numel() else 0.0,
         "polish_gain": float((err_before - err_after).mean().item()) if err_after.numel() else 0.0,

@@ -16,7 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from mpgq.combo import QuantCombo, make_combo
+from mpq.combo import QuantCombo, make_combo
 
 
 def _git_head(path: Path) -> str:
@@ -153,24 +153,24 @@ def main() -> None:
     parser.add_argument("--eval-seqlen", type=int, default=2048)
     parser.add_argument("--eval-max-eval-tokens", type=int, default=131072)
 
-    parser.add_argument("--mpgq-iters", type=int, default=10)
-    parser.add_argument("--mpgq-block-rows", type=int, default=32)
-    parser.add_argument("--mpgq-rotation-seed", type=int, default=0)
-    parser.add_argument("--mpgq-gamma-start", type=float, default=1.0)
-    parser.add_argument("--mpgq-gamma-retry-factor", type=float, default=4.0)
-    parser.add_argument("--mpgq-gamma-retry-steps", type=int, default=3)
-    parser.add_argument("--mpgq-obs-precision", type=float, default=0.0)
-    parser.add_argument("--mpgq-init", type=str, default="random", choices=["random", "rtn", "ldlq"])
-    parser.add_argument("--mpgq-method", type=str, default="vamp")
-    parser.add_argument("--mpgq-prior-tau-scale-mode", type=str, default="absmax")
-    parser.add_argument("--mpgq-blocks-per-chunk", type=int, default=16)
-    parser.add_argument("--mpgq-polish-metric", type=str, default="gram")
-    parser.add_argument("--mpgq-polish-max-blocks", type=int, default=0)
-    parser.add_argument("--mpgq-metric-rows-per-chunk", type=int, default=0)
+    parser.add_argument("--mpq-iters", type=int, default=10)
+    parser.add_argument("--mpq-block-rows", type=int, default=128)
+    parser.add_argument("--mpq-rotation-seed", type=int, default=0)
+    parser.add_argument("--mpq-gamma-start", type=float, default=1.0)
+    parser.add_argument("--mpq-gamma-retry-factor", type=float, default=4.0)
+    parser.add_argument("--mpq-gamma-retry-steps", type=int, default=3)
+    parser.add_argument("--mpq-obs-precision", type=float, default=0.0)
+    parser.add_argument("--mpq-init", type=str, default="random", choices=["random", "rtn", "ldlq"])
+    parser.add_argument("--mpq-method", type=str, default="vamp")
+    parser.add_argument("--mpq-prior-tau-scale-mode", type=str, default="absmax")
+    parser.add_argument("--mpq-blocks-per-chunk", type=int, default=16)
+    parser.add_argument("--mpq-polish-metric", type=str, default="gram")
+    parser.add_argument("--mpq-polish-max-blocks", type=int, default=0)
+    parser.add_argument("--mpq-metric-rows-per-chunk", type=int, default=0)
 
     parser.add_argument("--env", type=str, default=None)
-    parser.add_argument("--gptq-env", type=str, default="mpgq-gptq")
-    parser.add_argument("--quip-env", type=str, default="mpgq-quip")
+    parser.add_argument("--gptq-env", type=str, default="mpq-gptq")
+    parser.add_argument("--quip-env", type=str, default="mpq-quip")
     parser.add_argument("--runs-dir", type=str, default="runs")
     parser.add_argument("--run-id", type=str, default=None)
     parser.add_argument("--dry-run", action="store_true")
@@ -262,40 +262,40 @@ def main() -> None:
                     str(int(args.eval_seqlen)),
                     "--eval-max-eval-tokens",
                     str(int(args.eval_max_eval_tokens)),
-                    "--mpgq-init",
-                    str(args.mpgq_init),
-                    "--mpgq-method",
-                    str(args.mpgq_method),
-                    "--mpgq-iters",
-                    str(int(args.mpgq_iters)),
-                    "--mpgq-damping",
+                    "--mpq-init",
+                    str(args.mpq_init),
+                    "--mpq-method",
+                    str(args.mpq_method),
+                    "--mpq-iters",
+                    str(int(args.mpq_iters)),
+                    "--mpq-damping",
                     str(float(spec.damping)),
-                    "--mpgq-prior-tau",
+                    "--mpq-prior-tau",
                     str(float(spec.prior_tau)),
-                    "--mpgq-prior-tau-scale-mode",
-                    str(args.mpgq_prior_tau_scale_mode),
-                    "--mpgq-gamma-start",
-                    str(float(args.mpgq_gamma_start)),
-                    "--mpgq-gamma-retry-factor",
-                    str(float(args.mpgq_gamma_retry_factor)),
-                    "--mpgq-gamma-retry-steps",
-                    str(int(args.mpgq_gamma_retry_steps)),
-                    "--mpgq-obs-precision",
-                    str(float(args.mpgq_obs_precision)),
-                    "--mpgq-em-obs-precision" if bool(spec.em_obs_precision) else "--no-mpgq-em-obs-precision",
-                    "--mpgq-blocks-per-chunk",
-                    str(int(args.mpgq_blocks_per_chunk)),
-                    "--mpgq-block-rows",
-                    str(int(args.mpgq_block_rows)),
-                    "--mpgq-polish-sweeps",
+                    "--mpq-prior-tau-scale-mode",
+                    str(args.mpq_prior_tau_scale_mode),
+                    "--mpq-gamma-start",
+                    str(float(args.mpq_gamma_start)),
+                    "--mpq-gamma-retry-factor",
+                    str(float(args.mpq_gamma_retry_factor)),
+                    "--mpq-gamma-retry-steps",
+                    str(int(args.mpq_gamma_retry_steps)),
+                    "--mpq-obs-precision",
+                    str(float(args.mpq_obs_precision)),
+                    "--mpq-em-obs-precision" if bool(spec.em_obs_precision) else "--no-mpq-em-obs-precision",
+                    "--mpq-blocks-per-chunk",
+                    str(int(args.mpq_blocks_per_chunk)),
+                    "--mpq-block-rows",
+                    str(int(args.mpq_block_rows)),
+                    "--mpq-polish-sweeps",
                     str(int(spec.polish_sweeps)),
-                    "--mpgq-polish-metric",
-                    str(args.mpgq_polish_metric),
-                    "--mpgq-polish-max-blocks",
-                    str(int(args.mpgq_polish_max_blocks)),
-                    "--mpgq-metric-rows-per-chunk",
-                    str(int(args.mpgq_metric_rows_per_chunk)),
-                    "--mpgq-topk-k",
+                    "--mpq-polish-metric",
+                    str(args.mpq_polish_metric),
+                    "--mpq-polish-max-blocks",
+                    str(int(args.mpq_polish_max_blocks)),
+                    "--mpq-metric-rows-per-chunk",
+                    str(int(args.mpq_metric_rows_per_chunk)),
+                    "--mpq-topk-k",
                     str(int(args.quant_topk_k)),
                     "--output-dir",
                     str(out_dir),
@@ -347,27 +347,27 @@ def main() -> None:
                     str(int(args.eval_seqlen)),
                     "--eval-max-eval-tokens",
                     str(int(args.eval_max_eval_tokens)),
-                    "--mpgq-iters",
-                    str(int(args.mpgq_iters)),
-                    "--mpgq-damping",
+                    "--mpq-iters",
+                    str(int(args.mpq_iters)),
+                    "--mpq-damping",
                     str(float(spec.damping)),
-                    "--mpgq-prior-tau",
+                    "--mpq-prior-tau",
                     str(float(spec.prior_tau)),
-                    "--mpgq-polish-sweeps",
+                    "--mpq-polish-sweeps",
                     str(int(spec.polish_sweeps)),
-                    "--mpgq-em-obs-precision" if bool(spec.em_obs_precision) else "--no-mpgq-em-obs-precision",
-                    "--mpgq-block-rows",
-                    str(int(args.mpgq_block_rows)),
-                    "--mpgq-rotation-seed",
-                    str(int(args.mpgq_rotation_seed)),
-                    "--mpgq-gamma-start",
-                    str(float(args.mpgq_gamma_start)),
-                    "--mpgq-gamma-retry-factor",
-                    str(float(args.mpgq_gamma_retry_factor)),
-                    "--mpgq-gamma-retry-steps",
-                    str(int(args.mpgq_gamma_retry_steps)),
-                    "--mpgq-obs-precision",
-                    str(float(args.mpgq_obs_precision)),
+                    "--mpq-em-obs-precision" if bool(spec.em_obs_precision) else "--no-mpq-em-obs-precision",
+                    "--mpq-block-rows",
+                    str(int(args.mpq_block_rows)),
+                    "--mpq-rotation-seed",
+                    str(int(args.mpq_rotation_seed)),
+                    "--mpq-gamma-start",
+                    str(float(args.mpq_gamma_start)),
+                    "--mpq-gamma-retry-factor",
+                    str(float(args.mpq_gamma_retry_factor)),
+                    "--mpq-gamma-retry-steps",
+                    str(int(args.mpq_gamma_retry_steps)),
+                    "--mpq-obs-precision",
+                    str(float(args.mpq_obs_precision)),
                     "--output-dir",
                     str(out_dir),
                     "--json-out",

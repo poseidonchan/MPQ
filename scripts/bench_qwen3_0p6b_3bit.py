@@ -17,8 +17,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 class Job:
     label: str
     method: str
-    mpgq_iters: int = 10
-    mpgq_polish_sweeps: int = 0
+    mpq_iters: int = 10
+    mpq_polish_sweeps: int = 0
 
 
 def _timestamp_id() -> str:
@@ -60,11 +60,11 @@ def main() -> None:
     parser.add_argument("--eval-seqlen", type=int, default=2048)
     parser.add_argument("--eval-max-eval-tokens", type=int, default=131072)
 
-    parser.add_argument("--mpgq-damping", type=float, default=0.5)
-    parser.add_argument("--mpgq-prior-tau", type=float, default=0.2)
-    parser.add_argument("--mpgq-em-obs-precision", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--mpgq-block-rows", type=int, default=32)
-    parser.add_argument("--mpgq-rotation-seed", type=int, default=0)
+    parser.add_argument("--mpq-damping", type=float, default=0.5)
+    parser.add_argument("--mpq-prior-tau", type=float, default=0.2)
+    parser.add_argument("--mpq-em-obs-precision", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--mpq-block-rows", type=int, default=128)
+    parser.add_argument("--mpq-rotation-seed", type=int, default=0)
 
     parser.add_argument("--awq-batch-size", type=int, default=1)
     parser.add_argument("--force", action="store_true", help="Re-run even if backend_results.json exists.")
@@ -77,11 +77,11 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
 
     jobs = [
-        Job(label="mpgq_vamp10", method="mpgq", mpgq_iters=10, mpgq_polish_sweeps=0),
-        Job(label="mpgq_vamp10_polish3", method="mpgq", mpgq_iters=10, mpgq_polish_sweeps=3),
-        Job(label="awq_mpgq_vamp10", method="awq+mpgq", mpgq_iters=10, mpgq_polish_sweeps=0),
-        Job(label="awq_mpgq_vamp10_polish3", method="awq+mpgq", mpgq_iters=10, mpgq_polish_sweeps=3),
-        Job(label="gptq_strong_rht_descact", method="gptq-strong", mpgq_iters=0, mpgq_polish_sweeps=0),
+        Job(label="mpq_vamp10", method="mpq", mpq_iters=10, mpq_polish_sweeps=0),
+        Job(label="mpq_vamp10_polish3", method="mpq", mpq_iters=10, mpq_polish_sweeps=3),
+        Job(label="awq_mpq_vamp10", method="awq+mpq", mpq_iters=10, mpq_polish_sweeps=0),
+        Job(label="awq_mpq_vamp10_polish3", method="awq+mpq", mpq_iters=10, mpq_polish_sweeps=3),
+        Job(label="gptq_strong_rht_descact", method="gptq-strong", mpq_iters=0, mpq_polish_sweeps=0),
     ]
 
     results: List[Dict[str, Any]] = []
@@ -132,19 +132,19 @@ def main() -> None:
             str(int(args.eval_max_eval_tokens)),
             "--awq-batch-size",
             str(int(args.awq_batch_size)),
-            "--mpgq-iters",
-            str(int(job.mpgq_iters)),
-            "--mpgq-damping",
-            str(float(args.mpgq_damping)),
-            "--mpgq-prior-tau",
-            str(float(args.mpgq_prior_tau)),
-            "--mpgq-polish-sweeps",
-            str(int(job.mpgq_polish_sweeps)),
-            "--mpgq-em-obs-precision" if bool(args.mpgq_em_obs_precision) else "--no-mpgq-em-obs-precision",
-            "--mpgq-block-rows",
-            str(int(args.mpgq_block_rows)),
-            "--mpgq-rotation-seed",
-            str(int(args.mpgq_rotation_seed)),
+            "--mpq-iters",
+            str(int(job.mpq_iters)),
+            "--mpq-damping",
+            str(float(args.mpq_damping)),
+            "--mpq-prior-tau",
+            str(float(args.mpq_prior_tau)),
+            "--mpq-polish-sweeps",
+            str(int(job.mpq_polish_sweeps)),
+            "--mpq-em-obs-precision" if bool(args.mpq_em_obs_precision) else "--no-mpq-em-obs-precision",
+            "--mpq-block-rows",
+            str(int(args.mpq_block_rows)),
+            "--mpq-rotation-seed",
+            str(int(args.mpq_rotation_seed)),
             "--output-dir",
             str(run_dir),
             "--json-out",

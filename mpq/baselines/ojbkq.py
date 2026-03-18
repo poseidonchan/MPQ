@@ -15,7 +15,7 @@ _ALPHA_EPS = 1e-8
 class OJBKQConfig:
     """OJBKQ discrete solver baseline (ported from our GPTQModel fork).
 
-    This is not part of the MPGQ solver; it is a baseline discrete solver that can be used
+    This is not part of the MPQ solver; it is a baseline discrete solver that can be used
     as a GPTQ solver-swap using the Cholesky factor of H^{-1}.
     """
 

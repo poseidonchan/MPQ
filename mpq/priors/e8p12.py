@@ -83,7 +83,7 @@ def resolve_factorized_blocks_per_chunk(batch_rows: int, n_blocks: int, requeste
 @torch.inference_mode()
 def get_e8p12_factor_cache(cb: object, *, device: Optional[torch.device] = None) -> Dict[str, torch.Tensor]:
     target_device = cb.grid.device if device is None else device
-    cache = getattr(cb, "_mpgq_factor_cache", None)
+    cache = getattr(cb, "_mpq_factor_cache", None)
     if cache is not None and cache.get("device") == target_device:
         return cache
 
@@ -151,7 +151,7 @@ def get_e8p12_factor_cache(cb: object, *, device: Optional[torch.device] = None)
         "bit_values_view": bit_values.view(1, 1, codesz),
         "branch_offsets": branch_offsets,
     }
-    setattr(cb, "_mpgq_factor_cache", cache)
+    setattr(cb, "_mpq_factor_cache", cache)
     return cache
 
 
@@ -254,12 +254,14 @@ def _branch_factorized_stats_impl(
         suffix = suffix * t_coord
     sign_mean = torch.nan_to_num(sign_mean, nan=0.0, posinf=0.0, neginf=0.0)
 
+    offset_f = float(offset)
+    offset_sq = offset_f * offset_f
     mu_core = sign_mean * base_abs_view
-    mu_component = mu_core + float(offset)
+    mu_component = mu_core + offset_f
     second_component = (
         base_sqnorm_view
-        + codesz * (float(offset) ** 2)
-        + 2.0 * float(offset) * mu_core.sum(dim=-1)
+        + codesz * offset_sq
+        + 2.0 * offset_f * mu_core.sum(dim=-1)
     )
     log_component = const + logZ_sign
 

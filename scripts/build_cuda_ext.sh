@@ -5,7 +5,7 @@ set -euo pipefail
 # - QUIP#: quiptools_cuda (required for fast decode/decompress)
 # - fast-hadamard-transform (optional)
 
-ENV_NAME="${ENV_NAME:-mpgq-quip}"
+ENV_NAME="${ENV_NAME:-mpq-quip}"
 
 if ! command -v conda >/dev/null 2>&1; then
   echo "conda not found" >&2

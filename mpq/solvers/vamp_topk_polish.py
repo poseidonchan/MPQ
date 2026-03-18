@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
-from mpgq.solver import E8P12VampConfig, solve_e8p12_rankspace_vamp
+from mpq.solver import E8P12VampConfig, solve_e8p12_rankspace_vamp
 
 
 @torch.inference_mode()

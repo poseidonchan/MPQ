@@ -31,4 +31,4 @@ This is the intended public matrix for benchmark and ablation runs.
 - `topk_block_cd` always uses `topk_source=aux_vamp`.
 - `solver=ldlq_tune10` is only valid with `polish_mode=none`.
 - `preprocess=awq` is only valid on `backend=gptqmodel`.
-- The benchmark and ablation CLIs validate these combinations through `mpgq/combo.py`.
+- The benchmark and ablation CLIs validate these combinations through `mpq/combo.py`.

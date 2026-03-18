@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mpgq"
+name = "mpq"
 version = "0.1.0"
-description = "MPGQ unified solver for GPTQModel and QUIP#"
+description = "MPQ unified solver for GPTQModel and QUIP#"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -16,4 +16,4 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["mpgq*", "lrs_vasp_ptq*"]
+include = ["mpq*"]

@@ -22,14 +22,14 @@ index e9b342a5..91f26b29 100644
  
          # cleanup all memory or states vars persistently added by this processor
          module.stream_sync()
-+        mpgq_cfg = getattr(self.qcfg, "mpgq", None)
++        mpq_cfg = getattr(self.qcfg, "mpq", None)
 +        if (
-+            mpgq_cfg is not None
-+            and bool(getattr(mpgq_cfg, "enabled", False))
-+            and str(getattr(mpgq_cfg, "solver", "")) == "vamp"
++            mpq_cfg is not None
++            and bool(getattr(mpq_cfg, "enabled", False))
++            and str(getattr(mpq_cfg, "solver", "")) == "vamp"
 +            and str(getattr(self.qcfg, "rotation", None)) == "hadamard"
 +        ):
-+            # MPGQ exact-full path with internal Hadamard is a dense research path; skip packing/export.
++            # MPQ exact-full path with internal Hadamard is a dense research path; skip packing/export.
 +            with (self.lock):
 +                if self.calculate_w_wq_diff:
 +                    module.weight.data = module.state.pop("wq").to(CPU)
@@ -74,14 +74,14 @@ index 7d16f5ae..6d3b4eb8 100644
 -            rotation_device = self.quantize_config.device if self.quantize_config.device != DEVICE.MPS else DEVICE.CPU
 -            self.model, _ = rotate_model(model=self.model, rotate_mode=self.quantize_config.rotation,
 -                                            device=rotation_device, **module_name_args)
-+            mpgq_cfg = getattr(self.quantize_config, "mpgq", None)
++            mpq_cfg = getattr(self.quantize_config, "mpq", None)
 +            if (
-+                mpgq_cfg is not None
-+                and bool(getattr(mpgq_cfg, "enabled", False))
-+                and str(getattr(mpgq_cfg, "solver", "")) == "vamp"
++                mpq_cfg is not None
++                and bool(getattr(mpq_cfg, "enabled", False))
++                and str(getattr(mpq_cfg, "solver", "")) == "vamp"
 +                and str(self.quantize_config.rotation) == "hadamard"
 +            ):
-+                log.info("MPGQ `rotation=hadamard`: using internal right-side Hadamard; skipping model rotation.")
++                log.info("MPQ `rotation=hadamard`: using internal right-side Hadamard; skipping model rotation.")
 +            else:
 +                from gptqmodel.models.definitions.llama import LlamaQModel
 +                from gptqmodel.models.definitions.qwen2 import Qwen2QModel
@@ -161,8 +161,8 @@ index 97998f41..93268c75 100644
  
  
 +@dataclass
-+class MPGQConfig:
-+    """MPGQ exact-full VAMP + greedy polish (research path).
++class MPQConfig:
++    """MPQ exact-full VAMP + greedy polish (research path).
 +
 +    This is a dense quantization path that can optionally use an internal right-side
 +    Hadamard rotation for preconditioning. When that internal rotation is enabled
@@ -212,8 +212,8 @@ index 97998f41..93268c75 100644
      # Hessian accumulation controls (GPTQ only)
      hessian: Optional[HessianConfig] = field(default_factory=HessianConfig)
  
-+    # MPGQ exact-full solver config (research-only dense path)
-+    mpgq: MPGQConfig = field(default_factory=MPGQConfig)
++    # MPQ exact-full solver config (research-only dense path)
++    mpq: MPQConfig = field(default_factory=MPQConfig)
 +
      # Callback function to filter devices for compute-intensive stages (quantization and forwarding)
      # Takes a list of devices and returns either the original list or a filtered subset
@@ -226,42 +226,42 @@ index ae0921aa..b8185211 100644
              W = self.module_copy.to(device=self.H.device)
              del self.module_copy
  
-+        mpgq_cfg = getattr(self.qcfg, "mpgq", None)
++        mpq_cfg = getattr(self.qcfg, "mpq", None)
 +        if (
-+            mpgq_cfg is not None
-+            and bool(getattr(mpgq_cfg, "enabled", False))
-+            and str(getattr(mpgq_cfg, "solver", "vamp")) == "vamp"
++            mpq_cfg is not None
++            and bool(getattr(mpq_cfg, "enabled", False))
++            and str(getattr(mpq_cfg, "solver", "vamp")) == "vamp"
 +        ):
-+            from mpgq.adapters.gptqmodel import GPTQAdapterConfig, run_mpgq_quantization
-+            from mpgq.solver import UniformVampConfig
++            from mpq.adapters.gptqmodel import GPTQAdapterConfig, run_mpq_quantization
++            from mpq.solver import UniformVampConfig
 +
 +            vamp_cfg = UniformVampConfig(
-+                iters=int(getattr(mpgq_cfg, "iters", 10)),
-+                damping=float(getattr(mpgq_cfg, "damping", 0.5)),
-+                final_decision=str(getattr(mpgq_cfg, "final_decision", "map") or "map"),
++                iters=int(getattr(mpq_cfg, "iters", 10)),
++                damping=float(getattr(mpq_cfg, "damping", 0.5)),
++                final_decision=str(getattr(mpq_cfg, "final_decision", "map") or "map"),
 +                init_from="rtn",
-+                gamma_start=float(getattr(mpgq_cfg, "gamma_start", 1.0)),
-+                gamma_retry_factor=float(getattr(mpgq_cfg, "gamma_retry_factor", 4.0)),
-+                gamma_retry_steps=int(getattr(mpgq_cfg, "gamma_retry_steps", 3)),
-+                prior_tau=float(getattr(mpgq_cfg, "prior_tau", 0.2)),
-+                obs_precision=float(getattr(mpgq_cfg, "obs_precision", 0.0)),
-+                em_obs_precision=bool(getattr(mpgq_cfg, "em_obs_precision", True)),
-+                em_obs_precision_damping=float(getattr(mpgq_cfg, "em_obs_precision_damping", 0.3)),
-+                em_obs_precision_min=float(getattr(mpgq_cfg, "em_obs_precision_min", 1e-4)),
-+                em_obs_precision_max=float(getattr(mpgq_cfg, "em_obs_precision_max", 1e8)),
-+                polish_sweeps=int(getattr(mpgq_cfg, "polish_sweeps", 3)),
-+                polish_mode=str(getattr(mpgq_cfg, "polish_mode", "block_cd") or "block_cd"),
-+                topk_k=int(getattr(mpgq_cfg, "topk_k", 8) or 8),
++                gamma_start=float(getattr(mpq_cfg, "gamma_start", 1.0)),
++                gamma_retry_factor=float(getattr(mpq_cfg, "gamma_retry_factor", 4.0)),
++                gamma_retry_steps=int(getattr(mpq_cfg, "gamma_retry_steps", 3)),
++                prior_tau=float(getattr(mpq_cfg, "prior_tau", 0.2)),
++                obs_precision=float(getattr(mpq_cfg, "obs_precision", 0.0)),
++                em_obs_precision=bool(getattr(mpq_cfg, "em_obs_precision", True)),
++                em_obs_precision_damping=float(getattr(mpq_cfg, "em_obs_precision_damping", 0.3)),
++                em_obs_precision_min=float(getattr(mpq_cfg, "em_obs_precision_min", 1e-4)),
++                em_obs_precision_max=float(getattr(mpq_cfg, "em_obs_precision_max", 1e8)),
++                polish_sweeps=int(getattr(mpq_cfg, "polish_sweeps", 3)),
++                polish_mode=str(getattr(mpq_cfg, "polish_mode", "block_cd") or "block_cd"),
++                topk_k=int(getattr(mpq_cfg, "topk_k", 8) or 8),
 +            )
 +            adapter_cfg = GPTQAdapterConfig(
-+                hessian_scale=float(getattr(mpgq_cfg, "hessian_scale", 0.5)),
-+                block_rows=int(getattr(mpgq_cfg, "block_rows", 32)),
-+                jitter_base=float(getattr(mpgq_cfg, "eigen_jitter", 1e-6)),
-+                eigen_floor_scale=float(getattr(mpgq_cfg, "eigen_floor_scale", 1e-6)),
-+                rotation_seed=int(getattr(mpgq_cfg, "rotation_seed", 0)),
++                hessian_scale=float(getattr(mpq_cfg, "hessian_scale", 0.5)),
++                block_rows=int(getattr(mpq_cfg, "block_rows", 32)),
++                jitter_base=float(getattr(mpq_cfg, "eigen_jitter", 1e-6)),
++                eigen_floor_scale=float(getattr(mpq_cfg, "eigen_floor_scale", 1e-6)),
++                rotation_seed=int(getattr(mpq_cfg, "rotation_seed", 0)),
 +            )
 +
-+            Q, _q_int, scale, zero, g_idx, duration, _stats = run_mpgq_quantization(
++            Q, _q_int, scale, zero, g_idx, duration, _stats = run_mpq_quantization(
 +                W=W,
 +                H=self.H,
 +                quantizer=self.quantizer,
@@ -311,7 +311,7 @@ index ae0921aa..b8185211 100644
 +                    f"OJBKQ: Module `{self.name}` requires the GPTQ Hessian path and cannot run under failsafe/no-Hessian mode."
 +                )
 +
-+            from mpgq.baselines.ojbkq import run_ojbkq_gptq_quantization
++            from mpq.baselines.ojbkq import run_ojbkq_gptq_quantization
 +
 +            Q_ojbkq, q_int_ojbkq, scale_ojbkq, zero_ojbkq, g_idx_ojbkq, avg_loss_ojbkq, _ojbkq_stats = (
 +                run_ojbkq_gptq_quantization(
@@ -375,19 +375,19 @@ index ae0921aa..b8185211 100644
 +        zero = torch.cat(zero, dim=1)
 +
 +        if (
-+            mpgq_cfg is not None
-+            and bool(getattr(mpgq_cfg, "enabled", False))
-+            and str(getattr(mpgq_cfg, "solver", "")) == "gptq"
-+            and str(getattr(mpgq_cfg, "polish_mode", "none")) != "none"
++            mpq_cfg is not None
++            and bool(getattr(mpq_cfg, "enabled", False))
++            and str(getattr(mpq_cfg, "solver", "")) == "gptq"
++            and str(getattr(mpq_cfg, "polish_mode", "none")) != "none"
 +        ):
-+            from mpgq.adapters.gptqmodel import GPTQAdapterConfig, postprocess_gptq_quantization
++            from mpq.adapters.gptqmodel import GPTQAdapterConfig, postprocess_gptq_quantization
 +
 +            adapter_cfg = GPTQAdapterConfig(
-+                hessian_scale=float(getattr(mpgq_cfg, "hessian_scale", 0.5)),
-+                block_rows=int(getattr(mpgq_cfg, "block_rows", 32)),
-+                jitter_base=float(getattr(mpgq_cfg, "eigen_jitter", 1e-6)),
-+                eigen_floor_scale=float(getattr(mpgq_cfg, "eigen_floor_scale", 1e-6)),
-+                rotation_seed=int(getattr(mpgq_cfg, "rotation_seed", 0)),
++                hessian_scale=float(getattr(mpq_cfg, "hessian_scale", 0.5)),
++                block_rows=int(getattr(mpq_cfg, "block_rows", 32)),
++                jitter_base=float(getattr(mpq_cfg, "eigen_jitter", 1e-6)),
++                eigen_floor_scale=float(getattr(mpq_cfg, "eigen_floor_scale", 1e-6)),
++                rotation_seed=int(getattr(mpq_cfg, "rotation_seed", 0)),
 +            )
 +            Q, _q_int_post, scale, zero, g_idx, _duration_post, _stats_post = postprocess_gptq_quantization(
 +                W=W,

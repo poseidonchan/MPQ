@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -86,22 +87,25 @@ def _parse_layers(layers: Sequence[int] | None, *, num_layers: int) -> List[int]
 class Timing:
     overhead_s: float
     quip_total_s: float
-    mpgq_total_s: float
+    mpq_total_s: float
     quip_quant_s: float
-    mpgq_quant_s: float
+    mpq_quant_s: float
     ratio: float
 
 
-def _estimate_quant_times(overhead_s: float, quip_total_s: float, mpgq_total_s: float) -> Timing:
-    quip_quant_s = max(0.0, float(quip_total_s - overhead_s))
-    mpgq_quant_s = max(0.0, float(mpgq_total_s - overhead_s))
-    ratio = float("inf") if quip_quant_s <= 0 else float(mpgq_quant_s / quip_quant_s)
+def _estimate_quant_times(overhead_s: float, quip_total_s: float, mpq_total_s: float) -> Timing:
+    if not math.isfinite(float(quip_total_s)):
+        quip_quant_s = float("nan")
+    else:
+        quip_quant_s = max(0.0, float(quip_total_s - overhead_s))
+    mpq_quant_s = max(0.0, float(mpq_total_s - overhead_s))
+    ratio = float("nan") if not math.isfinite(quip_quant_s) or quip_quant_s <= 0 else float(mpq_quant_s / quip_quant_s)
     return Timing(
         overhead_s=float(overhead_s),
         quip_total_s=float(quip_total_s),
-        mpgq_total_s=float(mpgq_total_s),
+        mpq_total_s=float(mpq_total_s),
         quip_quant_s=float(quip_quant_s),
-        mpgq_quant_s=float(mpgq_quant_s),
+        mpq_quant_s=float(mpq_quant_s),
         ratio=float(ratio),
     )
 
@@ -113,17 +117,17 @@ def _load_reference_json(path: Path) -> Dict[str, Any]:
     return payload
 
 
-def _collect_mpgq_stats(save_dir: Path, *, layers: Sequence[int]) -> List[Dict[str, Any]]:
+def _collect_mpq_stats(save_dir: Path, *, layers: Sequence[int]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for idx in layers:
         for suffix in ("qkv", "o", "up", "down"):
             path = save_dir / f"{int(idx)}_{suffix}.pt"
             payload = torch.load(path, map_location="cpu")
-            stats = payload.get("mpgq_stats")
+            stats = payload.get("mpq_stats")
             if not isinstance(stats, dict):
-                raise RuntimeError(f"missing mpgq_stats in {path}")
+                raise RuntimeError(f"missing mpq_stats in {path}")
             ldlq_mean = float(stats.get("exact_surrogate_ldlq_mean", float("nan")))
-            mpgq_mean = float(stats.get("exact_surrogate_after_mean", float("nan")))
+            mpq_mean = float(stats.get("exact_surrogate_after_mean", float("nan")))
             rows.append(
                 {
                     "layer": int(idx),
@@ -131,8 +135,8 @@ def _collect_mpgq_stats(save_dir: Path, *, layers: Sequence[int]) -> List[Dict[s
                     "m": int(stats.get("m", 0) or 0),
                     "n": int(stats.get("n", 0) or 0),
                     "ldlq_mean": ldlq_mean,
-                    "mpgq_mean": mpgq_mean,
-                    "delta_mean": float(mpgq_mean - ldlq_mean),
+                    "mpq_mean": mpq_mean,
+                    "delta_mean": float(mpq_mean - ldlq_mean),
                     "violation_chunks": int(stats.get("surrogate_chunk_violation_count", 0) or 0),
                     "max_delta": float(stats.get("surrogate_chunk_violation_max_delta", 0.0) or 0.0),
                     "max_ratio": float(stats.get("surrogate_chunk_violation_max_ratio", 0.0) or 0.0),
@@ -151,7 +155,7 @@ def _layer_aggregate(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
             by_layer[layer] = {
                 "layer": layer,
                 "ldlq_total": 0.0,
-                "mpgq_total": 0.0,
+                "mpq_total": 0.0,
                 "m_total": 0,
                 "violation_chunks": 0,
                 "max_delta": 0.0,
@@ -159,9 +163,9 @@ def _layer_aggregate(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
             }
         agg = by_layer[layer]
         ldlq_total = float(r["ldlq_mean"]) * max(m, 1)
-        mpgq_total = float(r["mpgq_mean"]) * max(m, 1)
+        mpq_total = float(r["mpq_mean"]) * max(m, 1)
         agg["ldlq_total"] += ldlq_total
-        agg["mpgq_total"] += mpgq_total
+        agg["mpq_total"] += mpq_total
         agg["m_total"] += int(m)
         agg["violation_chunks"] += int(r.get("violation_chunks", 0) or 0)
         agg["max_delta"] = max(float(agg["max_delta"]), float(r.get("max_delta", 0.0) or 0.0))
@@ -175,8 +179,8 @@ def _layer_aggregate(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
             {
                 "layer": int(layer),
                 "ldlq_mean": float(agg["ldlq_total"]) / float(m_total),
-                "mpgq_mean": float(agg["mpgq_total"]) / float(m_total),
-                "delta_mean": float(agg["mpgq_total"] - agg["ldlq_total"]) / float(m_total),
+                "mpq_mean": float(agg["mpq_total"]) / float(m_total),
+                "delta_mean": float(agg["mpq_total"] - agg["ldlq_total"]) / float(m_total),
                 "violation_chunks": int(agg["violation_chunks"]),
                 "max_delta": float(agg["max_delta"]),
                 "max_ratio": float(agg["max_ratio"]),
@@ -186,7 +190,7 @@ def _layer_aggregate(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="QUIP# smoke: compare LDLQ vs MPGQ proxy (surrogate) losses layer-wise.")
+    parser = argparse.ArgumentParser(description="QUIP# smoke: compare LDLQ vs MPQ proxy (surrogate) losses layer-wise.")
     parser.add_argument("--base-model", required=True)
     parser.add_argument("--hessian-dir", required=True)
     parser.add_argument("--seed", type=int, default=0)
@@ -199,13 +203,17 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--sample-proc", type=int, default=1)
     parser.add_argument("--scale-override", type=float, default=0.9)
-    parser.add_argument("--mpgq-init", type=str, default="rtn", choices=["random", "rtn", "ldlq"])
-    parser.add_argument("--mpgq-iters", type=int, default=4)
-    parser.add_argument("--mpgq-damping", type=float, default=0.5)
-    parser.add_argument("--mpgq-prior-tau", type=float, default=0.0)
-    parser.add_argument("--mpgq-polish-sweeps", type=int, default=3)
-    parser.add_argument("--mpgq-polish-metric", type=str, default="gram", choices=["gram", "isotropic", "diag"])
-    parser.add_argument("--reference-json", type=str, default=None, help="Reuse overhead/quip timing from a previous smoke json and only rerun MPGQ.")
+    parser.add_argument("--quip-tune-iters", type=int, default=0, help="Pass through QUIP# --quip_tune_iters (0 disables QUIP tune sweeps).")
+    parser.add_argument("--mpq-init", type=str, default="rtn", choices=["random", "rtn", "ldlq"])
+    parser.add_argument("--mpq-iters", type=int, default=4)
+    parser.add_argument("--mpq-damping", type=float, default=0.5)
+    parser.add_argument("--mpq-prior-tau", type=float, default=0.0)
+    parser.add_argument("--mpq-block-rows", type=int, default=128, help="MPQ row chunk size (passed to QUIP# --mpq_block_rows).")
+    parser.add_argument("--mpq-blocks-per-chunk", type=int, default=16, help="MPQ block chunk size (passed to QUIP# --mpq_blocks_per_chunk).")
+    parser.add_argument("--mpq-polish-sweeps", type=int, default=3)
+    parser.add_argument("--mpq-polish-metric", type=str, default="gram", choices=["gram", "isotropic", "diag"])
+    parser.add_argument("--skip-quip-baseline", action=argparse.BooleanOptionalAction, default=False, help="Skip the standalone QUIP pass and only run MPQ (LDLQ baseline is still available via mpq_stats).")
+    parser.add_argument("--reference-json", type=str, default=None, help="Reuse overhead/quip timing from a previous smoke json and only rerun MPQ.")
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--json-out", type=str, default=None)
     args = parser.parse_args()
@@ -224,8 +232,8 @@ def main() -> None:
 
     overhead_dir = out_root / "overhead_all_skipped"
     quip_dir = out_root / "quip_layers"
-    mpgq_dir = out_root / "mpgq_layers"
-    _touch_skip_files(mpgq_dir, skip_layers=skip_layers)
+    mpq_dir = out_root / "mpq_layers"
+    _touch_skip_files(mpq_dir, skip_layers=skip_layers)
 
     base_cmd = [
         sys.executable,
@@ -245,6 +253,8 @@ def main() -> None:
         str(int(args.sample_proc)),
         "--scale_override",
         str(float(args.scale_override)),
+        "--quip_tune_iters",
+        str(int(args.quip_tune_iters)),
         "--calibration_dataset",
         str(args.calibration_dataset),
         "--calibration_split",
@@ -269,34 +279,41 @@ def main() -> None:
         _touch_skip_files(overhead_dir, skip_layers=range(num_layers))
         _touch_skip_files(quip_dir, skip_layers=skip_layers)
         overhead_s = _run(base_cmd + ["--solver", "quip", "--save_path", str(overhead_dir)], cwd=QUIP_ROOT, env=env)
-        quip_total_s = _run(base_cmd + ["--solver", "quip", "--save_path", str(quip_dir)], cwd=QUIP_ROOT, env=env)
+        if bool(args.skip_quip_baseline):
+            quip_total_s = float("nan")
+        else:
+            quip_total_s = _run(base_cmd + ["--solver", "quip", "--save_path", str(quip_dir)], cwd=QUIP_ROOT, env=env)
 
-    # Quantize only the requested layers for MPGQ as well; otherwise QUIP# will
+    # Quantize only the requested layers for MPQ as well; otherwise QUIP# will
     # happily run the full-model pass.
-    _touch_skip_files(mpgq_dir, skip_layers=skip_layers)
+    _touch_skip_files(mpq_dir, skip_layers=skip_layers)
 
-    mpgq_cmd = base_cmd + [
+    mpq_cmd = base_cmd + [
         "--solver",
-        "mpgq",
+        "mpq",
         "--save_path",
-        str(mpgq_dir),
-        "--mpgq_init",
-        str(args.mpgq_init),
-        "--mpgq_iters",
-        str(int(args.mpgq_iters)),
-        "--mpgq_damping",
-        str(float(args.mpgq_damping)),
-        "--mpgq_prior_tau",
-        str(float(args.mpgq_prior_tau)),
-        "--mpgq_polish_sweeps",
-        str(int(args.mpgq_polish_sweeps)),
-        "--mpgq_polish_metric",
-        str(args.mpgq_polish_metric),
+        str(mpq_dir),
+        "--mpq_init",
+        str(args.mpq_init),
+        "--mpq_iters",
+        str(int(args.mpq_iters)),
+        "--mpq_damping",
+        str(float(args.mpq_damping)),
+        "--mpq_prior_tau",
+        str(float(args.mpq_prior_tau)),
+        "--mpq_block_rows",
+        str(int(args.mpq_block_rows)),
+        "--mpq_blocks_per_chunk",
+        str(int(args.mpq_blocks_per_chunk)),
+        "--mpq_polish_sweeps",
+        str(int(args.mpq_polish_sweeps)),
+        "--mpq_polish_metric",
+        str(args.mpq_polish_metric),
     ]
-    mpgq_total_s = _run(mpgq_cmd, cwd=QUIP_ROOT, env=env)
+    mpq_total_s = _run(mpq_cmd, cwd=QUIP_ROOT, env=env)
 
-    timing = _estimate_quant_times(overhead_s, quip_total_s, mpgq_total_s)
-    rows = _collect_mpgq_stats(mpgq_dir, layers=layers)
+    timing = _estimate_quant_times(overhead_s, quip_total_s, mpq_total_s)
+    rows = _collect_mpq_stats(mpq_dir, layers=layers)
     layer_rows = _layer_aggregate(rows)
 
     violations = [r for r in rows if int(r.get("violation_chunks", 0) or 0) > 0]
@@ -307,10 +324,10 @@ def main() -> None:
         "timing": {
             "overhead_s": timing.overhead_s,
             "quip_total_s": timing.quip_total_s,
-            "mpgq_total_s": timing.mpgq_total_s,
+            "mpq_total_s": timing.mpq_total_s,
             "quip_quant_s": timing.quip_quant_s,
-            "mpgq_quant_s": timing.mpgq_quant_s,
-            "ratio_mpgq_over_quip": timing.ratio,
+            "mpq_quant_s": timing.mpq_quant_s,
+            "ratio_mpq_over_quip": timing.ratio,
         },
         "modules": rows,
         "layers_agg": layer_rows,
@@ -320,18 +337,21 @@ def main() -> None:
             "out_root": str(out_root),
             "overhead_dir": str(overhead_dir),
             "quip_dir": str(quip_dir),
-            "mpgq_dir": str(mpgq_dir),
+            "mpq_dir": str(mpq_dir),
         },
     }
 
     json_out = Path(args.json_out).resolve() if args.json_out else (out_root / "smoke_proxy.json")
     json_out.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     print(f"WROTE {json_out}")
-    print(f"timing ratio mpgq/quip ~= {timing.ratio:.2f} (quant-only, overhead-subtracted)")
+    if math.isfinite(timing.ratio):
+        print(f"timing ratio mpq/quip ~= {timing.ratio:.2f} (quant-only, overhead-subtracted)")
+    else:
+        print("timing ratio mpq/quip ~= n/a (skipped quip baseline)")
     print(f"violation modules: {len(violations)} / {len(rows)}")
     for r in layer_rows:
         print(
-            f"layer {r['layer']:02d}: ldlq_mean={r['ldlq_mean']:.6g} mpgq_mean={r['mpgq_mean']:.6g} delta={r['delta_mean']:.6g} viol_chunks={r['violation_chunks']} max_ratio={r['max_ratio']:.3g}"
+            f"layer {r['layer']:02d}: ldlq_mean={r['ldlq_mean']:.6g} mpq_mean={r['mpq_mean']:.6g} delta={r['delta_mean']:.6g} viol_chunks={r['violation_chunks']} max_ratio={r['max_ratio']:.3g}"
         )
 
 

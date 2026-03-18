@@ -79,11 +79,11 @@ index 7ceb211..ce438be 100644
                                       buf_cols=128)
  
 +    solver = str(getattr(args, 'solver', 'quip') or 'quip').strip().lower()
-+    mpgq_stats = None
-+    if solver == 'mpgq':
-+        from mpgq.adapters.quip_sharp import mpgq_refine_codebook
++    mpq_stats = None
++    if solver == 'mpq':
++        from mpq.adapters.quip_sharp import mpq_refine_codebook
 +
-+        hatWr, Qidxs, mpgq_stats = mpgq_refine_codebook(
++        hatWr, Qidxs, mpq_stats = mpq_refine_codebook(
 +            Wr,
 +            Hr,
 +            hatWr,
@@ -100,8 +100,8 @@ index 7ceb211..ce438be 100644
              torch.float16).to(orig_device),  # fuse Wscale into SV
          'scaleWH': scaleWH,
      }
-+    if mpgq_stats is not None:
-+        attr['mpgq_stats'] = mpgq_stats
++    if mpq_stats is not None:
++        attr['mpq_stats'] = mpq_stats
  
      utils.clean()
  
@@ -763,33 +763,33 @@ index af33222..e5ce82a 100644
 +    '--solver',
 +    default='quip',
 +    type=str,
-+    choices=['quip', 'mpgq'],
-+    help="Quantization solver: 'quip' runs LDLQ baseline; 'mpgq' runs MPGQ refine after LDLQ.",
++    choices=['quip', 'mpq'],
++    help="Quantization solver: 'quip' runs LDLQ baseline; 'mpq' runs MPQ refine after LDLQ.",
 +)
 +
-+# MPGQ hyperparameters (used when --solver=mpgq)
-+parser.add_argument('--mpgq_init', default='random', type=str, choices=['random', 'rtn', 'ldlq'])
-+parser.add_argument('--mpgq_iters', default=4, type=int)
-+parser.add_argument('--mpgq_damping', default=0.5, type=float)
-+parser.add_argument('--mpgq_prior_tau', default=0.0, type=float)
-+parser.add_argument('--mpgq_prior_tau_scale_mode',
++# MPQ hyperparameters (used when --solver=mpq)
++parser.add_argument('--mpq_init', default='random', type=str, choices=['random', 'rtn', 'ldlq'])
++parser.add_argument('--mpq_iters', default=4, type=int)
++parser.add_argument('--mpq_damping', default=0.5, type=float)
++parser.add_argument('--mpq_prior_tau', default=0.0, type=float)
++parser.add_argument('--mpq_prior_tau_scale_mode',
 +                    default='absmax',
 +                    type=str,
 +                    choices=['none', 'absmax', 'rms', 'mean_abs'])
-+parser.add_argument('--mpgq_gamma_start', default=1.0, type=float)
-+parser.add_argument('--mpgq_gamma_retry_factor', default=4.0, type=float)
-+parser.add_argument('--mpgq_gamma_retry_steps', default=3, type=int)
-+parser.add_argument('--mpgq_obs_precision', default=0.0, type=float)
-+parser.add_argument('--mpgq_em_obs_precision', action=argparse.BooleanOptionalAction, default=True)
-+parser.add_argument('--mpgq_em_obs_precision_damping', default=0.3, type=float)
-+parser.add_argument('--mpgq_em_obs_precision_min', default=1e-4, type=float)
-+parser.add_argument('--mpgq_em_obs_precision_max', default=1e8, type=float)
-+parser.add_argument('--mpgq_blocks_per_chunk', default=16, type=int)
-+parser.add_argument('--mpgq_block_rows', default=32, type=int)
-+parser.add_argument('--mpgq_polish_sweeps', default=3, type=int)
-+parser.add_argument('--mpgq_polish_metric', default='gram', type=str, choices=['gram', 'isotropic', 'diag'])
-+parser.add_argument('--mpgq_polish_max_blocks', default=0, type=int)
-+parser.add_argument('--mpgq_metric_rows_per_chunk', default=0, type=int)
++parser.add_argument('--mpq_gamma_start', default=1.0, type=float)
++parser.add_argument('--mpq_gamma_retry_factor', default=4.0, type=float)
++parser.add_argument('--mpq_gamma_retry_steps', default=3, type=int)
++parser.add_argument('--mpq_obs_precision', default=0.0, type=float)
++parser.add_argument('--mpq_em_obs_precision', action=argparse.BooleanOptionalAction, default=True)
++parser.add_argument('--mpq_em_obs_precision_damping', default=0.3, type=float)
++parser.add_argument('--mpq_em_obs_precision_min', default=1e-4, type=float)
++parser.add_argument('--mpq_em_obs_precision_max', default=1e8, type=float)
++parser.add_argument('--mpq_blocks_per_chunk', default=16, type=int)
++parser.add_argument('--mpq_block_rows', default=32, type=int)
++parser.add_argument('--mpq_polish_sweeps', default=3, type=int)
++parser.add_argument('--mpq_polish_metric', default='gram', type=str, choices=['gram', 'isotropic', 'diag'])
++parser.add_argument('--mpq_polish_max_blocks', default=0, type=int)
++parser.add_argument('--mpq_metric_rows_per_chunk', default=0, type=int)
 +
  
  def check_exist(idx, args):
@@ -844,3 +844,37 @@ index af33222..e5ce82a 100644
              model.model.layers[i].cpu()
              orig_msv = orig_emb_cache[cur_device].float().norm(
              )**2 / orig_emb_cache[cur_device].numel()
+diff --git a/lib/utils/gptq_data_utils.py b/lib/utils/gptq_data_utils.py
+index 3e5b5ef..063a353 100644
+--- a/lib/utils/gptq_data_utils.py
++++ b/lib/utils/gptq_data_utils.py
+@@ -82,7 +82,8 @@ def get_c4(nsamples, seed, seqlen, model):
+             trainenc = tokenizer(traindata[i]['text'], return_tensors='pt')
+             if trainenc.input_ids.shape[1] >= seqlen:
+                 break
+-        i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
++        max_start = trainenc.input_ids.shape[1] - seqlen
++        i = 0 if max_start <= 0 else random.randint(0, max_start)
+         j = i + seqlen
+         inp = trainenc.input_ids[:, i:j]
+         tar = inp.clone()
+@@ -98,7 +99,8 @@ def get_c4(nsamples, seed, seqlen, model):
+             tmp = tokenizer(valdata[i]['text'], return_tensors='pt')
+             if tmp.input_ids.shape[1] >= seqlen:
+                 break
+-        i = random.randint(0, tmp.input_ids.shape[1] - seqlen - 1)
++        max_start = tmp.input_ids.shape[1] - seqlen
++        i = 0 if max_start <= 0 else random.randint(0, max_start)
+         j = i + seqlen
+         valenc.append(tmp.input_ids[:, i:j])
+     valenc = torch.hstack(valenc)
+@@ -159,7 +161,8 @@ def get_c4_new(nsamples, seed, seqlen, model):
+             trainenc = tokenizer(traindata[i]['text'], return_tensors='pt')
+             if trainenc.input_ids.shape[1] >= seqlen:
+                 break
+-        i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
++        max_start = trainenc.input_ids.shape[1] - seqlen
++        i = 0 if max_start <= 0 else random.randint(0, max_start)
+         j = i + seqlen
+         inp = trainenc.input_ids[:, i:j]
+         tar = inp.clone()
