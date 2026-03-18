@@ -1,6 +1,6 @@
 # Repro & Install
 
-This repo integrates `mpgq` into `GPTQModel` and `QUIP#` while keeping third-party logic patch-only.
+This repo integrates `mpq` into `GPTQModel` and `QUIP#` while keeping third-party logic patch-only.
 
 ## Patch workflow
 
@@ -11,9 +11,9 @@ python patches/apply_patches.py
 ```
 
 - Keep algorithm code in this repo:
-  - `mpgq/solver.py`
-  - `mpgq/adapters/*`
-  - `mpgq/polish/*`
+  - `mpq/solver.py`
+  - `mpq/adapters/*`
+  - `mpq/polish/*`
   - `scripts/*`
 
 - Keep third-party changes thin:
@@ -25,8 +25,8 @@ python patches/apply_patches.py
 
 Use two conda envs because GPTQModel and QUIP# pin different stacks.
 
-- `mpgq-gptq`
-- `mpgq-quip`
+- `mpq-gptq`
+- `mpq-quip`
 
 In each env:
 
@@ -113,9 +113,9 @@ python scripts/backend_gptq.py \
   --bits 4 \
   --group-size 128 \
   --seed 0 \
-  --mpgq-iters 16 \
-  --mpgq-damping 0.7 \
-  --mpgq-prior-tau 0.25 \
+  --mpq-iters 16 \
+  --mpq-damping 0.7 \
+  --mpq-prior-tau 0.25 \
   --output-dir runs/vamp_topk_example \
   --json-out runs/vamp_topk_example/backend_results.json
 ```
@@ -185,12 +185,50 @@ python scripts/backend_quip.py \
   --quant-topk-k 8 \
   --base-model meta-llama/Llama-3.2-1B \
   --seed 0 \
-  --mpgq-iters 16 \
-  --mpgq-damping 0.7 \
-  --mpgq-prior-tau 0.25 \
+  --mpq-iters 16 \
+  --mpq-damping 0.7 \
+  --mpq-prior-tau 0.25 \
   --output-dir runs/quip_vamp_topk_example \
   --json-out runs/quip_vamp_topk_example/backend_results.json
 ```
+
+## Quantizing your own model
+
+To quantize a custom HuggingFace model, use the single-backend scripts directly.
+
+### 4-bit (GPTQModel)
+
+```bash
+conda run -n mpq-gptq python scripts/backend_gptq.py \
+  --model-id <your-hf-model> \
+  --bits 4 --group-size 128 \
+  --quant-solver vamp --quant-polish-mode topk_block_cd \
+  --quant-topk-k 8 \
+  --output-dir runs/my_model \
+  --json-out runs/my_model/results.json
+```
+
+Key flags:
+- `--bits`: 2, 3, 4, or 8
+- `--group-size`: quantization group size (128 is standard for 4-bit)
+- `--quant-solver`: `gptq` (baseline) or `vamp` (MPQ)
+- `--quant-polish-mode`: `none`, `block_cd`, or `topk_block_cd`
+
+### 2-bit (QUIP#)
+
+```bash
+conda run -n mpq-quip python scripts/backend_quip.py \
+  --base-model <your-hf-model> \
+  --quant-solver vamp --quant-polish-mode topk_block_cd \
+  --quant-topk-k 8 \
+  --output-dir runs/my_model \
+  --json-out runs/my_model/results.json
+```
+
+Key flags:
+- `--quant-solver`: `ldlq` (QUIP# baseline), `ldlq_tune10`, or `vamp` (MPQ)
+- `--quant-polish-mode`: `none`, `block_cd`, or `topk_block_cd`
+- `--quant-rotation`: `had` (default) or `kron`
 
 ## Benchmark examples
 
@@ -255,8 +293,8 @@ python scripts/ablation.py \
 
 Old method aliases still work:
 
-- `scripts/backend_gptq.py --method mpgq`
-- `scripts/backend_quip.py --method quip+mpgq`
+- `scripts/backend_gptq.py --method mpq`
+- `scripts/backend_quip.py --method quip+mpq`
 - `scripts/benchmark.py --methods ...`
 
 They are kept for compatibility only; new experiments should use the combo flags.

@@ -1,48 +1,48 @@
-# MPGQ Unified (GPTQModel + QUIP#)
+# MPQ (GPTQModel + QUIP#)
 
-This repo provides a **single canonical MPGQ solver implementation** and adapts it to two upstream codebases via patch scripts:
+A unified quantization solver adapted to two upstream codebases via patch scripts:
 
 - `third_party/GPTQModel` (upstream submodule)
 - `third_party/quip-sharp` (upstream submodule)
 
-The primary solver family now lives behind an orthogonal combo interface:
+## Quick Start
 
-- `backend`
-- `codebook`
-- `preprocess`
-- `rotation`
-- `solver`
-- `polish_mode`
+```bash
+git clone --recurse-submodules <url>
+cd mpq-unified
+bash install.sh              # both envs
+bash install.sh --gptq-only  # GPTQModel only
+bash install.sh --quip-only  # QUIP# only
+```
 
-The main research path is `VAMP + topk block CD polish`, implemented in the shared solver and exposed on both backends.
+On HPC where clone is already done:
 
-## Third-party policy (important)
+```bash
+bash install.sh
+```
 
-- **Do not edit** `third_party/*` directly.
-- All compatibility changes live in `patches/*.patch` and are applied by `python patches/apply_patches.py`.
-- Most entrypoints call `apply_patches.py` automatically (notably `scripts/backend_gptq.py` and `scripts/backend_quip.py`).
-- Keep algorithm logic in `mpgq/*` and `scripts/*`; third-party patches should stay as thin dispatch/config glue.
-- If a submodule becomes “dirty” due to build artifacts, clean it with:
-  - `git -C third_party/<name> reset --hard`
-  - `git -C third_party/<name> clean -fdx`
+## Running benchmarks
+
+```bash
+# 4-bit GPTQModel
+conda run -n mpq-gptq python scripts/benchmark.py --bits 4 --model-id Qwen/Qwen3-0.6B --seeds 0
+
+# 2-bit QUIP#
+conda run -n mpq-quip python scripts/benchmark.py --bits 2 --base-model meta-llama/Llama-3.2-1B --seeds 0
+```
 
 ## Solver is unified
 
 The same solver code is used in both integration paths:
 
-- Core solver: `mpgq/solver.py`
-- GPTQModel adapter: `mpgq/adapters/gptqmodel.py` (scalar/groupwise quantization)
-- QUIP# adapter: `mpgq/adapters/quip_sharp.py` (E8P12 codebook refinement)
+- Core solver: `mpq/solver.py`
+- GPTQModel adapter: `mpq/adapters/gptqmodel.py` (scalar/groupwise quantization)
+- QUIP# adapter: `mpq/adapters/quip_sharp.py` (E8P12 codebook refinement)
 
-The shared polish modes are:
-
-- `none`
-- `block_cd`
-- `topk_block_cd`
+The primary solver family lives behind an orthogonal combo interface (`backend`, `codebook`, `preprocess`, `rotation`, `solver`, `polish_mode`). The main research path is `VAMP + topk block CD polish`.
 
 ## Key entrypoints
 
-- Apply patches: `python patches/apply_patches.py`
 - Full benchmark runner: `python scripts/benchmark.py ...`
 - Single-backend entrypoints:
   - `python scripts/backend_gptq.py ...`
@@ -51,12 +51,49 @@ The shared polish modes are:
 - Qwen3-0.6B 3-bit suite: `python scripts/bench_qwen3_0p6b_3bit.py ...`
 - GPTQ-side ablations: `python scripts/ablation.py ...`
 
-## Setup notes (recommended)
+## Two conda environments
 
-We typically use **two conda envs** because GPTQModel and QUIP# pin different Torch/Transformers stacks:
+GPTQModel and QUIP# pin different Torch/Transformers stacks:
 
-- `mpgq-gptq`: GPTQModel backend (`scripts/backend_gptq.py`, `scripts/bench_qwen3_0p6b_3bit.py`)
-- `mpgq-quip`: QUIP# backend (`scripts/backend_quip.py`, `scripts/bench_quip_module_proxy.py`)
+- `mpq-gptq`: GPTQModel backend
+- `mpq-quip`: QUIP# backend
 
-See [docs/repro.md](/home/cys/mpgq-unified/docs/repro.md) for installation, combo examples, and benchmark/ablation recipes.
-See [docs/benchmark_matrix.md](/home/cys/mpgq-unified/docs/benchmark_matrix.md) for the supported combo table.
+## Third-party policy
+
+- **Do not edit** `third_party/*` directly.
+- All compatibility changes live in `patches/*.patch` and are applied by `python patches/apply_patches.py`.
+- Keep algorithm logic in `mpq/*` and `scripts/*`; third-party patches should stay as thin dispatch/config glue.
+
+## Quantizing your own model
+
+### 4-bit (GPTQModel backend)
+
+```bash
+conda run -n mpq-gptq python scripts/backend_gptq.py \
+  --model-id <your-hf-model> \
+  --bits 4 --group-size 128 \
+  --quant-solver vamp --quant-polish-mode topk_block_cd \
+  --output-dir runs/my_model \
+  --json-out runs/my_model/results.json
+```
+
+### 2-bit (QUIP# backend)
+
+```bash
+conda run -n mpq-quip python scripts/backend_quip.py \
+  --base-model <your-hf-model> \
+  --quant-solver vamp --quant-polish-mode topk_block_cd \
+  --output-dir runs/my_model \
+  --json-out runs/my_model/results.json
+```
+
+## Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `CUDA_TOOLKIT_VERSION` | `12.8` | CUDA toolkit version for conda install |
+| `TORCH_CUDA_ARCH_LIST` | `8.0+PTX` | GPU arch for CUDA extension compilation |
+| `INSTALL_FLASH_ATTN` | `0` | Set to `1` to install flash-attention (QUIP# env) |
+
+See [docs/repro.md](docs/repro.md) for detailed installation, combo examples, and benchmark/ablation recipes.
+See [docs/benchmark_matrix.md](docs/benchmark_matrix.md) for the supported combo table.

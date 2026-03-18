@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
+import copy
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -15,7 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from mpgq.combo import QuantCombo, make_combo
+from mpq.combo import QuantCombo, make_combo
 
 
 def _conda_run_prefix(env_name: str) -> List[str]:
@@ -95,6 +98,16 @@ def _json_load(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _load_existing_result(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.exists():
+        return None
+    try:
+        payload = _json_load(path)
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 @dataclass(frozen=True)
 class RunMeta:
     run_id: str
@@ -105,9 +118,9 @@ class RunMeta:
 
 def _default_methods(bits: int) -> List[str]:
     if int(bits) == 2:
-        return ["quip", "quip+mpgq"]
+        return ["quip", "quip+mpq"]
     if int(bits) in {3, 4}:
-        return ["rtn", "mpgq", "gptq", "ojbkq", "awq+mpgq", "awq+gptq"]
+        return ["rtn", "mpq", "gptq", "ojbkq", "awq+mpq", "awq+gptq"]
     raise ValueError(f"unsupported bits={bits}; expected 2/3/4")
 
 
@@ -121,6 +134,46 @@ def _combo_ppl(row: Dict[str, Any]) -> float:
     eval_payload = row.get("eval", {})
     if not isinstance(eval_payload, dict):
         return float("nan")
+
+
+def _flatten_result(row: Dict[str, Any]) -> Dict[str, Any]:
+    eval_payload = row.get("eval", {})
+    timing = row.get("timing", {})
+    ppl = eval_payload.get("ppl", {}) if isinstance(eval_payload, dict) else {}
+    if not isinstance(ppl, dict):
+        ppl = {}
+    model_id = row.get("model_id") or row.get("base_model") or ""
+    topk_k = 0
+    if isinstance(row.get("mpq_args"), dict):
+        topk_k = int(row["mpq_args"].get("topk_k", 0) or 0)
+    elif isinstance(row.get("mpq"), dict):
+        topk_k = int(row["mpq"].get("topk_k", 0) or 0)
+    elif isinstance(row.get("awq_preprocess"), dict):
+        topk_k = int(row.get("topk_k", 0) or 0)
+    return {
+        "model_id": str(model_id),
+        "backend": str(row.get("backend", "")),
+        "codebook": str(row.get("codebook", row.get("codebook_impl", ""))),
+        "bits": int(row.get("bits", 0) or 0),
+        "preprocess": str(row.get("preprocess", "")),
+        "rotation": str(row.get("rotation", "")),
+        "solver": str(row.get("solver", row.get("resolved_method", ""))),
+        "polish_mode": str(row.get("polish_mode", "")),
+        "topk_k": int(row.get("topk_k", topk_k) or topk_k),
+        "seed": int(row.get("seed", 0) or 0),
+        "wikitext2_ppl": float(ppl["wikitext2"]) if "wikitext2" in ppl else float("nan"),
+        "c4_ppl": float(ppl["c4"]) if "c4" in ppl else float("nan"),
+        "load_s": float(timing.get("load_s", 0.0) or 0.0),
+        "preprocess_s": float(timing.get("awq_preprocess_s", 0.0) or 0.0),
+        "hessian_or_stats_s": float(timing.get("hessian_s", 0.0) or 0.0),
+        "quantize_s": float(timing.get("quantize_s", 0.0) or 0.0),
+        "hfize_s": float(timing.get("hfize_s", timing.get("save_quantized_s", 0.0)) or 0.0),
+        "eval_wikitext2_s": float(timing.get("eval_wikitext2_s", 0.0) or 0.0),
+        "eval_c4_s": float(timing.get("eval_c4_s", 0.0) or 0.0),
+        "quantize_total_s": float(timing.get("quantize_total_s", 0.0) or 0.0),
+        "eval_total_s": float(timing.get("eval_total_s", 0.0) or 0.0),
+        "total_s": float(timing.get("total_s", 0.0) or 0.0),
+    }
     ppl = eval_payload.get("ppl")
     if isinstance(ppl, dict):
         try:
@@ -136,14 +189,14 @@ def _combo_ppl(row: Dict[str, Any]) -> float:
 def _resolve_combo_matrix(bits: int, args) -> List[QuantCombo]:
     if int(bits) == 2:
         preprocesses = list(args.quant_preprocesses) if args.quant_preprocesses else ["none"]
-        rotations = list(args.quant_rotations) if args.quant_rotations else ["had"]
+        rotations = list(args.quant_rotations) if args.quant_rotations else ["had", "kron"]
         solvers = list(args.quant_solvers) if args.quant_solvers else ["ldlq", "vamp", "ldlq_tune10"]
         polish_modes = list(args.quant_polish_modes) if args.quant_polish_modes else ["none", "block_cd", "topk_block_cd"]
         backend = "quip"
         codebook = "e8p12"
     else:
-        preprocesses = list(args.quant_preprocesses) if args.quant_preprocesses else ["none"]
-        rotations = list(args.quant_rotations) if args.quant_rotations else ["hadamard"]
+        preprocesses = list(args.quant_preprocesses) if args.quant_preprocesses else ["none", "awq"]
+        rotations = list(args.quant_rotations) if args.quant_rotations else ["none", "hadamard", "random"]
         solvers = list(args.quant_solvers) if args.quant_solvers else ["gptq", "vamp"]
         polish_modes = list(args.quant_polish_modes) if args.quant_polish_modes else ["none", "block_cd", "topk_block_cd"]
         backend = "gptqmodel"
@@ -169,6 +222,33 @@ def _resolve_combo_matrix(bits: int, args) -> List[QuantCombo]:
                     if combo not in combos:
                         combos.append(combo)
     return combos
+
+
+def _default_sanity_eval_label(bits: int) -> str:
+    if int(bits) == 2:
+        return "backend-quip__codebook-e8p12__pre-none__rot-had__solver-vamp__polish-topk_block_cd"
+    return "backend-gptqmodel__codebook-grid_g128__pre-none__rot-hadamard__solver-vamp__polish-topk_block_cd"
+
+
+def _build_job_args(args, *, bits: int, label: str, combo: Optional[QuantCombo]):
+    job_args = argparse.Namespace(**copy.deepcopy(vars(args)))
+    is_full_eval = True
+    if str(getattr(args, "sanity_mode", "none")) == "light":
+        requested = list(getattr(args, "sanity_full_eval_labels", []) or [])
+        eval_labels = requested if requested else [_default_sanity_eval_label(bits)]
+        is_full_eval = str(label) in set(str(item) for item in eval_labels)
+        if not is_full_eval:
+            if int(bits) == 2:
+                job_args.devset_size = min(int(args.devset_size), int(args.sanity_smoke_devset_size))
+            else:
+                job_args.calibration_limit = min(int(args.calibration_limit), int(args.sanity_smoke_calibration_limit))
+            job_args.skip_eval = True
+            job_args.eval_datasets = []
+        else:
+            job_args.skip_eval = False
+    else:
+        job_args.skip_eval = False
+    return job_args, is_full_eval
 
 
 def _legacy_quip_cmd(method: str, *, seed: int, seed_dir: Path, method_dir: Path, json_out: Path, args) -> List[str]:
@@ -208,42 +288,42 @@ def _legacy_quip_cmd(method: str, *, seed: int, seed_dir: Path, method_dir: Path
         str(int(args.eval_seqlen)),
         "--eval-max-eval-tokens",
         str(int(args.eval_max_eval_tokens)),
-        "--eval-datasets",
-        *list(args.eval_datasets),
-        "--mpgq-init",
-        str(args.mpgq_init),
-        "--mpgq-method",
-        str(args.mpgq_method),
-        "--mpgq-iters",
-        str(int(args.mpgq_iters)),
-        "--mpgq-damping",
-        str(float(args.mpgq_damping)),
-        "--mpgq-prior-tau",
-        str(float(args.mpgq_prior_tau)),
-        "--mpgq-prior-tau-scale-mode",
-        str(args.mpgq_prior_tau_scale_mode),
-        "--mpgq-gamma-start",
-        str(float(args.mpgq_gamma_start)),
-        "--mpgq-gamma-retry-factor",
-        str(float(args.mpgq_gamma_retry_factor)),
-        "--mpgq-gamma-retry-steps",
-        str(int(args.mpgq_gamma_retry_steps)),
-        "--mpgq-obs-precision",
-        str(float(args.mpgq_obs_precision)),
-        "--mpgq-em-obs-precision" if bool(args.mpgq_em_obs_precision) else "--no-mpgq-em-obs-precision",
-        "--mpgq-blocks-per-chunk",
-        str(int(args.mpgq_blocks_per_chunk)),
-        "--mpgq-block-rows",
-        str(int(args.mpgq_block_rows)),
-        "--mpgq-polish-sweeps",
-        str(int(args.mpgq_polish_sweeps)),
-        "--mpgq-polish-metric",
-        str(args.mpgq_polish_metric),
-        "--mpgq-polish-max-blocks",
-        str(int(args.mpgq_polish_max_blocks)),
-        "--mpgq-metric-rows-per-chunk",
-        str(int(args.mpgq_metric_rows_per_chunk)),
-        "--mpgq-topk-k",
+        *(["--eval-datasets", *list(args.eval_datasets)] if getattr(args, "eval_datasets", None) else []),
+        "--skip-eval" if bool(getattr(args, "skip_eval", False)) else "--no-skip-eval",
+        "--mpq-init",
+        str(args.mpq_init),
+        "--mpq-method",
+        str(args.mpq_method),
+        "--mpq-iters",
+        str(int(args.mpq_iters)),
+        "--mpq-damping",
+        str(float(args.mpq_damping)),
+        "--mpq-prior-tau",
+        str(float(args.mpq_prior_tau)),
+        "--mpq-prior-tau-scale-mode",
+        str(args.mpq_prior_tau_scale_mode),
+        "--mpq-gamma-start",
+        str(float(args.mpq_gamma_start)),
+        "--mpq-gamma-retry-factor",
+        str(float(args.mpq_gamma_retry_factor)),
+        "--mpq-gamma-retry-steps",
+        str(int(args.mpq_gamma_retry_steps)),
+        "--mpq-obs-precision",
+        str(float(args.mpq_obs_precision)),
+        "--mpq-em-obs-precision" if bool(args.mpq_em_obs_precision) else "--no-mpq-em-obs-precision",
+        "--mpq-blocks-per-chunk",
+        str(int(args.mpq_blocks_per_chunk)),
+        "--mpq-block-rows",
+        str(int(args.mpq_block_rows)),
+        "--mpq-polish-sweeps",
+        str(int(args.mpq_polish_sweeps)),
+        "--mpq-polish-metric",
+        str(args.mpq_polish_metric),
+        "--mpq-polish-max-blocks",
+        str(int(args.mpq_polish_max_blocks)),
+        "--mpq-metric-rows-per-chunk",
+        str(int(args.mpq_metric_rows_per_chunk)),
+        "--mpq-topk-k",
         str(int(args.quant_topk_k)),
         "--output-dir",
         str(method_dir),
@@ -303,42 +383,42 @@ def _combo_quip_cmd(combo: QuantCombo, *, seed: int, seed_dir: Path, method_dir:
         str(int(args.eval_seqlen)),
         "--eval-max-eval-tokens",
         str(int(args.eval_max_eval_tokens)),
-        "--eval-datasets",
-        *list(args.eval_datasets),
-        "--mpgq-init",
-        str(args.mpgq_init),
-        "--mpgq-method",
-        str(args.mpgq_method),
-        "--mpgq-iters",
-        str(int(args.mpgq_iters)),
-        "--mpgq-damping",
-        str(float(args.mpgq_damping)),
-        "--mpgq-prior-tau",
-        str(float(args.mpgq_prior_tau)),
-        "--mpgq-prior-tau-scale-mode",
-        str(args.mpgq_prior_tau_scale_mode),
-        "--mpgq-gamma-start",
-        str(float(args.mpgq_gamma_start)),
-        "--mpgq-gamma-retry-factor",
-        str(float(args.mpgq_gamma_retry_factor)),
-        "--mpgq-gamma-retry-steps",
-        str(int(args.mpgq_gamma_retry_steps)),
-        "--mpgq-obs-precision",
-        str(float(args.mpgq_obs_precision)),
-        "--mpgq-em-obs-precision" if bool(args.mpgq_em_obs_precision) else "--no-mpgq-em-obs-precision",
-        "--mpgq-blocks-per-chunk",
-        str(int(args.mpgq_blocks_per_chunk)),
-        "--mpgq-block-rows",
-        str(int(args.mpgq_block_rows)),
-        "--mpgq-polish-sweeps",
-        str(int(args.mpgq_polish_sweeps)),
-        "--mpgq-polish-metric",
-        str(args.mpgq_polish_metric),
-        "--mpgq-polish-max-blocks",
-        str(int(args.mpgq_polish_max_blocks)),
-        "--mpgq-metric-rows-per-chunk",
-        str(int(args.mpgq_metric_rows_per_chunk)),
-        "--mpgq-topk-k",
+        *(["--eval-datasets", *list(args.eval_datasets)] if getattr(args, "eval_datasets", None) else []),
+        "--skip-eval" if bool(getattr(args, "skip_eval", False)) else "--no-skip-eval",
+        "--mpq-init",
+        str(args.mpq_init),
+        "--mpq-method",
+        str(args.mpq_method),
+        "--mpq-iters",
+        str(int(args.mpq_iters)),
+        "--mpq-damping",
+        str(float(args.mpq_damping)),
+        "--mpq-prior-tau",
+        str(float(args.mpq_prior_tau)),
+        "--mpq-prior-tau-scale-mode",
+        str(args.mpq_prior_tau_scale_mode),
+        "--mpq-gamma-start",
+        str(float(args.mpq_gamma_start)),
+        "--mpq-gamma-retry-factor",
+        str(float(args.mpq_gamma_retry_factor)),
+        "--mpq-gamma-retry-steps",
+        str(int(args.mpq_gamma_retry_steps)),
+        "--mpq-obs-precision",
+        str(float(args.mpq_obs_precision)),
+        "--mpq-em-obs-precision" if bool(args.mpq_em_obs_precision) else "--no-mpq-em-obs-precision",
+        "--mpq-blocks-per-chunk",
+        str(int(args.mpq_blocks_per_chunk)),
+        "--mpq-block-rows",
+        str(int(args.mpq_block_rows)),
+        "--mpq-polish-sweeps",
+        str(int(args.mpq_polish_sweeps)),
+        "--mpq-polish-metric",
+        str(args.mpq_polish_metric),
+        "--mpq-polish-max-blocks",
+        str(int(args.mpq_polish_max_blocks)),
+        "--mpq-metric-rows-per-chunk",
+        str(int(args.mpq_metric_rows_per_chunk)),
+        "--mpq-topk-k",
         str(int(args.quant_topk_k)),
         "--output-dir",
         str(method_dir),
@@ -375,29 +455,31 @@ def _legacy_gptq_cmd(method: str, *, seed: int, method_dir: Path, json_out: Path
         str(int(args.eval_seqlen)),
         "--eval-max-eval-tokens",
         str(int(args.eval_max_eval_tokens)),
+        *(["--eval-datasets", *list(args.eval_datasets)] if getattr(args, "eval_datasets", None) else []),
+        "--skip-eval" if bool(getattr(args, "skip_eval", False)) else "--no-skip-eval",
         "--awq-batch-size",
         str(int(getattr(args, "awq_batch_size", 1))),
-        "--mpgq-iters",
-        str(int(args.mpgq_iters)),
-        "--mpgq-damping",
-        str(float(args.mpgq_damping)),
-        "--mpgq-prior-tau",
-        str(float(args.mpgq_prior_tau)),
-        "--mpgq-polish-sweeps",
-        str(int(args.mpgq_polish_sweeps)),
-        "--mpgq-em-obs-precision" if bool(args.mpgq_em_obs_precision) else "--no-mpgq-em-obs-precision",
-        "--mpgq-block-rows",
-        str(int(args.mpgq_block_rows)),
-        "--mpgq-rotation-seed",
-        str(int(args.mpgq_rotation_seed)),
-        "--mpgq-gamma-start",
-        str(float(args.mpgq_gamma_start)),
-        "--mpgq-gamma-retry-factor",
-        str(float(args.mpgq_gamma_retry_factor)),
-        "--mpgq-gamma-retry-steps",
-        str(int(args.mpgq_gamma_retry_steps)),
-        "--mpgq-obs-precision",
-        str(float(args.mpgq_obs_precision)),
+        "--mpq-iters",
+        str(int(args.mpq_iters)),
+        "--mpq-damping",
+        str(float(args.mpq_damping)),
+        "--mpq-prior-tau",
+        str(float(args.mpq_prior_tau)),
+        "--mpq-polish-sweeps",
+        str(int(args.mpq_polish_sweeps)),
+        "--mpq-em-obs-precision" if bool(args.mpq_em_obs_precision) else "--no-mpq-em-obs-precision",
+        "--mpq-block-rows",
+        str(int(args.mpq_block_rows)),
+        "--mpq-rotation-seed",
+        str(int(args.mpq_rotation_seed)),
+        "--mpq-gamma-start",
+        str(float(args.mpq_gamma_start)),
+        "--mpq-gamma-retry-factor",
+        str(float(args.mpq_gamma_retry_factor)),
+        "--mpq-gamma-retry-steps",
+        str(int(args.mpq_gamma_retry_steps)),
+        "--mpq-obs-precision",
+        str(float(args.mpq_obs_precision)),
         "--ojbkq-random-trials",
         str(int(args.ojbkq_random_trials)),
         "--ojbkq-alpha-mode",
@@ -456,29 +538,31 @@ def _combo_gptq_cmd(combo: QuantCombo, *, seed: int, method_dir: Path, json_out:
         str(int(args.eval_seqlen)),
         "--eval-max-eval-tokens",
         str(int(args.eval_max_eval_tokens)),
+        *(["--eval-datasets", *list(args.eval_datasets)] if getattr(args, "eval_datasets", None) else []),
+        "--skip-eval" if bool(getattr(args, "skip_eval", False)) else "--no-skip-eval",
         "--awq-batch-size",
         str(int(getattr(args, "awq_batch_size", 1))),
-        "--mpgq-iters",
-        str(int(args.mpgq_iters)),
-        "--mpgq-damping",
-        str(float(args.mpgq_damping)),
-        "--mpgq-prior-tau",
-        str(float(args.mpgq_prior_tau)),
-        "--mpgq-polish-sweeps",
-        str(int(args.mpgq_polish_sweeps)),
-        "--mpgq-em-obs-precision" if bool(args.mpgq_em_obs_precision) else "--no-mpgq-em-obs-precision",
-        "--mpgq-block-rows",
-        str(int(args.mpgq_block_rows)),
-        "--mpgq-rotation-seed",
-        str(int(args.mpgq_rotation_seed)),
-        "--mpgq-gamma-start",
-        str(float(args.mpgq_gamma_start)),
-        "--mpgq-gamma-retry-factor",
-        str(float(args.mpgq_gamma_retry_factor)),
-        "--mpgq-gamma-retry-steps",
-        str(int(args.mpgq_gamma_retry_steps)),
-        "--mpgq-obs-precision",
-        str(float(args.mpgq_obs_precision)),
+        "--mpq-iters",
+        str(int(args.mpq_iters)),
+        "--mpq-damping",
+        str(float(args.mpq_damping)),
+        "--mpq-prior-tau",
+        str(float(args.mpq_prior_tau)),
+        "--mpq-polish-sweeps",
+        str(int(args.mpq_polish_sweeps)),
+        "--mpq-em-obs-precision" if bool(args.mpq_em_obs_precision) else "--no-mpq-em-obs-precision",
+        "--mpq-block-rows",
+        str(int(args.mpq_block_rows)),
+        "--mpq-rotation-seed",
+        str(int(args.mpq_rotation_seed)),
+        "--mpq-gamma-start",
+        str(float(args.mpq_gamma_start)),
+        "--mpq-gamma-retry-factor",
+        str(float(args.mpq_gamma_retry_factor)),
+        "--mpq-gamma-retry-steps",
+        str(int(args.mpq_gamma_retry_steps)),
+        "--mpq-obs-precision",
+        str(float(args.mpq_obs_precision)),
         "--ojbkq-random-trials",
         str(int(args.ojbkq_random_trials)),
         "--ojbkq-alpha-mode",
@@ -524,17 +608,17 @@ def main() -> None:
         help="Optional extra site-packages path for GPTQModel deps when running backend_gptq without installing GPTQModel.",
     )
 
-    parser.add_argument("--mpgq-iters", type=int, default=10)
-    parser.add_argument("--mpgq-damping", type=float, default=0.5)
-    parser.add_argument("--mpgq-prior-tau", type=float, default=0.2)
-    parser.add_argument("--mpgq-polish-sweeps", type=int, default=3)
-    parser.add_argument("--mpgq-em-obs-precision", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--mpgq-block-rows", type=int, default=32)
-    parser.add_argument("--mpgq-rotation-seed", type=int, default=0)
-    parser.add_argument("--mpgq-gamma-start", type=float, default=1.0)
-    parser.add_argument("--mpgq-gamma-retry-factor", type=float, default=4.0)
-    parser.add_argument("--mpgq-gamma-retry-steps", type=int, default=3)
-    parser.add_argument("--mpgq-obs-precision", type=float, default=0.0)
+    parser.add_argument("--mpq-iters", type=int, default=16)
+    parser.add_argument("--mpq-damping", type=float, default=0.5)
+    parser.add_argument("--mpq-prior-tau", type=float, default=0.2)
+    parser.add_argument("--mpq-polish-sweeps", type=int, default=3)
+    parser.add_argument("--mpq-em-obs-precision", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--mpq-block-rows", type=int, default=128)
+    parser.add_argument("--mpq-rotation-seed", type=int, default=0)
+    parser.add_argument("--mpq-gamma-start", type=float, default=1.0)
+    parser.add_argument("--mpq-gamma-retry-factor", type=float, default=4.0)
+    parser.add_argument("--mpq-gamma-retry-steps", type=int, default=3)
+    parser.add_argument("--mpq-obs-precision", type=float, default=0.0)
 
     parser.add_argument("--ojbkq-random-trials", type=int, default=5)
     parser.add_argument("--ojbkq-alpha-mode", type=str, default="paper", choices=["paper", "fixed"])
@@ -551,20 +635,25 @@ def main() -> None:
     parser.add_argument("--scale-override", type=float, default=0.9)
     parser.add_argument("--hessian-batch-size", type=int, default=2)
     parser.add_argument("--force-hessians", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--mpgq-init", type=str, default="random", choices=["random", "rtn", "ldlq"])
-    parser.add_argument("--mpgq-method", type=str, default="vamp", choices=["vamp", "vamp-topk-polish", "ep-diag"])
-    parser.add_argument("--mpgq-prior-tau-scale-mode", type=str, default="absmax", choices=["none", "absmax", "rms", "mean_abs"])
-    parser.add_argument("--mpgq-blocks-per-chunk", type=int, default=16)
-    parser.add_argument("--mpgq-polish-metric", type=str, default="gram", choices=["gram", "diag", "isotropic"])
-    parser.add_argument("--mpgq-polish-max-blocks", type=int, default=0)
-    parser.add_argument("--mpgq-metric-rows-per-chunk", type=int, default=0)
+    parser.add_argument("--mpq-init", type=str, default="random", choices=["random", "rtn", "ldlq"])
+    parser.add_argument("--mpq-method", type=str, default="vamp", choices=["vamp", "vamp-topk-polish"])
+    parser.add_argument("--mpq-prior-tau-scale-mode", type=str, default="absmax", choices=["none", "absmax", "rms", "mean_abs"])
+    parser.add_argument("--mpq-blocks-per-chunk", type=int, default=16)
+    parser.add_argument("--mpq-polish-metric", type=str, default="gram", choices=["gram", "diag", "isotropic"])
+    parser.add_argument("--mpq-polish-max-blocks", type=int, default=0)
+    parser.add_argument("--mpq-metric-rows-per-chunk", type=int, default=0)
 
     parser.add_argument("--runs-dir", type=str, default="runs")
     parser.add_argument("--run-id", type=str, default=None)
-    parser.add_argument("--gptq-env", type=str, default="mpgq-gptq")
-    parser.add_argument("--quip-env", type=str, default="mpgq-quip")
+    parser.add_argument("--gptq-env", type=str, default="mpq-gptq")
+    parser.add_argument("--quip-env", type=str, default="mpq-quip")
     parser.add_argument("--backend-retries", type=int, default=5)
     parser.add_argument("--backend-retry-sleep", type=float, default=2.0)
+    parser.add_argument("--resume-existing", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--sanity-mode", type=str, default="none", choices=["none", "light"])
+    parser.add_argument("--sanity-full-eval-labels", nargs="*", default=None)
+    parser.add_argument("--sanity-smoke-calibration-limit", type=int, default=8)
+    parser.add_argument("--sanity-smoke-devset-size", type=int, default=8)
     parser.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args()
@@ -607,17 +696,26 @@ def main() -> None:
             method_dir.mkdir(parents=True, exist_ok=True)
             json_out = method_dir / "backend_results.json"
             log_path = method_dir / "run.log"
+            job_args, is_full_eval = _build_job_args(args, bits=bits, label=label, combo=combo)
+
+            if bool(args.resume_existing):
+                existing = _load_existing_result(json_out)
+                if existing is not None:
+                    print(f"SKIP existing result: {json_out}")
+                    all_results.append(existing)
+                    continue
 
             if combo is None and bits == 2:
-                cmd = _legacy_quip_cmd(label, seed=seed, seed_dir=seed_dir, method_dir=method_dir, json_out=json_out, args=args)
+                cmd = _legacy_quip_cmd(label, seed=seed, seed_dir=seed_dir, method_dir=method_dir, json_out=json_out, args=job_args)
             elif combo is None:
-                cmd = _legacy_gptq_cmd(label, seed=seed, method_dir=method_dir, json_out=json_out, bits=bits, args=args)
+                cmd = _legacy_gptq_cmd(label, seed=seed, method_dir=method_dir, json_out=json_out, bits=bits, args=job_args)
             elif bits == 2:
-                cmd = _combo_quip_cmd(combo, seed=seed, seed_dir=seed_dir, method_dir=method_dir, json_out=json_out, args=args)
+                cmd = _combo_quip_cmd(combo, seed=seed, seed_dir=seed_dir, method_dir=method_dir, json_out=json_out, args=job_args)
             else:
-                cmd = _combo_gptq_cmd(combo, seed=seed, method_dir=method_dir, json_out=json_out, bits=bits, args=args)
+                cmd = _combo_gptq_cmd(combo, seed=seed, method_dir=method_dir, json_out=json_out, bits=bits, args=job_args)
 
             if args.dry_run:
+                print(f"# {'full-eval' if is_full_eval else 'smoke'}")
                 print("$ " + " ".join(shlex.quote(x) for x in cmd))
                 continue
 
@@ -630,6 +728,17 @@ def main() -> None:
             )
             all_results.append(_json_load(json_out))
 
+            # Clean up model artifacts to save disk space.
+            for _subdir_name in ("ckpt", "hf", "quantized"):
+                _subdir = method_dir / _subdir_name
+                if _subdir.is_dir():
+                    shutil.rmtree(_subdir, ignore_errors=True)
+
+        # Clean up shared hessian directory for this seed.
+        for _hess_dir in seed_dir.glob("hess_*"):
+            if _hess_dir.is_dir():
+                shutil.rmtree(_hess_dir, ignore_errors=True)
+
     payload: Dict[str, Any] = {
         "meta": asdict(meta),
         "args": vars(args),
@@ -637,21 +746,33 @@ def main() -> None:
     }
     out_path = run_dir / "results.json"
     out_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    flat_rows = [_flatten_result(row) for row in all_results]
+    jsonl_path = run_dir / "results.jsonl"
+    with jsonl_path.open("w", encoding="utf-8") as fh:
+        for row in flat_rows:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+    csv_path = run_dir / "results.csv"
+    if flat_rows:
+        with csv_path.open("w", encoding="utf-8", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=list(flat_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(flat_rows)
 
     lines = [
         f"# Benchmark (bits={bits})",
         "",
-        "| Backend | Codebook | Preprocess | Rotation | Solver | Polish | Seed | Wikitext2 PPL |",
-        "| --- | --- | --- | --- | --- | --- | ---: | ---: |",
+        "| Model | Backend | Codebook | Preprocess | Rotation | Solver | Polish | Seed | Wikitext2 PPL | C4 PPL | Quantize Total (s) |",
+        "| --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: |",
     ]
     for row in sorted(
-        all_results,
+        flat_rows,
         key=lambda item: (
+            str(item.get("model_id", "")),
             str(item.get("backend", "")),
-            str(item.get("codebook", item.get("codebook_impl", ""))),
+            str(item.get("codebook", "")),
             str(item.get("preprocess", "")),
             str(item.get("rotation", "")),
-            str(item.get("solver", item.get("resolved_method", ""))),
+            str(item.get("solver", "")),
             str(item.get("polish_mode", "")),
             int(item.get("seed", 0)),
         ),
@@ -660,14 +781,17 @@ def main() -> None:
             "| "
             + " | ".join(
                 [
+                    str(row.get("model_id", "")),
                     str(row.get("backend", "")),
-                    str(row.get("codebook", row.get("codebook_impl", ""))),
+                    str(row.get("codebook", "")),
                     str(row.get("preprocess", "")),
                     str(row.get("rotation", "")),
-                    str(row.get("solver", row.get("resolved_method", ""))),
+                    str(row.get("solver", "")),
                     str(row.get("polish_mode", "")),
                     str(int(row.get("seed", 0))),
-                    f"{_combo_ppl(row):.4f}",
+                    f"{float(row.get('wikitext2_ppl', float('nan'))):.4f}",
+                    f"{float(row.get('c4_ppl', float('nan'))):.4f}",
+                    f"{float(row.get('quantize_total_s', 0.0)):.2f}",
                 ]
             )
             + " |"
@@ -675,6 +799,8 @@ def main() -> None:
     md_path = run_dir / "benchmark.md"
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"WROTE {out_path}")
+    print(f"WROTE {jsonl_path}")
+    print(f"WROTE {csv_path}")
     print(f"WROTE {md_path}")
 
 
