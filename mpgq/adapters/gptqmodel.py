@@ -8,7 +8,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 from ..rotation import apply_right_hadamard, apply_right_hadamard_inverse, sample_hadamard_signs
-from ..solver import UniformVampConfig, solve_uniform_rankspace_vamp
+from ..linear import vamp_rankspace_error
+from ..solver import (
+    UniformVampConfig,
+    build_uniform_vamp_topk_candidates,
+    polish_uniform_rankspace,
+    solve_uniform_rankspace_vamp,
+)
 
 
 @dataclass(frozen=True)
@@ -37,6 +43,13 @@ def _expand_group_params(grouped: torch.Tensor, widths: torch.Tensor) -> torch.T
         return grouped.new_zeros((grouped.shape[0], 0))
     widths = widths.to(device=grouped.device)
     return torch.repeat_interleave(grouped, widths, dim=1)
+
+
+@torch.inference_mode()
+def _expand_group_params_from_gidx(grouped: torch.Tensor, g_idx: torch.Tensor) -> torch.Tensor:
+    if grouped.numel() == 0 or g_idx.numel() == 0:
+        return grouped.new_zeros((grouped.shape[0], int(g_idx.numel())))
+    return grouped.index_select(1, g_idx.to(device=grouped.device, dtype=torch.long))
 
 
 @torch.inference_mode()
@@ -82,6 +95,41 @@ def _resolve_block_rows(rows: int, cols: int, maxq: int, requested: int, device:
 
 
 @torch.inference_mode()
+def _uniform_vamp_cfg_from_qcfg(qcfg: Any) -> UniformVampConfig:
+    mpgq_cfg = getattr(qcfg, "mpgq", None)
+    return UniformVampConfig(
+        iters=int(getattr(mpgq_cfg, "iters", 10)),
+        damping=float(getattr(mpgq_cfg, "damping", 0.5)),
+        final_decision=str(getattr(mpgq_cfg, "final_decision", "map") or "map"),
+        init_from="rtn",
+        gamma_start=float(getattr(mpgq_cfg, "gamma_start", 1.0)),
+        gamma_retry_factor=float(getattr(mpgq_cfg, "gamma_retry_factor", 4.0)),
+        gamma_retry_steps=int(getattr(mpgq_cfg, "gamma_retry_steps", 3)),
+        prior_tau=float(getattr(mpgq_cfg, "prior_tau", 0.2)),
+        obs_precision=float(getattr(mpgq_cfg, "obs_precision", 0.0)),
+        em_obs_precision=bool(getattr(mpgq_cfg, "em_obs_precision", True)),
+        em_obs_precision_damping=float(getattr(mpgq_cfg, "em_obs_precision_damping", 0.3)),
+        em_obs_precision_min=float(getattr(mpgq_cfg, "em_obs_precision_min", 1e-4)),
+        em_obs_precision_max=float(getattr(mpgq_cfg, "em_obs_precision_max", 1e8)),
+        polish_sweeps=int(getattr(mpgq_cfg, "polish_sweeps", 3)),
+        polish_mode=str(getattr(mpgq_cfg, "polish_mode", "block_cd") or "block_cd"),
+        topk_k=int(getattr(mpgq_cfg, "topk_k", 8) or 8),
+    )
+
+
+@torch.inference_mode()
+def _adapter_cfg_from_qcfg(qcfg: Any) -> GPTQAdapterConfig:
+    mpgq_cfg = getattr(qcfg, "mpgq", None)
+    return GPTQAdapterConfig(
+        hessian_scale=float(getattr(mpgq_cfg, "hessian_scale", 0.5)),
+        block_rows=int(getattr(mpgq_cfg, "block_rows", 32)),
+        jitter_base=float(getattr(mpgq_cfg, "eigen_jitter", 1e-6)),
+        eigen_floor_scale=float(getattr(mpgq_cfg, "eigen_floor_scale", 1e-6)),
+        rotation_seed=int(getattr(mpgq_cfg, "rotation_seed", 0)),
+    )
+
+
+@torch.inference_mode()
 def run_mpgq_quantization(
     *,
     W: torch.Tensor,
@@ -124,8 +172,8 @@ def run_mpgq_quantization(
         group_size = cols
 
     rotation = str(getattr(qcfg, "rotation", None) or "none").strip().lower()
-    if rotation not in ("none", "hadamard", ""):
-        raise ValueError(f"mpgq only supports rotation in {{none, hadamard}}; got rotation={rotation!r}.")
+    if rotation not in ("none", "hadamard", "random", ""):
+        raise ValueError(f"mpgq only supports rotation in {{none, hadamard, random}}; got rotation={rotation!r}.")
     use_hadamard = rotation == "hadamard"
     if bool(getattr(qcfg, "desc_act", False)):
         raise ValueError("mpgq exact-full path does not support desc_act=True.")
@@ -253,6 +301,8 @@ def run_mpgq_quantization(
 
     stats: Dict[str, Any] = {
         "method": "mpgq",
+        "solver": str(getattr(getattr(qcfg, "mpgq", None), "solver", "vamp") or "vamp"),
+        "polish_mode": str(getattr(getattr(qcfg, "mpgq", None), "polish_mode", getattr(vamp_cfg, "polish_mode", "block_cd"))),
         "module": str(module_name),
         "bits": int(bits),
         "group_size": int(group_size),
@@ -270,3 +320,158 @@ def run_mpgq_quantization(
         "quant_time_s": float(time.time() - start),
     }
     return Q, q_int_out, scale_out, zero_out, g_idx_out, float(time.time() - start), stats
+
+
+@torch.inference_mode()
+def postprocess_gptq_quantization(
+    *,
+    W: torch.Tensor,
+    H: torch.Tensor,
+    Q_init: torch.Tensor,
+    scale_groups: torch.Tensor,
+    zero_groups: torch.Tensor,
+    g_idx: torch.Tensor,
+    qcfg: Any,
+    module_name: str,
+    adapter_cfg: GPTQAdapterConfig = GPTQAdapterConfig(),
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    float,
+    Dict[str, Any],
+]:
+    start = time.time()
+    W = W.to(dtype=torch.float32)
+    H = H.to(dtype=torch.float32)
+    Q_init = Q_init.to(dtype=torch.float32)
+    scale_groups = scale_groups.to(dtype=torch.float32)
+    zero_groups = zero_groups.to(dtype=torch.float32)
+    g_idx = g_idx.to(dtype=torch.int32, device=W.device)
+
+    bits = int(getattr(qcfg, "bits"))
+    maxq = int((2**bits) - 1)
+    rows, cols = W.shape
+    block_rows = _resolve_block_rows(
+        rows=rows,
+        cols=cols,
+        maxq=maxq,
+        requested=int(adapter_cfg.block_rows),
+        device=W.device,
+    )
+
+    scale_full = _expand_group_params_from_gidx(scale_groups.to(device=W.device), g_idx)
+    zero_full = _expand_group_params_from_gidx(zero_groups.to(device=W.device), g_idx)
+    q_init = torch.round(Q_init / scale_full.clamp_min(1e-12) + zero_full).clamp_(0, maxq).to(dtype=torch.int32)
+
+    H_work = float(adapter_cfg.hessian_scale) * H
+    eigenvalues, V, eigen_floor = _vamp_hessian_eigen(
+        H_work,
+        jitter_base=float(adapter_cfg.jitter_base),
+        floor_scale=float(adapter_cfg.eigen_floor_scale),
+    )
+    V = V.to(device=W.device, dtype=torch.float32).contiguous()
+    eigenvalues = eigenvalues.to(device=W.device, dtype=torch.float32).contiguous()
+    Vh = V.T.contiguous()
+    S = torch.sqrt(eigenvalues).contiguous()
+    Vs = V * S.unsqueeze(0)
+    Y_u = W.matmul(Vs)
+
+    mpgq_cfg = getattr(qcfg, "mpgq", None)
+    polish_mode = str(getattr(mpgq_cfg, "polish_mode", "none") or "none").strip().lower()
+    polish_sweeps = int(getattr(mpgq_cfg, "polish_sweeps", 0))
+    vamp_cfg = _uniform_vamp_cfg_from_qcfg(qcfg)
+
+    err_before = vamp_rankspace_error(Y_u=Y_u, x=Q_init, Vs=Vs)
+
+    topk = None
+    aux_stats: Dict[str, Any] = {}
+    if polish_mode == "topk_block_cd":
+        aux_debug: Dict[str, Any] = {}
+        aux_cfg = UniformVampConfig(
+            iters=vamp_cfg.iters,
+            damping=vamp_cfg.damping,
+            final_decision=vamp_cfg.final_decision,
+            init_from="rtn",
+            gamma_start=vamp_cfg.gamma_start,
+            gamma_retry_factor=vamp_cfg.gamma_retry_factor,
+            gamma_retry_steps=vamp_cfg.gamma_retry_steps,
+            prior_tau=vamp_cfg.prior_tau,
+            obs_precision=vamp_cfg.obs_precision,
+            em_obs_precision=vamp_cfg.em_obs_precision,
+            em_obs_precision_damping=vamp_cfg.em_obs_precision_damping,
+            em_obs_precision_min=vamp_cfg.em_obs_precision_min,
+            em_obs_precision_max=vamp_cfg.em_obs_precision_max,
+            polish_sweeps=0,
+            polish_mode="none",
+            topk_k=vamp_cfg.topk_k,
+        )
+        _aux_q, _aux_x, _aux_err, _rtn_err, aux_stats = solve_uniform_rankspace_vamp(
+            W=W,
+            x_rtn=Q_init,
+            scale_full=scale_full,
+            zero_full=zero_full,
+            maxq=maxq,
+            V=V,
+            Vh=Vh,
+            S=S,
+            Vs=Vs,
+            cfg=aux_cfg,
+            log_stats=False,
+            debug_out=aux_debug,
+        )
+        topk = build_uniform_vamp_topk_candidates(
+            r1=aux_debug["r1"].to(device=W.device, dtype=torch.float32),
+            gamma1=aux_debug["gamma1"].to(device=W.device, dtype=torch.float32),
+            W=W,
+            scale_full=scale_full,
+            zero_full=zero_full,
+            maxq=maxq,
+            prior_tau=float(vamp_cfg.prior_tau),
+            k=int(vamp_cfg.topk_k),
+        )
+
+    q_polished, x_polished, err_after, polish_stats = polish_uniform_rankspace(
+        x_init=Q_init,
+        Y_u=Y_u,
+        Vs=Vs,
+        scale_full=scale_full,
+        zero_full=zero_full,
+        maxq=maxq,
+        sweeps=polish_sweeps,
+        polish_mode=polish_mode,
+        topk_values=None if topk is None else topk["topk_values"],
+        topk_q=None if topk is None else topk["topk_q"],
+    )
+    improve = err_after + 1e-12 < err_before
+    if bool(improve.any().item()):
+        Q_final = torch.where(improve.unsqueeze(-1), x_polished, Q_init)
+        q_final = torch.where(improve.unsqueeze(-1), q_polished, q_init)
+    else:
+        Q_final = Q_init
+        q_final = q_init
+
+    stats: Dict[str, Any] = {
+        "method": "mpgq",
+        "solver": "gptq",
+        "polish_mode": str(polish_mode),
+        "module": str(module_name),
+        "bits": int(bits),
+        "group_size": int(getattr(qcfg, "group_size", cols)),
+        "rows": int(rows),
+        "cols": int(cols),
+        "rank": int(S.numel()),
+        "eigen_floor": float(eigen_floor),
+        "block_rows": int(block_rows),
+        "polish_sweeps": int(polish_sweeps),
+        "topk_k": int(getattr(mpgq_cfg, "topk_k", 8) or 8),
+        "rankspace_error_mean_before": float(err_before.mean().item()) if err_before.numel() else 0.0,
+        "rankspace_error_mean_after": float(err_after.mean().item()) if err_after.numel() else 0.0,
+        "polish_gain": float((err_before - err_after).mean().item()) if err_after.numel() else 0.0,
+        "polish_updates": float(polish_stats.get("accepted_updates", 0.0)),
+        "aux_vamp": aux_stats if topk is not None else {},
+        "quant_time_s": float(time.time() - start),
+    }
+    return Q_final, q_final, scale_groups, zero_groups, g_idx, float(time.time() - start), stats

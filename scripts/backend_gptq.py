@@ -19,6 +19,10 @@ import torch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from mpgq.combo import QuantCombo, make_combo
 
 
 def _maybe_reexec_via_runpy() -> None:
@@ -445,7 +449,104 @@ def _resolve_local_hf_snapshot(model_id_or_path: str) -> Optional[str]:
     return str(snap_dirs[0])
 
 
-def _build_quantize_config(method: str, args) -> Any:
+def _resolve_combo_and_runtime(args) -> tuple[Optional[QuantCombo], Dict[str, Any]]:
+    requested_method = str(getattr(args, "method", "") or "").strip().lower()
+    runtime: Dict[str, Any] = {
+        "request_source": "combo",
+        "requested_method": requested_method or None,
+        "awq_preprocess": False,
+        "awq_apply_clip": False,
+        "desc_act": True,
+        "sym": bool(args.sym),
+        "legacy_rtn": False,
+        "ojbkq": False,
+    }
+
+    if requested_method:
+        runtime["request_source"] = "method"
+        if requested_method in {"gptq", "gptq-strong"}:
+            combo = make_combo(
+                backend="gptqmodel",
+                codebook="grid_g128",
+                preprocess="none",
+                rotation="hadamard",
+                solver="gptq",
+                polish_mode="none",
+            )
+            return combo, runtime
+        if requested_method == "mpgq":
+            runtime["desc_act"] = False
+            combo = make_combo(
+                backend="gptqmodel",
+                codebook="grid_g128",
+                preprocess="none",
+                rotation="hadamard",
+                solver="vamp",
+                polish_mode="block_cd" if int(args.mpgq_polish_sweeps) > 0 else "none",
+            )
+            return combo, runtime
+        if requested_method == "rtn":
+            runtime["desc_act"] = False
+            runtime["legacy_rtn"] = True
+            combo = make_combo(
+                backend="gptqmodel",
+                codebook="grid_g128",
+                preprocess="none",
+                rotation="hadamard",
+                solver="vamp",
+                polish_mode="none",
+            )
+            return combo, runtime
+        if requested_method == "awq+gptq":
+            runtime["awq_preprocess"] = True
+            runtime["awq_apply_clip"] = True
+            runtime["sym"] = False
+            combo = make_combo(
+                backend="gptqmodel",
+                codebook="grid_g128",
+                preprocess="awq",
+                rotation="hadamard",
+                solver="gptq",
+                polish_mode="none",
+            )
+            return combo, runtime
+        if requested_method == "awq+mpgq":
+            runtime["awq_preprocess"] = True
+            runtime["awq_apply_clip"] = False
+            runtime["sym"] = False
+            runtime["desc_act"] = False
+            combo = make_combo(
+                backend="gptqmodel",
+                codebook="grid_g128",
+                preprocess="awq",
+                rotation="hadamard",
+                solver="vamp",
+                polish_mode="block_cd" if int(args.mpgq_polish_sweeps) > 0 else "none",
+            )
+            return combo, runtime
+        if requested_method == "ojbkq":
+            runtime["ojbkq"] = True
+            runtime["desc_act"] = False
+            return None, runtime
+        raise ValueError(f"unsupported method={requested_method!r} for backend_gptq")
+
+    combo = make_combo(
+        backend=str(getattr(args, "quant_backend", "gptqmodel")),
+        codebook=str(getattr(args, "quant_codebook", "grid_g128")),
+        preprocess=str(getattr(args, "quant_preprocess", "none")),
+        rotation=str(getattr(args, "quant_rotation", "hadamard")),
+        solver=str(getattr(args, "quant_solver", "gptq")),
+        polish_mode=str(getattr(args, "quant_polish_mode", "none")),
+        topk_source=str(getattr(args, "quant_topk_source", "aux_vamp")),
+    )
+    runtime["awq_preprocess"] = combo.preprocess == "awq"
+    runtime["awq_apply_clip"] = combo.preprocess == "awq" and combo.solver == "gptq"
+    runtime["sym"] = False if combo.preprocess == "awq" else bool(args.sym)
+    runtime["desc_act"] = combo.solver == "gptq"
+    return combo, runtime
+
+
+def _build_quantize_config(combo: Optional[QuantCombo], runtime: Dict[str, Any], args) -> Any:
     from gptqmodel import QuantizeConfig
     from gptqmodel.quantization import FORMAT
 
@@ -453,30 +554,39 @@ def _build_quantize_config(method: str, args) -> Any:
     qcfg = QuantizeConfig(
         bits=int(args.bits),
         group_size=int(args.group_size),
-        sym=bool(args.sym),
+        sym=bool(runtime["sym"]),
         # Default `FORMAT.GPTQ` (v1) is meant for checkpoint interchange; it forces a v2->v1 qzeros
         # conversion during packing which breaks in-process TorchQuantLinear inference. We always
         # evaluate in-process here, so prefer internal v2 format.
         format=FORMAT.GPTQ_V2,
         device=device,
         offload_to_disk=bool(args.offload_to_disk),
-        rotation=str(args.rotation) if args.rotation else None,
-        desc_act=bool(args.desc_act),
+        rotation=None if combo is None or combo.rotation in {"none", ""} else str(combo.rotation),
+        desc_act=bool(runtime["desc_act"]),
     )
 
-    if method in {"mpgq", "rtn"}:
+    use_repo_managed = combo is not None and (combo.solver == "vamp" or combo.polish_mode != "none")
+    if use_repo_managed:
         qcfg.mpgq.enabled = True
-        qcfg.mpgq.iters = 0 if method == "rtn" else int(args.mpgq_iters)
+        qcfg.mpgq.solver = str(combo.solver)
+        qcfg.mpgq.polish_mode = str(combo.polish_mode)
+        qcfg.mpgq.topk_source = str(combo.topk_source)
+        qcfg.mpgq.topk_k = int(getattr(args, "quant_topk_k", 8))
+        qcfg.mpgq.iters = 0 if bool(runtime["legacy_rtn"]) else int(args.mpgq_iters)
         qcfg.mpgq.damping = float(args.mpgq_damping)
-        qcfg.mpgq.prior_tau = 0.0 if method == "rtn" else float(args.mpgq_prior_tau)
-        qcfg.mpgq.polish_sweeps = 0 if method == "rtn" else int(args.mpgq_polish_sweeps)
-        qcfg.mpgq.em_obs_precision = False if method == "rtn" else bool(args.mpgq_em_obs_precision)
+        qcfg.mpgq.prior_tau = 0.0 if bool(runtime["legacy_rtn"]) else float(args.mpgq_prior_tau)
+        qcfg.mpgq.polish_sweeps = 0 if bool(runtime["legacy_rtn"]) else int(args.mpgq_polish_sweeps)
+        qcfg.mpgq.em_obs_precision = False if bool(runtime["legacy_rtn"]) else bool(args.mpgq_em_obs_precision)
         qcfg.mpgq.block_rows = int(args.mpgq_block_rows)
         qcfg.mpgq.rotation_seed = int(args.mpgq_rotation_seed)
+        qcfg.mpgq.gamma_start = float(args.mpgq_gamma_start)
+        qcfg.mpgq.gamma_retry_factor = float(args.mpgq_gamma_retry_factor)
+        qcfg.mpgq.gamma_retry_steps = int(args.mpgq_gamma_retry_steps)
+        qcfg.mpgq.obs_precision = float(args.mpgq_obs_precision)
     else:
         qcfg.mpgq.enabled = False
 
-    if method == "ojbkq":
+    if bool(runtime["ojbkq"]):
         from mpgq.baselines.ojbkq import OJBKQConfig
 
         qcfg.desc_act = False
@@ -509,51 +619,10 @@ def run(args) -> Dict[str, Any]:
     from transformers import AutoTokenizer
 
     _setup_hf_cache(model_id=str(args.model_id), calibration_dataset=str(args.calibration_dataset))
-
-    requested_method = str(args.method).strip().lower()
-    supported = {"gptq", "gptq-strong", "mpgq", "rtn", "ojbkq", "awq+gptq", "awq+mpgq"}
-    if requested_method not in supported:
-        raise ValueError(f"unsupported method={requested_method!r} for backend_gptq")
+    combo, runtime = _resolve_combo_and_runtime(args)
 
     device = torch.device(str(args.device))
-
-    awq_preprocess = False
-    awq_apply_clip = False
     awq_time_s = 0.0
-
-    # Resolve method -> base solver + canonical defaults.
-    if requested_method in {"gptq", "gptq-strong"}:
-        method = "gptq"
-        args.desc_act = True
-        args.rotation = "hadamard"
-    elif requested_method == "mpgq":
-        method = "mpgq"
-        args.desc_act = False
-        args.rotation = "hadamard"
-    elif requested_method == "rtn":
-        method = "rtn"
-        args.desc_act = False
-        args.rotation = "hadamard"
-    elif requested_method == "ojbkq":
-        method = "ojbkq"
-        args.desc_act = False
-        args.rotation = None
-    elif requested_method == "awq+gptq":
-        method = "gptq"
-        awq_preprocess = True
-        awq_apply_clip = True
-        args.sym = False
-        args.desc_act = True
-        args.rotation = "hadamard"
-    elif requested_method == "awq+mpgq":
-        method = "mpgq"
-        awq_preprocess = True
-        awq_apply_clip = False
-        args.sym = False
-        args.desc_act = False
-        args.rotation = "hadamard"
-    else:
-        raise RuntimeError("unreachable")
 
     model_id = str(args.model_id)
     model_path = _resolve_local_hf_snapshot(model_id) or model_id
@@ -573,19 +642,19 @@ def run(args) -> Dict[str, Any]:
         log_fn=lambda s: print(s, flush=True),
     )
 
-    qcfg = _build_quantize_config(method, args)
+    qcfg = _build_quantize_config(combo, runtime, args)
     t_load = time.time()
     model = GPTQModel.load(model_path, qcfg)
     load_time_s = float(time.time() - t_load)
-    if awq_preprocess:
+    if bool(runtime["awq_preprocess"]):
         t_awq = time.time()
         _apply_awq_preprocess(
             qmodel=model,
             calibration_blocks=calib_blocks,
             bits=int(args.bits),
             group_size=int(args.group_size),
-            sym=bool(args.sym),
-            apply_clip=bool(awq_apply_clip),
+            sym=bool(runtime["sym"]),
+            apply_clip=bool(runtime["awq_apply_clip"]),
             batch_size=int(args.awq_batch_size),
         )
         awq_time_s = float(time.time() - t_awq)
@@ -629,19 +698,25 @@ def run(args) -> Dict[str, Any]:
 
     return {
         "backend": "gptqmodel",
-        "requested_method": requested_method,
-        "resolved_method": method,
-        "baseline_family": "gptq" if requested_method in {"gptq", "gptq-strong"} else requested_method,
+        "requested_method": runtime["requested_method"],
+        "request_source": str(runtime["request_source"]),
+        "resolved_method": "ojbkq" if bool(runtime["ojbkq"]) else (combo.solver if combo is not None else "gptq"),
+        "baseline_family": "ojbkq" if bool(runtime["ojbkq"]) else ("gptq" if combo is None or combo.solver == "gptq" else "mpgq"),
         "bits": int(args.bits),
         "group_size": int(args.group_size),
-        "sym": bool(args.sym),
-        "rotation": "none" if args.rotation in {None, "", "none"} else str(args.rotation),
-        "desc_act": bool(args.desc_act),
+        "sym": bool(runtime["sym"]),
+        "codebook": combo.codebook if combo is not None else "grid_g128",
+        "preprocess": combo.preprocess if combo is not None else "none",
+        "rotation": combo.rotation if combo is not None else "none",
+        "solver": combo.solver if combo is not None else "gptq",
+        "polish_mode": combo.polish_mode if combo is not None else "none",
+        "topk_source": combo.topk_source if combo is not None else "aux_vamp",
+        "desc_act": bool(runtime["desc_act"]),
         "seed": int(args.seed),
         "model_id": str(args.model_id),
         "awq_preprocess": {
-            "enabled": bool(awq_preprocess),
-            "apply_clip": bool(awq_apply_clip),
+            "enabled": bool(runtime["awq_preprocess"]),
+            "apply_clip": bool(runtime["awq_apply_clip"]),
             "batch_size": int(args.awq_batch_size),
             "time_s": float(awq_time_s),
         },
@@ -663,8 +738,18 @@ def run(args) -> Dict[str, Any]:
             "quantize_s": float(quant_time),
         },
         "quantization_path": {
-            "dense": bool(getattr(qcfg, "mpgq", None) and bool(getattr(qcfg.mpgq, "enabled", False)) and str(getattr(qcfg, "rotation", None)) == "hadamard"),
-            "packed": not bool(getattr(qcfg, "mpgq", None) and bool(getattr(qcfg.mpgq, "enabled", False)) and str(getattr(qcfg, "rotation", None)) == "hadamard"),
+            "dense": bool(
+                getattr(qcfg, "mpgq", None)
+                and bool(getattr(qcfg.mpgq, "enabled", False))
+                and str(getattr(qcfg.mpgq, "solver", "")) == "vamp"
+                and str(getattr(qcfg, "rotation", None)) == "hadamard"
+            ),
+            "packed": not bool(
+                getattr(qcfg, "mpgq", None)
+                and bool(getattr(qcfg.mpgq, "enabled", False))
+                and str(getattr(qcfg.mpgq, "solver", "")) == "vamp"
+                and str(getattr(qcfg, "rotation", None)) == "hadamard"
+            ),
         },
         "meta": {
             "repo_sha": _git_head(REPO_ROOT),
@@ -675,6 +760,10 @@ def run(args) -> Dict[str, Any]:
         },
         "mpgq": {
             "enabled": bool(getattr(qcfg, "mpgq", None) and getattr(qcfg.mpgq, "enabled", False)),
+            "solver": str(getattr(qcfg.mpgq, "solver", "")) if getattr(qcfg, "mpgq", None) else "",
+            "polish_mode": str(getattr(qcfg.mpgq, "polish_mode", "")) if getattr(qcfg, "mpgq", None) else "",
+            "topk_source": str(getattr(qcfg.mpgq, "topk_source", "")) if getattr(qcfg, "mpgq", None) else "",
+            "topk_k": int(getattr(qcfg.mpgq, "topk_k", 0)) if getattr(qcfg, "mpgq", None) else 0,
             "iters": int(getattr(qcfg.mpgq, "iters", 0)) if getattr(qcfg, "mpgq", None) else 0,
             "prior_tau": float(getattr(qcfg.mpgq, "prior_tau", 0.0)) if getattr(qcfg, "mpgq", None) else 0.0,
             "damping": float(getattr(qcfg.mpgq, "damping", 0.0)) if getattr(qcfg, "mpgq", None) else 0.0,
@@ -700,9 +789,17 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--method",
-        required=True,
+        default=None,
         choices=["gptq", "gptq-strong", "mpgq", "rtn", "ojbkq", "awq+gptq", "awq+mpgq"],
     )
+    parser.add_argument("--quant-backend", type=str, default="gptqmodel")
+    parser.add_argument("--quant-codebook", type=str, default="grid_g128")
+    parser.add_argument("--quant-preprocess", type=str, default="none")
+    parser.add_argument("--quant-rotation", type=str, default="hadamard")
+    parser.add_argument("--quant-solver", type=str, default="gptq", choices=["gptq", "vamp"])
+    parser.add_argument("--quant-polish-mode", type=str, default="none", choices=["none", "block_cd", "topk_block_cd"])
+    parser.add_argument("--quant-topk-source", type=str, default="aux_vamp")
+    parser.add_argument("--quant-topk-k", type=int, default=8)
     parser.add_argument("--model-id", required=True)
     parser.add_argument("--bits", type=int, default=4)
     parser.add_argument("--group-size", type=int, default=128)
@@ -732,6 +829,10 @@ def main() -> None:
     parser.add_argument("--mpgq-em-obs-precision", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--mpgq-block-rows", type=int, default=32)
     parser.add_argument("--mpgq-rotation-seed", type=int, default=0)
+    parser.add_argument("--mpgq-gamma-start", type=float, default=1.0)
+    parser.add_argument("--mpgq-gamma-retry-factor", type=float, default=4.0)
+    parser.add_argument("--mpgq-gamma-retry-steps", type=int, default=3)
+    parser.add_argument("--mpgq-obs-precision", type=float, default=0.0)
 
     # OJBKQ baseline hyperparams
     parser.add_argument("--ojbkq-random-trials", type=int, default=5)

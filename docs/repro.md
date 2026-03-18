@@ -1,74 +1,262 @@
-# Repro & gates
+# Repro & Install
 
-This repo integrates `mpgq` into **two upstream submodules** (GPTQModel + QUIP#) while keeping
-third-party code upstream-clean. All third-party compatibility changes live in `patches/*.patch`
-and are applied via `python patches/apply_patches.py`.
+This repo integrates `mpgq` into `GPTQModel` and `QUIP#` while keeping third-party logic patch-only.
 
-Most entrypoints apply patches automatically (e.g. `scripts/backend_gptq.py`, `scripts/backend_quip.py`),
-but you still need to run patching manually before **building** any third-party CUDA extensions.
+## Patch workflow
 
-## Environments (recommended)
+- Apply patches before building CUDA extensions:
 
-GPTQModel and QUIP# pin different Torch/Transformers stacks. To avoid dependency conflicts we
-recommend two conda envs:
-
-- `mpgq-gptq`: GPTQModel backend runs (3/4-bit)
-- `mpgq-quip`: QUIP# backend runs (2-bit E8P12)
-
-At minimum, in each env:
-
-- Install this repo: `python -m pip install -e .`
-- Install the backend deps you plan to use:
-  - GPTQModel deps: `python -m pip install -r third_party/GPTQModel/requirements.txt`
-  - QUIP# deps: `python -m pip install -r third_party/quip-sharp/requirements.txt`
-
-## Prereq: fast_hadamard_transform (recommended)
-
-On new GPUs (e.g. SM 12.0 / RTX 5090), you typically need to **build from source**.
-We vendor `fast-hadamard-transform` as a pinned submodule and patch it for robust installs.
-
-Install (inside the target conda env):
 ```bash
 python patches/apply_patches.py
-# Build with the conda-provided CUDA toolchain (avoid picking up /usr/local/cuda).
+```
+
+- Keep algorithm code in this repo:
+  - `mpgq/solver.py`
+  - `mpgq/adapters/*`
+  - `mpgq/polish/*`
+  - `scripts/*`
+
+- Keep third-party changes thin:
+  - dispatch hooks
+  - config plumbing
+  - import / compatibility glue
+
+## Recommended environments
+
+Use two conda envs because GPTQModel and QUIP# pin different stacks.
+
+- `mpgq-gptq`
+- `mpgq-quip`
+
+In each env:
+
+```bash
+python -m pip install -e .
+python patches/apply_patches.py
+```
+
+Backend-specific deps:
+
+```bash
+# GPTQModel env
+python -m pip install -r third_party/GPTQModel/requirements.txt
+
+# QUIP env
+python -m pip install -r third_party/quip-sharp/requirements.txt
+```
+
+### fast-hadamard-transform
+
+On newer GPUs it is usually safest to build from the vendored submodule:
+
+```bash
 export CUDA_HOME="$CONDA_PREFIX"
 export PATH="$CONDA_PREFIX/bin:$PATH"
 FAST_HADAMARD_TRANSFORM_FORCE_BUILD=TRUE \
   python -m pip install --no-build-isolation -v third_party/fast-hadamard-transform
 ```
 
-## Gate A (GPTQModel, 4-bit Qwen3 0.6B)
-- Target: MPGQ exact-full achieves ~22.1 PPL on Wikitext2 (±0.3).
-- Recipe: C4 token blocks 128×2048, seed=0, iters=10, tau=0.2, damping=0.5, polish=3, rotation=hadamard.
+## Combo interface
 
-Repro:
+The public benchmark/backend interface is now:
+
+- `backend`
+- `codebook`
+- `preprocess`
+- `rotation`
+- `solver`
+- `polish_mode`
+
+Shared polish modes:
+
+- `none`
+- `block_cd`
+- `topk_block_cd`
+
+Top-k polish always uses `topk_source=aux_vamp`.
+
+## Single-backend examples
+
+### GPTQModel normal grid
+
+`GPTQ + topk block CD`:
+
 ```bash
-python scripts/benchmark.py \
-  --bits 4 --model-id Qwen/Qwen3-0.6B \
-  --methods mpgq gptq \
-  --seeds 0 \
-  --calibration-dataset c4 --calibration-split train --calibration-limit 128 --calibration-seqlen 2048 \
-  --eval-seqlen 2048 --eval-max-eval-tokens 131072 \
-  --mpgq-iters 10 --mpgq-prior-tau 0.2 --mpgq-damping 0.5 --mpgq-polish-sweeps 3 --mpgq-em-obs-precision
+python scripts/backend_gptq.py \
+  --quant-backend gptqmodel \
+  --quant-codebook grid_g128 \
+  --quant-preprocess none \
+  --quant-rotation hadamard \
+  --quant-solver gptq \
+  --quant-polish-mode topk_block_cd \
+  --quant-topk-k 8 \
+  --model-id Qwen/Qwen3-0.6B \
+  --bits 4 \
+  --group-size 128 \
+  --seed 0 \
+  --output-dir runs/gptq_topk_example \
+  --json-out runs/gptq_topk_example/backend_results.json
 ```
 
-## Gate B (QUIP#, 2-bit Llama-3.2-1B)
-- Target: `quip+mpgq` (MMSE-VAMP + gram polish + random init) beats LDLQ baseline on Wikitext2 for seeds {0,1,2}.
-- Additionally: per-layer/per-block surrogate error must satisfy `mpgq <= ldlq`.
-- Latency: wall-time ≤ 5× LDLQ.
+`VAMP + topk block CD`:
 
-Repro:
 ```bash
-python scripts/benchmark.py \
-  --bits 2 --base-model meta-llama/Llama-3.2-1B \
-  --methods quip quip+mpgq \
-  --seeds 0 1 2 \
-  --devset-size 128 --ctx-size 2048 --batch-size 16 --sample-proc 1 --scale-override 0.9 \
-  --mpgq-init random --mpgq-iters 4 --mpgq-damping 0.5 --mpgq-prior-tau 0.0 \
-  --mpgq-polish-sweeps 3 --mpgq-polish-metric gram
+python scripts/backend_gptq.py \
+  --quant-backend gptqmodel \
+  --quant-codebook grid_g128 \
+  --quant-preprocess none \
+  --quant-rotation hadamard \
+  --quant-solver vamp \
+  --quant-polish-mode topk_block_cd \
+  --quant-topk-k 8 \
+  --model-id Qwen/Qwen3-0.6B \
+  --bits 4 \
+  --group-size 128 \
+  --seed 0 \
+  --mpgq-iters 16 \
+  --mpgq-damping 0.7 \
+  --mpgq-prior-tau 0.25 \
+  --output-dir runs/vamp_topk_example \
+  --json-out runs/vamp_topk_example/backend_results.json
 ```
 
-## Convenience benchmarks
+### GPTQModel AWQ
 
-- Single-module QUIP# proxy (deterministic, for solver debugging): `scripts/bench_quip_module_proxy.py`
-- Qwen3-0.6B 3-bit Wikitext2 suite (mpgq / awq+mpgq / gptq-strong): `scripts/bench_qwen3_0p6b_3bit.py`
+```bash
+python scripts/backend_gptq.py \
+  --quant-backend gptqmodel \
+  --quant-codebook grid_g128 \
+  --quant-preprocess awq \
+  --quant-rotation hadamard \
+  --quant-solver gptq \
+  --quant-polish-mode block_cd \
+  --model-id Qwen/Qwen3-0.6B \
+  --bits 4 \
+  --group-size 128 \
+  --seed 0 \
+  --output-dir runs/awq_gptq_cd \
+  --json-out runs/awq_gptq_cd/backend_results.json
+```
+
+### QUIP# E8P12
+
+Native LDLQ baseline:
+
+```bash
+python scripts/backend_quip.py \
+  --quant-backend quip \
+  --quant-codebook e8p12 \
+  --quant-preprocess none \
+  --quant-rotation had \
+  --quant-solver ldlq \
+  --quant-polish-mode none \
+  --base-model meta-llama/Llama-3.2-1B \
+  --seed 0 \
+  --output-dir runs/ldlq_example \
+  --json-out runs/ldlq_example/backend_results.json
+```
+
+Default QUIP# baseline (`LDLQ + tune10`):
+
+```bash
+python scripts/backend_quip.py \
+  --quant-backend quip \
+  --quant-codebook e8p12 \
+  --quant-preprocess none \
+  --quant-rotation had \
+  --quant-solver ldlq_tune10 \
+  --quant-polish-mode none \
+  --base-model meta-llama/Llama-3.2-1B \
+  --seed 0 \
+  --output-dir runs/ldlq_tune10_example \
+  --json-out runs/ldlq_tune10_example/backend_results.json
+```
+
+`VAMP + topk block CD`:
+
+```bash
+python scripts/backend_quip.py \
+  --quant-backend quip \
+  --quant-codebook e8p12 \
+  --quant-preprocess none \
+  --quant-rotation had \
+  --quant-solver vamp \
+  --quant-polish-mode topk_block_cd \
+  --quant-topk-k 8 \
+  --base-model meta-llama/Llama-3.2-1B \
+  --seed 0 \
+  --mpgq-iters 16 \
+  --mpgq-damping 0.7 \
+  --mpgq-prior-tau 0.25 \
+  --output-dir runs/quip_vamp_topk_example \
+  --json-out runs/quip_vamp_topk_example/backend_results.json
+```
+
+## Benchmark examples
+
+### E8P12 matrix
+
+```bash
+python scripts/benchmark.py \
+  --bits 2 \
+  --base-model meta-llama/Llama-3.2-1B \
+  --quant-solvers ldlq vamp ldlq_tune10 \
+  --quant-polish-modes none block_cd topk_block_cd \
+  --quant-rotations had \
+  --seeds 0
+```
+
+### Normal grid matrix
+
+```bash
+python scripts/benchmark.py \
+  --bits 4 \
+  --model-id Qwen/Qwen3-0.6B \
+  --quant-solvers gptq vamp \
+  --quant-polish-modes none block_cd topk_block_cd \
+  --quant-preprocesses none awq \
+  --quant-rotations hadamard \
+  --seeds 0
+```
+
+Outputs:
+
+- `results.json`
+- `benchmark.md`
+
+## Ablation examples
+
+Fix a combo, then sweep VAMP hyperparameters:
+
+```bash
+python scripts/ablation.py \
+  --bits 4 \
+  --model-id Qwen/Qwen3-0.6B \
+  --quant-preprocess none \
+  --quant-rotation hadamard \
+  --quant-solver vamp \
+  --quant-polish-mode topk_block_cd \
+  --quant-topk-k 8
+```
+
+QUIP-side ablation:
+
+```bash
+python scripts/ablation.py \
+  --bits 2 \
+  --base-model meta-llama/Llama-3.2-1B \
+  --quant-rotation had \
+  --quant-solver vamp \
+  --quant-polish-mode topk_block_cd \
+  --quant-topk-k 8
+```
+
+## Legacy compatibility
+
+Old method aliases still work:
+
+- `scripts/backend_gptq.py --method mpgq`
+- `scripts/backend_quip.py --method quip+mpgq`
+- `scripts/benchmark.py --methods ...`
+
+They are kept for compatibility only; new experiments should use the combo flags.

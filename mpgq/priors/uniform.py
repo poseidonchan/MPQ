@@ -70,6 +70,77 @@ def discrete_uniform_mmse(
 
 
 @torch.inference_mode()
+def discrete_uniform_topk(
+    *,
+    r1: torch.Tensor,  # (B, n)
+    gamma1: torch.Tensor,  # (B, 1)
+    scale_full: torch.Tensor,  # (B, n)
+    zero_full: torch.Tensor,  # (B, n)
+    maxq: int,
+    prior_center: torch.Tensor,  # (B, n)
+    prior_tau: float,
+    k: int,
+    atoms: torch.Tensor | None = None,  # (B, n, L) optional precomputed atoms
+) -> Dict[str, torch.Tensor]:
+    """Return per-entry top-k atoms under the same exact scalar posterior used by VAMP."""
+    if atoms is None:
+        candidates = candidate_tensor(maxq, device=r1.device)  # (1,1,L)
+        atoms = scale_full.to(dtype=torch.float32).unsqueeze(-1) * (
+            candidates - zero_full.to(dtype=torch.float32).unsqueeze(-1)
+        )  # (B,n,L)
+    gamma1 = gamma1.to(dtype=torch.float32)
+
+    scores = -0.5 * gamma1.unsqueeze(-1) * (atoms - r1.to(dtype=torch.float32).unsqueeze(-1)).square()
+    if float(prior_tau) > 0.0:
+        scaled_tau2 = (float(prior_tau) * scale_full.to(dtype=torch.float32).clamp_min(1e-12)).square().unsqueeze(-1)
+        scores = scores - 0.5 * (atoms - prior_center.to(dtype=torch.float32).unsqueeze(-1)).square() / scaled_tau2
+
+    k_eff = max(1, min(int(k), int(scores.shape[-1])))
+    topk_scores, topk_q = torch.topk(scores, k=k_eff, dim=-1)
+    topk_values = torch.gather(atoms, dim=-1, index=topk_q)
+    return {
+        "topk_q": topk_q.to(dtype=torch.long),
+        "topk_values": topk_values.to(dtype=torch.float32),
+        "topk_scores": topk_scores.to(dtype=torch.float32),
+    }
+
+
+@torch.inference_mode()
+def uniform_map_topk(
+    *,
+    r1: torch.Tensor,  # (B, n)
+    gamma1: torch.Tensor,  # (B, 1)
+    scale_full: torch.Tensor,  # (B, n)
+    zero_full: torch.Tensor,  # (B, n)
+    maxq: int,
+    prior_center: torch.Tensor,  # (B, n)
+    prior_tau: float,
+    k: int,
+    atoms: torch.Tensor | None = None,  # (B, n, L) optional precomputed atoms
+) -> Dict[str, torch.Tensor]:
+    if atoms is None:
+        candidates = candidate_tensor(maxq, device=r1.device)  # (1,1,L)
+        atoms = scale_full.to(dtype=torch.float32).unsqueeze(-1) * (
+            candidates - zero_full.to(dtype=torch.float32).unsqueeze(-1)
+        )  # (B,n,L)
+    gamma1 = gamma1.to(dtype=torch.float32)
+
+    scores = -0.5 * gamma1.unsqueeze(-1) * (atoms - r1.to(dtype=torch.float32).unsqueeze(-1)).square()
+    if float(prior_tau) > 0.0:
+        scaled_tau2 = (float(prior_tau) * scale_full.to(dtype=torch.float32).clamp_min(1e-12)).square().unsqueeze(-1)
+        scores = scores - 0.5 * (atoms - prior_center.to(dtype=torch.float32).unsqueeze(-1)).square() / scaled_tau2
+
+    k_eff = min(max(int(k), 1), int(scores.shape[-1]))
+    top_scores, top_q = torch.topk(scores, k=k_eff, dim=-1)
+    top_values = torch.gather(atoms, dim=-1, index=top_q)
+    return {
+        "topk_q": top_q.to(dtype=torch.long),
+        "topk_values": top_values.to(dtype=torch.float32),
+        "topk_scores": top_scores.to(dtype=torch.float32),
+    }
+
+
+@torch.inference_mode()
 def nearest_atom_idx(
     *,
     x: torch.Tensor,  # (B, n)

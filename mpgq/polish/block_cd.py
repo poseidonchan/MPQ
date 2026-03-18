@@ -200,6 +200,37 @@ class UniformScalarProvider:
         return xq.to(dtype=x_block.dtype), None
 
 
+@dataclass(frozen=True)
+class UniformTopKProvider:
+    topk_values: torch.Tensor  # (B, n, k)
+    topk_q: Optional[torch.Tensor] = None  # (B, n, k)
+
+    @torch.inference_mode()
+    def propose(
+        self,
+        *,
+        block_idx: int,
+        start: int,
+        end: int,
+        x_block: torch.Tensor,
+        target: torch.Tensor,
+        metric: str,
+        gram_chol: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if end != start + 1:
+            raise ValueError("UniformTopKProvider expects block_size=1.")
+        cand_vals = self.topk_values[:, start:end, :].to(device=x_block.device, dtype=torch.float32).transpose(1, 2)
+        dist = (cand_vals.squeeze(-1) - target.to(dtype=torch.float32)).square()
+        best = torch.argmin(dist, dim=1)
+        row_idx = torch.arange(int(x_block.shape[0]), device=x_block.device)
+        out_vals = cand_vals[row_idx, best].to(dtype=x_block.dtype)
+        if self.topk_q is None:
+            return out_vals, None
+        cand_q = self.topk_q[:, start:end, :].to(device=x_block.device, dtype=torch.long).transpose(1, 2)
+        out_q = cand_q[row_idx, best].squeeze(-1).to(dtype=torch.int32)
+        return out_vals, out_q
+
+
 @dataclass
 class E8P12Provider:
     cb: object
@@ -272,3 +303,57 @@ class E8P12Provider:
             raise ValueError("cb.quantize is required for isotropic polish.")
         cand_vals, cand_idxs = self.cb.quantize(target, resid_scale_override=-1)
         return cand_vals.to(dtype=x_block.dtype), cand_idxs
+
+
+@dataclass
+class E8P12TopKProvider:
+    cb: object
+    topk_idxs: torch.Tensor  # (rows, nblocks, k)
+    _grid: Optional[torch.Tensor] = None
+
+    def _grid_on(self, device: torch.device) -> torch.Tensor:
+        if self._grid is None or self._grid.device != device:
+            self._grid = self.cb.grid.to(device=device, dtype=torch.float32)
+        return self._grid
+
+    @torch.inference_mode()
+    def propose(
+        self,
+        *,
+        block_idx: int,
+        start: int,
+        end: int,
+        x_block: torch.Tensor,
+        target: torch.Tensor,
+        metric: str,
+        gram_chol: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        rows = int(x_block.shape[0])
+        width = int(end - start)
+        codesz = int(getattr(self.cb, "codesz", 8))
+        if width != codesz:
+            raise ValueError(f"E8P12TopKProvider expects block_size={codesz}, got {width}.")
+
+        cand_idxs = self.topk_idxs[:, int(block_idx), :].to(
+            device=x_block.device,
+            dtype=getattr(self.cb, "idx_dtype", torch.int64),
+        )
+        k = int(cand_idxs.shape[1])
+        grid = self._grid_on(x_block.device)
+        cand_vals = grid.index_select(0, cand_idxs.reshape(-1).to(dtype=torch.long)).view(rows, k, width)
+
+        if metric == "gram":
+            if gram_chol is None:
+                raise ValueError("metric='gram' requires gram_chol.")
+            chol = gram_chol.to(device=x_block.device, dtype=torch.float32)
+            target_metric = target.to(dtype=torch.float32).matmul(chol)
+            cand_metric = cand_vals.to(dtype=torch.float32).matmul(chol)
+            dist = (cand_metric - target_metric.unsqueeze(1)).square().sum(dim=-1)
+        else:
+            dist = (cand_vals.to(dtype=torch.float32) - target.to(dtype=torch.float32).unsqueeze(1)).square().sum(dim=-1)
+
+        best = torch.argmin(dist, dim=1)
+        row_idx = torch.arange(rows, device=x_block.device)
+        out_vals = cand_vals[row_idx, best].to(dtype=x_block.dtype)
+        out_idxs = cand_idxs[row_idx, best]
+        return out_vals, out_idxs

@@ -331,14 +331,145 @@ def _branch_factorized_map(
     if need_stats:
         second_abs = abs_a.clone()
         second_abs.scatter_(-1, min_pos.unsqueeze(-1), float("inf"))
-        second_min_abs = second_abs.min(dim=-1).values
+        second_min = second_abs.min(dim=-1)
+        second_min_abs = second_min.values
+        second_pos = second_min.indices
         second_linear = torch.where(
             mismatch,
             sum_abs - 2.0 * second_min_abs,
             sum_abs - 2.0 * (min_abs + second_min_abs),
         )
         out["second_logscore"] = const + second_linear
+        # Second-best MAP index under the parity constraint.
+        #
+        # Let s0 be the unconstrained best sign assignment (per coordinate). Each bit flip i
+        # reduces the linear score by 2|a_i|. The parity constraint means:
+        #   - if s0 parity mismatches base parity, the best valid sign flips the smallest |a_i|
+        #     bit; the second-best flips the second-smallest |a_i| bit.
+        #   - if s0 parity already matches, the second-best valid sign flips the two smallest
+        #     |a_i| bits (to keep parity).
+        orig_sign_id = (best_sign_bits.to(dtype=torch.long) * bit_values.view(1, 1, codesz)).sum(dim=-1)
+        min_bit = bit_values[min_pos]
+        second_bit = bit_values[second_pos]
+        flip2 = torch.bitwise_xor(min_bit, second_bit)
+        second_sign_id = torch.where(mismatch, torch.bitwise_xor(orig_sign_id, second_bit), torch.bitwise_xor(orig_sign_id, flip2))
+        second_idx = idx_lut_branch[base_ids, second_sign_id]
+        if not torch.all(second_idx >= 0):
+            raise RuntimeError("failed to map factorized E8P12 2nd MAP sign patterns back to full codebook indices.")
+        out["second_idx"] = second_idx
     return out
+
+
+@torch.inference_mode()
+def vamp_vector_map_topk_e8p12(
+    *,
+    r1_blocks: torch.Tensor,  # (B, n_blocks, 8)
+    gamma1: torch.Tensor,  # (B, 1) or (B, n_blocks, 1) or (B, n_blocks, 8)
+    cb: object,
+    k: int,
+    blocks_per_chunk: int = 64,
+    prior_center_blocks: Optional[torch.Tensor] = None,
+    prior_scale_blocks: Optional[torch.Tensor] = None,
+    prior_tau: float = 0.0,
+    prior_tau_scale_mode: str = "absmax",
+) -> Dict[str, torch.Tensor]:
+    """Return per-block top-k MAP candidates (indices + scores) under the factorized E8P12 model.
+
+    Candidate set is restricted to the {best, 2nd-best} parity-valid sign assignments for each
+    (branch, abs-base) pattern. This yields 2 * 256 * 2 = 1024 candidates per block.
+    """
+    batch, n_blocks, codesz = r1_blocks.shape
+    if int(codesz) != 8:
+        raise ValueError(f"E8P12 top-k expects codesz=8, got {codesz}.")
+    k = int(k)
+    if k <= 0:
+        raise ValueError(f"expected k>0, got k={k}")
+
+    r1_work = r1_blocks
+    gamma_blocks = None
+    if float(prior_tau) > 0.0 and prior_center_blocks is not None:
+        scale_blocks = prior_scale_blocks
+        if scale_blocks is None:
+            scale_blocks = prior_scale_from_center(prior_center_blocks, prior_tau_scale_mode)
+        assert scale_blocks is not None
+        scale_blocks = scale_blocks.to(dtype=torch.float32, device=r1_blocks.device).clamp_min_(1e-12)
+        tau2 = (max(float(prior_tau), 1e-12) * scale_blocks).square()
+        prior_prec = 1.0 / tau2
+        if gamma1.ndim == 2:
+            gamma_base = gamma1.unsqueeze(1).expand(batch, n_blocks, 1).to(dtype=torch.float32)
+        elif gamma1.ndim == 3:
+            gamma_base = gamma1.to(dtype=torch.float32)
+            if gamma_base.shape[-1] not in (1, codesz):
+                raise ValueError(f"expected gamma1 last dim in {{1,{codesz}}}, got {tuple(gamma1.shape)}")
+        else:
+            raise ValueError(f"expected gamma1 with ndim in {{2,3}}, got {tuple(gamma1.shape)}")
+        gamma_blocks = gamma_base + prior_prec
+        r1_work = (
+            gamma_base * r1_blocks.to(dtype=torch.float32)
+            + prior_prec * prior_center_blocks.to(dtype=torch.float32)
+        ) / gamma_blocks
+        r1_work = r1_work.to(dtype=r1_blocks.dtype)
+
+    blocks_per_chunk = resolve_factorized_blocks_per_chunk(batch, n_blocks, blocks_per_chunk, r1_blocks.device)
+    cache = get_e8p12_factor_cache(cb, device=r1_blocks.device)
+    branch_offsets = cache["branch_offsets"]
+
+    # 1024 candidates per block.
+    cand_count = 2 * int(cache["abs_count"].item()) * 2
+    k_eff = min(int(k), int(cand_count))
+
+    topk_idxs = torch.empty(batch, n_blocks, k_eff, dtype=torch.long, device=r1_blocks.device)
+    topk_scores = torch.empty(batch, n_blocks, k_eff, dtype=torch.float32, device=r1_blocks.device)
+
+    for bstart in range(0, n_blocks, blocks_per_chunk):
+        bend = min(bstart + blocks_per_chunk, n_blocks)
+        chunk_size = bend - bstart
+        r1_chunk = r1_work[:, bstart:bend, :]
+        r1_flat = r1_chunk.reshape(batch * chunk_size, codesz).to(dtype=torch.float32)
+
+        if gamma_blocks is None:
+            if gamma1.ndim == 2:
+                gamma_flat = (
+                    gamma1.unsqueeze(1)
+                    .expand(batch, chunk_size, 1)
+                    .reshape(batch * chunk_size, 1)
+                    .to(dtype=torch.float32)
+                )
+            else:
+                gamma_src = gamma1[:, bstart:bend, :]
+                if gamma_src.shape[-1] not in (1, codesz):
+                    raise ValueError(f"expected gamma1 last dim in {{1,{codesz}}}, got {tuple(gamma1.shape)}")
+                gamma_flat = gamma_src.reshape(batch * chunk_size, gamma_src.shape[-1]).to(dtype=torch.float32)
+        else:
+            gamma_src = gamma_blocks[:, bstart:bend, :]
+            gamma_flat = gamma_src.reshape(batch * chunk_size, gamma_src.shape[-1]).to(dtype=torch.float32)
+
+        branch_outputs = []
+        for branch_idx, offset in enumerate(branch_offsets.tolist()):
+            branch_outputs.append(
+                _branch_factorized_map(
+                    y_branch=r1_flat - float(offset),
+                    gamma_flat=gamma_flat,
+                    branch_idx=int(branch_idx),
+                    cache=cache,
+                    need_stats=True,
+                )
+            )
+
+        best_logscore = torch.stack([out["best_logscore"] for out in branch_outputs], dim=1)  # (N,2,256)
+        second_logscore = torch.stack([out["second_logscore"] for out in branch_outputs], dim=1)  # (N,2,256)
+        best_idx = torch.stack([out["best_idx"] for out in branch_outputs], dim=1)  # (N,2,256)
+        second_idx = torch.stack([out["second_idx"] for out in branch_outputs], dim=1)  # (N,2,256)
+
+        scores = torch.stack([best_logscore, second_logscore], dim=-1).reshape(batch * chunk_size, -1)
+        idxs = torch.stack([best_idx, second_idx], dim=-1).reshape(batch * chunk_size, -1)
+        top_scores, top_pos = torch.topk(scores, k=k_eff, dim=1)
+        top_idxs = idxs.gather(1, top_pos)
+
+        topk_idxs[:, bstart:bend, :] = top_idxs.view(batch, chunk_size, k_eff)
+        topk_scores[:, bstart:bend, :] = top_scores.view(batch, chunk_size, k_eff).to(dtype=torch.float32)
+
+    return {"topk_idxs": topk_idxs, "topk_scores": topk_scores}
 
 
 @torch.inference_mode()

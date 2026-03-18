@@ -7,9 +7,21 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 
 from .linear import em_update_obs_precision_rankspace, linear_mmse_exact, vamp_rankspace_error
-from .polish.block_cd import BlockCDConfig, E8P12Provider, UniformScalarProvider, block_coordinate_descent_rankspace
-from .priors.e8p12 import prior_scale_from_center, vamp_vector_discrete_mmse_e8p12, vamp_vector_map_e8p12
-from .priors.uniform import dequant_from_q, discrete_uniform_mmse, nearest_atom_idx
+from .polish.block_cd import (
+    BlockCDConfig,
+    E8P12Provider,
+    E8P12TopKProvider,
+    UniformScalarProvider,
+    UniformTopKProvider,
+    block_coordinate_descent_rankspace,
+)
+from .priors.e8p12 import (
+    prior_scale_from_center,
+    vamp_vector_discrete_mmse_e8p12,
+    vamp_vector_map_e8p12,
+    vamp_vector_map_topk_e8p12,
+)
+from .priors.uniform import dequant_from_q, discrete_uniform_mmse, nearest_atom_idx, uniform_map_topk
 from .utils import (
     alpha_valid_mask,
     log_damp_positive,
@@ -35,6 +47,8 @@ class UniformVampConfig:
     em_obs_precision_min: float = 1e-4
     em_obs_precision_max: float = 1e8
     polish_sweeps: int = 3
+    polish_mode: str = "block_cd"  # "none" | "block_cd" | "topk_block_cd"
+    topk_k: int = 8
 
 
 @dataclass(frozen=True)
@@ -55,59 +69,11 @@ class E8P12VampConfig:
     em_obs_precision_max: float = 1e8
     blocks_per_chunk: int = 16
     polish_sweeps: int = 3
+    polish_mode: str = "block_cd"  # "none" | "block_cd" | "topk_block_cd"
     polish_metric: str = "gram"  # "gram" | "diag"
     polish_metric_rows_per_chunk: int = 0
     polish_max_blocks: int = 0
-
-
-@dataclass(frozen=True)
-class E8P12LrsVaspConfig:
-    """LRS-VASP (RS-VAMP + low-rank survey) config for QUIP E8P12.
-
-    The solver internally uses the trace-normalized Hessian Hbar, so `lambda_eff`
-    is interpreted against Hbar rather than the raw H. By default the provided
-    `lambda_eff_grid` is treated as *relative* values and scaled by an automatic
-    base precision derived from the init mismatch under Hbar.
-    """
-
-    method: str = "lrs-vasp"  # "rs-vamp" | "lrs-vasp"
-    iters: int = 16
-    rs_warmup_iters: int = 4
-    damping: float = 0.5
-
-    gamma_start: float = 1.0
-    gamma_retry_factor: float = 4.0
-    gamma_retry_steps: int = 3
-    alpha_eps: float = 1e-6
-    gamma_min: float = 1e-8
-    gamma_max: float = 1e12
-    blocks_per_chunk: int = 64
-    tol: float = 1e-4
-    prior_tau: float = 0.0
-    prior_tau_scale_mode: str = "absmax"
-
-    lambda_eff_grid: tuple[float, ...] = (0.25, 1.0, 4.0)
-    lambda_eff_scale_mode: str = "auto"  # "auto" | "none"
-
-    # Survey settings (hard blocks only).
-    enable_survey: bool = True
-    survey_L: float = 2.0
-    survey_Q: int = 9
-    survey_v1_init: float = 0.0  # <=0 means "auto"
-    survey_v1_min: float = 1e-6
-
-    # Hard-block gating (top2 gap + variance).
-    hard_gap_thresh: float = 0.5
-    hard_var_mult: float = 2.0
-    hard_max_frac: float = 0.25
-
-    backend: str = "factorized"  # "factorized" | "bruteforce"
-
-    # Optional polish (same rank-space block CD as scalar VAMP).
-    polish_sweeps: int = 0
-    polish_metric: str = "gram"  # "gram" | "diag"
-    polish_metric_rows_per_chunk: int = 0
-    polish_max_blocks: int = 0
+    topk_k: int = 8
 
 
 @torch.inference_mode()
@@ -118,6 +84,58 @@ def _rowwise_quant_mse(W: torch.Tensor, x_quant: torch.Tensor) -> torch.Tensor:
 @torch.inference_mode()
 def _global_quant_mse(W: torch.Tensor, x_quant: torch.Tensor) -> float:
     return float((W - x_quant).square().mean().clamp_min_(1e-12).item())
+
+
+@torch.inference_mode()
+def _e8p12_block_debug_stats(
+    *,
+    r1: torch.Tensor,  # (B, n)
+    gamma1: torch.Tensor,  # (B, 1) or (B, n_blocks, 1|8)
+    cb: object,
+    blocks_per_chunk: int,
+    prior_center_blocks: Optional[torch.Tensor],
+    prior_scale_blocks: Optional[torch.Tensor],
+    prior_tau: float,
+    prior_tau_scale_mode: str,
+) -> Dict[str, torch.Tensor]:
+    """Return per-block diagnostics at a VAMP fixed point.
+
+    Intended for post-hoc analysis (changed-by-polish, selector recall, etc.).
+    All outputs are float32 tensors on the same device as `r1`.
+    """
+    B, n = r1.shape
+    codesz = int(getattr(cb, "codesz", 8))
+    if codesz != 8 or (n % codesz) != 0:
+        raise ValueError(f"E8P12 debug expects n divisible by 8; got n={n}, codesz={codesz}.")
+    nblocks = n // codesz
+
+    post = vamp_vector_discrete_mmse_e8p12(
+        r1_blocks=r1.reshape(B, nblocks, codesz),
+        gamma1=gamma1,
+        cb=cb,
+        blocks_per_chunk=int(blocks_per_chunk),
+        need_stats=False,
+        need_var_diag=False,
+        prior_center_blocks=prior_center_blocks,
+        prior_scale_blocks=prior_scale_blocks,
+        prior_tau=float(prior_tau),
+        prior_tau_scale_mode=str(prior_tau_scale_mode),
+        return_logZ_blocks=False,
+        return_margin_blocks=True,
+        return_entropy_blocks=True,
+    )
+    gap = post.get("margin_blocks")
+    ent = post.get("entropy_blocks")
+    if gap is None or ent is None:
+        raise RuntimeError("E8P12 oracle did not return margin_blocks/entropy_blocks for debug.")
+
+    var1 = post["var1"].to(dtype=torch.float32)
+    cov_trace = (8.0 * var1).to(dtype=torch.float32)
+    return {
+        "top2_gap": gap.to(dtype=torch.float32),
+        "entropy": ent.to(dtype=torch.float32),
+        "cov_trace": cov_trace,
+    }
 
 
 @torch.inference_mode()
@@ -139,97 +157,185 @@ def _resolve_obs_precision(
 
 
 @torch.inference_mode()
-def resolve_e8p12_lrs_lambda_eff_grid(
+def _resolve_polish_mode(*, sweeps: int, mode: str) -> str:
+    if int(sweeps) <= 0:
+        return "none"
+    mode_norm = str(mode or "block_cd").strip().lower()
+    if mode_norm in {"none", "off"}:
+        return "none"
+    if mode_norm in {"block_cd", "cd", "full_cd"}:
+        return "block_cd"
+    if mode_norm in {"topk_block_cd", "topk_cd", "topk", "vamp_topk"}:
+        return "topk_block_cd"
+    raise ValueError(f"unsupported polish_mode={mode!r}; expected none|block_cd|topk_block_cd.")
+
+
+@torch.inference_mode()
+def _resolve_e8p12_polish_metric(metric: str) -> str:
+    polish_metric = str(metric or "gram").strip().lower()
+    if polish_metric in ("isotropic", "diag"):
+        return "diag"
+    if polish_metric == "gram":
+        return "gram"
+    raise ValueError(f"unsupported polish_metric={metric!r}; expected 'gram'|'diag'.")
+
+
+@torch.inference_mode()
+def build_uniform_vamp_topk_candidates(
     *,
-    Wr: torch.Tensor,  # (M,n)
-    hatWr_init: torch.Tensor,  # (M,n)
+    r1: torch.Tensor,
+    gamma1: torch.Tensor,
+    W: torch.Tensor,
+    scale_full: torch.Tensor,
+    zero_full: torch.Tensor,
+    maxq: int,
+    prior_tau: float,
+    k: int,
+    atoms: Optional[torch.Tensor] = None,
+) -> Dict[str, torch.Tensor]:
+    return uniform_map_topk(
+        r1=r1,
+        gamma1=gamma1,
+        scale_full=scale_full,
+        zero_full=zero_full,
+        maxq=maxq,
+        prior_center=W,
+        prior_tau=float(prior_tau),
+        k=max(int(k), 1),
+        atoms=atoms,
+    )
+
+
+@torch.inference_mode()
+def build_e8p12_vamp_topk_candidates(
+    *,
+    r1: torch.Tensor,
+    gamma1: torch.Tensor,
+    Wr: torch.Tensor,
     cb: object,
-    S: torch.Tensor,  # (n,)
-    Vs: torch.Tensor,  # (n,n)
-    cfg: E8P12LrsVaspConfig,
-    sample_rows: int = 32,
-) -> tuple[tuple[float, ...], Dict[str, float]]:
-    """Resolve an absolute `lambda_eff_grid` for LRS solvers.
-
-    When `cfg.lambda_eff_scale_mode == "auto"`, the user-provided grid is treated
-    as *relative* values and scaled by an estimated base precision derived from
-    the init mismatch under Hbar and the RS denoiser divergence at init.
-
-    This helper is intended to be called once per module (before row chunking)
-    so that all chunks use a consistent lambda scale.
-    """
-    scale_mode = str(cfg.lambda_eff_scale_mode or "auto").strip().lower()
-    raw_grid = tuple(float(x) for x in (cfg.lambda_eff_grid or (1.0,)))
-    if not raw_grid:
-        raw_grid = (1.0,)
-    if scale_mode == "none":
-        return raw_grid, {}
-    if scale_mode != "auto":
-        raise ValueError(f"unknown lambda_eff_scale_mode={scale_mode!r} (expected 'auto'|'none')")
-
-    Wr = Wr.to(dtype=torch.float32)
-    hatWr_init = hatWr_init.to(dtype=torch.float32)
-    M, n = Wr.shape
+    blocks_per_chunk: int,
+    prior_tau: float,
+    prior_tau_scale_mode: str,
+    k: int,
+) -> Dict[str, torch.Tensor]:
+    B, n = Wr.shape
     codesz = int(getattr(cb, "codesz", 8))
     if codesz != 8 or (n % codesz) != 0:
-        raise ValueError(f"E8P12 solver expects n divisible by 8; got n={n}, codesz={codesz}.")
+        raise ValueError(f"E8P12 top-k expects n divisible by 8; got n={n}, codesz={codesz}.")
     nblocks = n // codesz
-
-    # Trace-normalize Hbar: Vsbar = Vs / sqrt(tr(H)/n).
-    eigs = S.to(dtype=torch.float32).square()
-    trace_avg = float(eigs.mean().clamp_min_(1e-30).item()) if eigs.numel() else 1.0
-    Vsbar = Vs.to(dtype=torch.float32) / float(trace_avg) ** 0.5
-
-    # Estimate alpha1 at init on a small deterministic sample of rows.
-    sample_rows = min(int(sample_rows), int(M))
-    if sample_rows <= 0:
-        sample_rows = int(M)
-    rb = slice(0, sample_rows)
-    w_s = Wr[rb]
-    r1_s = hatWr_init[rb]
-
-    # Use the same deterministic sample for the init mismatch estimate. This
-    # avoids over-penalizing outlier rows when selecting a single module-wide
-    # lambda scale.
-    diff_u = (w_s - r1_s).matmul(Vsbar)
-    mse_u = float(diff_u.square().mean().clamp_min_(1e-12).item())
-    lambda_init = float(1.0 / mse_u)
-
-    gamma1_s = float(cfg.gamma_start) * (0.25 / _rowwise_quant_mse(w_s, r1_s))
-
-    prior_tau = float(cfg.prior_tau)
-    prior_tau_scale_mode = str(cfg.prior_tau_scale_mode or "absmax").strip().lower()
-    prior_center_blocks = w_s.reshape(sample_rows, nblocks, codesz) if prior_tau > 0.0 else None
+    W_blocks = Wr.reshape(B, nblocks, codesz)
     prior_scale_blocks = None
-    if prior_tau > 0.0 and prior_center_blocks is not None:
-        prior_scale_blocks = prior_scale_from_center(prior_center_blocks, prior_tau_scale_mode)
-
-    post = vamp_vector_discrete_mmse_e8p12(
-        r1_blocks=r1_s.reshape(sample_rows, nblocks, codesz),
-        gamma1=gamma1_s,
+    if float(prior_tau) > 0.0:
+        prior_scale_blocks = prior_scale_from_center(W_blocks, prior_tau_scale_mode)
+    return vamp_vector_map_topk_e8p12(
+        r1_blocks=r1.reshape(B, nblocks, codesz),
+        gamma1=gamma1,
         cb=cb,
-        blocks_per_chunk=int(cfg.blocks_per_chunk),
-        need_stats=False,
-        need_var_diag=False,
-        prior_center_blocks=prior_center_blocks,
+        k=max(int(k), 1),
+        blocks_per_chunk=max(int(blocks_per_chunk), 1),
+        prior_center_blocks=W_blocks if float(prior_tau) > 0.0 else None,
         prior_scale_blocks=prior_scale_blocks,
-        prior_tau=prior_tau,
-        prior_tau_scale_mode=prior_tau_scale_mode,
+        prior_tau=float(prior_tau),
+        prior_tau_scale_mode=str(prior_tau_scale_mode),
     )
-    alpha1_s = post["alpha1"]  # type: ignore[assignment]
-    alpha_eps = float(cfg.alpha_eps)
-    alpha1_mean = float(torch.nan_to_num(alpha1_s, nan=0.5).clamp(min=alpha_eps, max=1.0 - alpha_eps).mean().item())
 
-    lambda_base = float(lambda_init / max(alpha1_mean, alpha_eps))
-    abs_grid = tuple(float(lambda_base) * float(x) for x in raw_grid)
-    stats = {
-        "trace_avg": float(trace_avg),
-        "init_mse_u": float(mse_u),
-        "lambda_init": float(lambda_init),
-        "alpha1_init_mean": float(alpha1_mean),
-        "lambda_eff_base": float(lambda_base),
-    }
-    return abs_grid, stats
+
+@torch.inference_mode()
+def polish_uniform_rankspace(
+    *,
+    x_init: torch.Tensor,
+    Y_u: torch.Tensor,
+    Vs: torch.Tensor,
+    scale_full: torch.Tensor,
+    zero_full: torch.Tensor,
+    maxq: int,
+    sweeps: int,
+    polish_mode: str,
+    topk_values: Optional[torch.Tensor] = None,
+    topk_q: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
+    mode = _resolve_polish_mode(sweeps=int(sweeps), mode=str(polish_mode))
+    x_work = x_init.to(dtype=torch.float32)
+    if mode == "none" or Vs.numel() == 0:
+        q_int = nearest_atom_idx(x=x_work, scale_full=scale_full, zero_full=zero_full, maxq=maxq).to(dtype=torch.int32)
+        x_out = dequant_from_q(q_int=q_int, scale_full=scale_full, zero_full=zero_full)
+        err = vamp_rankspace_error(Y_u=Y_u, x=x_out, Vs=Vs)
+        return q_int, x_out, err, {"accepted_updates": 0.0}
+
+    if mode == "topk_block_cd":
+        if topk_values is None:
+            raise ValueError("topk_block_cd requires topk_values for uniform polish.")
+        provider = UniformTopKProvider(topk_values=topk_values, topk_q=topk_q)
+    else:
+        provider = UniformScalarProvider(scale=scale_full, zero=zero_full, maxq=maxq)
+
+    x_polished, q_topk, polish_stats = block_coordinate_descent_rankspace(
+        x=x_work,
+        Y_u=Y_u,
+        Vs=Vs,
+        block_size=1,
+        provider=provider,
+        cfg=BlockCDConfig(sweeps=int(sweeps), metric="diag", accept_tol=0.0, order_mode="greedy_gain"),
+    )
+    if q_topk is not None:
+        q_polished = q_topk.to(dtype=torch.int32)
+    else:
+        q_polished = nearest_atom_idx(x=x_polished, scale_full=scale_full, zero_full=zero_full, maxq=maxq).to(dtype=torch.int32)
+    x_out = dequant_from_q(q_int=q_polished, scale_full=scale_full, zero_full=zero_full)
+    err = vamp_rankspace_error(Y_u=Y_u, x=x_out, Vs=Vs)
+    return q_polished, x_out, err, polish_stats
+
+
+@torch.inference_mode()
+def polish_e8p12_rankspace(
+    *,
+    x_init: torch.Tensor,
+    idxs_init: torch.Tensor,
+    Y_u: torch.Tensor,
+    Vs: torch.Tensor,
+    cb: object,
+    sweeps: int,
+    polish_mode: str,
+    polish_metric: str,
+    metric_rows_per_chunk: int = 0,
+    polish_max_blocks: int = 0,
+    topk_idxs: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
+    mode = _resolve_polish_mode(sweeps=int(sweeps), mode=str(polish_mode))
+    metric_norm = _resolve_e8p12_polish_metric(str(polish_metric))
+    x_work = x_init.to(dtype=torch.float32)
+    if mode == "none" or Vs.numel() == 0:
+        err = vamp_rankspace_error(Y_u=Y_u, x=x_work, Vs=Vs)
+        return x_work, idxs_init, err, {"accepted_updates": 0.0}
+
+    if mode == "topk_block_cd":
+        if topk_idxs is None:
+            raise ValueError("topk_block_cd requires topk_idxs for E8P12 polish.")
+        provider = E8P12TopKProvider(cb=cb, topk_idxs=topk_idxs)
+    else:
+        provider = E8P12Provider(cb=cb, metric_rows_per_chunk=int(metric_rows_per_chunk))
+
+    codesz = int(getattr(cb, "codesz", 8))
+    x_out, idxs_out, polish_stats = block_coordinate_descent_rankspace(
+        x=x_work,
+        Y_u=Y_u,
+        Vs=Vs,
+        block_size=codesz,
+        provider=provider,
+        cfg=BlockCDConfig(
+            sweeps=int(sweeps),
+            metric="gram" if metric_norm == "gram" else "diag",
+            accept_tol=0.0,
+            metric_rows_per_chunk=int(metric_rows_per_chunk),
+            max_blocks_per_sweep=int(polish_max_blocks),
+            order_mode="greedy_gain",
+        ),
+        idxs_init=idxs_init,
+    )
+    if idxs_out is None:
+        raise RuntimeError("E8P12 polish must return block indices.")
+    err = vamp_rankspace_error(Y_u=Y_u, x=x_out, Vs=Vs)
+    return x_out, idxs_out, err, polish_stats
 
 
 @torch.inference_mode()
@@ -247,6 +353,7 @@ def solve_uniform_rankspace_vamp(
     cfg: UniformVampConfig,
     obs_precision_init: Optional[float] = None,
     log_stats: bool = True,
+    debug_out: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
     """Scalar uniform exact-full VAMP in rank space (MMSE x1), with optional polish.
 
@@ -304,6 +411,7 @@ def solve_uniform_rankspace_vamp(
     alpha2_values = []
     entropy_values = []
     margin_values = []
+    iter_logs = [] if debug_out is not None else None
     alpha1_retry_count = 0
     alpha2_clip_count = 0
     gamma2_invalid_count = 0
@@ -312,7 +420,7 @@ def solve_uniform_rankspace_vamp(
     gamma_retry_factor = max(float(cfg.gamma_retry_factor), 1.000001)
     gamma_retry_steps = max(int(cfg.gamma_retry_steps), 0)
 
-    for _ in range(iters):
+    for it in range(iters):
         gamma1_work = gamma1
         post = None
         alpha1 = None
@@ -419,6 +527,19 @@ def solve_uniform_rankspace_vamp(
         if log_stats:
             entropy_values.append(float(post["entropy"]))  # type: ignore[arg-type]
             margin_values.append(float(post["margin"]))  # type: ignore[arg-type]
+        if iter_logs is not None:
+            gap = float(((x1 - x2).norm() / (x2.norm().clamp_min(1e-12))).item())
+            iter_logs.append(
+                {
+                    "iter": int(it),
+                    "alpha1": float(alpha1.mean().item()),
+                    "alpha2": float(alpha2.mean().item()),
+                    "gamma1": float(gamma1.mean().item()),
+                    "gamma2": float(gamma2.mean().item()),
+                    "obs_precision": float(obs_precision_local),
+                    "gap": float(gap),
+                }
+            )
 
     final_post = discrete_uniform_mmse(
         r1=r1,
@@ -442,21 +563,37 @@ def solve_uniform_rankspace_vamp(
     err_final = vamp_rankspace_error(Y_u=Y_u, x=x_final, Vs=Vs)
 
     polish_sweeps = max(int(cfg.polish_sweeps), 0)
+    polish_mode = _resolve_polish_mode(sweeps=polish_sweeps, mode=str(getattr(cfg, "polish_mode", "block_cd")))
+    topk_k = max(int(getattr(cfg, "topk_k", 8) or 8), 1)
     polish_gain = 0.0
     polish_updates = 0.0
-    if polish_sweeps > 0 and Vs.numel() > 0:
+    if polish_mode != "none" and Vs.numel() > 0:
         err_before = vamp_rankspace_error(Y_u=Y_u, x=x_final, Vs=Vs)
-        x_polished, _, polish_stats = block_coordinate_descent_rankspace(
-            x=x_final,
+        topk = None
+        if polish_mode == "topk_block_cd":
+            topk = build_uniform_vamp_topk_candidates(
+                r1=r1,
+                gamma1=gamma1,
+                W=W,
+                scale_full=scale_full,
+                zero_full=zero_full,
+                maxq=maxq,
+                prior_tau=prior_tau,
+                k=topk_k,
+                atoms=atoms,
+            )
+        q_polished, x_polished, err_after, polish_stats = polish_uniform_rankspace(
+            x_init=x_final,
             Y_u=Y_u,
             Vs=Vs,
-            block_size=1,
-            provider=UniformScalarProvider(scale=scale_full, zero=zero_full, maxq=maxq),
-            cfg=BlockCDConfig(sweeps=polish_sweeps, metric="diag", accept_tol=0.0, order_mode="greedy_gain"),
+            scale_full=scale_full,
+            zero_full=zero_full,
+            maxq=maxq,
+            sweeps=polish_sweeps,
+            polish_mode=polish_mode,
+            topk_values=None if topk is None else topk["topk_values"],
+            topk_q=None if topk is None else topk["topk_q"],
         )
-        q_polished = nearest_atom_idx(x=x_polished, scale_full=scale_full, zero_full=zero_full, maxq=maxq).to(dtype=torch.int32)
-        x_polished = dequant_from_q(q_int=q_polished, scale_full=scale_full, zero_full=zero_full)
-        err_after = vamp_rankspace_error(Y_u=Y_u, x=x_polished, Vs=Vs)
         improve = err_after + 1e-12 < err_before
         if bool(improve.any().item()):
             polish_gain = float((err_before - err_after).mean().item())
@@ -464,6 +601,13 @@ def solve_uniform_rankspace_vamp(
             x_final = torch.where(improve.unsqueeze(-1), x_polished, x_final)
             err_final = torch.where(improve, err_after, err_final)
         polish_updates = float(polish_stats.get("accepted_updates", 0.0))
+
+    if debug_out is not None:
+        debug_out["solver"] = "uniform_exact_vamp"
+        debug_out["q_pre_polish"] = q_final.detach().to(device="cpu")
+        debug_out["r1"] = r1.detach().to(device="cpu")
+        debug_out["gamma1"] = gamma1.detach().to(device="cpu")
+        debug_out["W"] = W.detach().to(device="cpu")
 
     rtn_err = vamp_rankspace_error(Y_u=Y_u, x=x_rtn, Vs=Vs)
 
@@ -489,6 +633,8 @@ def solve_uniform_rankspace_vamp(
         "mean_margin": float(sum(margin_values) / len(margin_values)) if margin_values else 0.0,
         "final_decision": str(final_decision),
         "polish_sweeps": int(polish_sweeps),
+        "polish_mode": str(polish_mode),
+        "topk_k": int(topk_k),
         "polish_gain": float(polish_gain),
         "polish_updates": float(polish_updates),
         "rankspace_error_mean": float(err_final.mean().item()) if err_final.numel() else 0.0,
@@ -531,6 +677,7 @@ def solve_e8p12_rankspace_vamp(
     module_name: str = "",
     obs_precision_init: Optional[float] = None,
     log_stats: bool = True,
+    debug_out: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
     """Scalar-precision VAMP for QUIP E8P12 in rank space, with optional rank-space polish."""
     Wr = Wr.to(dtype=torch.float32)
@@ -578,6 +725,7 @@ def solve_e8p12_rankspace_vamp(
     alpha2_values = []
     entropy_values = []
     margin_values = []
+    iter_logs = [] if debug_out is not None else None
     alpha1_retry_count = 0
     alpha2_clip_count = 0
     gamma2_invalid_count = 0
@@ -586,7 +734,7 @@ def solve_e8p12_rankspace_vamp(
     gamma_retry_factor = max(float(cfg.gamma_retry_factor), 1.000001)
     gamma_retry_steps = max(int(cfg.gamma_retry_steps), 0)
 
-    for _ in range(iters):
+    for it in range(iters):
         gamma1_work = gamma1
         post = None
         alpha1 = None
@@ -694,6 +842,19 @@ def solve_e8p12_rankspace_vamp(
         if log_stats:
             entropy_values.append(float(post["entropy"]))  # type: ignore[arg-type]
             margin_values.append(float(post["margin"]))  # type: ignore[arg-type]
+        if iter_logs is not None:
+            gap = float(((x1 - x2).norm() / (x2.norm().clamp_min(1e-12))).item())
+            iter_logs.append(
+                {
+                    "iter": int(it),
+                    "alpha1": float(alpha1.mean().item()),
+                    "alpha2": float(alpha2.mean().item()),
+                    "gamma1": float(gamma1.mean().item()),
+                    "gamma2": float(gamma2.mean().item()),
+                    "obs_precision": float(obs_precision_local),
+                    "gap": float(gap),
+                }
+            )
 
     final_post = vamp_vector_map_e8p12(
         r1_blocks=r1.reshape(B, nblocks, codesz),
@@ -710,37 +871,71 @@ def solve_e8p12_rankspace_vamp(
     final_Qidxs = final_post["map_idxs"].to(dtype=getattr(cb, "idx_dtype", torch.int64))
     final_err = vamp_rankspace_error(Y_u=Y_u, x=final_hatWr, Vs=Vs)
 
+    if debug_out is not None:
+        dbg_stats = _e8p12_block_debug_stats(
+            r1=r1,
+            gamma1=gamma1,
+            cb=cb,
+            blocks_per_chunk=blocks_per_chunk,
+            prior_center_blocks=W_blocks if prior_tau > 0.0 else None,
+            prior_scale_blocks=prior_scale_blocks,
+            prior_tau=prior_tau,
+            prior_tau_scale_mode=prior_tau_scale_mode,
+        )
+        debug_out["solver"] = "e8p12_exact_vamp"
+        debug_out["idxs_pre_polish"] = final_Qidxs.detach().to(device="cpu")
+        debug_out["r1"] = r1.detach().to(device="cpu")
+        debug_out["gamma1"] = gamma1.detach().to(device="cpu")
+        debug_out["W"] = Wr.detach().to(device="cpu")
+        debug_out["block_stats"] = {k: v.detach().to(device="cpu") for k, v in dbg_stats.items()}
+        debug_out["iter_logs"] = iter_logs if iter_logs is not None else []
+
     polish_sweeps = max(int(cfg.polish_sweeps), 0)
-    polish_metric = str(cfg.polish_metric or "gram").strip().lower()
-    if polish_metric in ("isotropic", "diag"):
-        polish_metric = "diag"
-    elif polish_metric != "gram":
-        raise ValueError(f"unsupported polish_metric={polish_metric!r}; expected 'gram'|'diag'.")
+    polish_mode = _resolve_polish_mode(sweeps=polish_sweeps, mode=str(getattr(cfg, "polish_mode", "block_cd")))
+    polish_metric = _resolve_e8p12_polish_metric(str(cfg.polish_metric or "gram"))
+    topk_k = max(int(getattr(cfg, "topk_k", 8) or 8), 1)
 
     polish_gain = 0.0
     polish_updates = 0.0
-    if polish_sweeps > 0 and Vs.numel() > 0:
+    if polish_mode != "none" and Vs.numel() > 0:
         err_before = vamp_rankspace_error(Y_u=Y_u, x=final_hatWr, Vs=Vs)
-        final_hatWr, final_Qidxs, polish_stats = block_coordinate_descent_rankspace(
-            x=final_hatWr,
+        topk = None
+        if polish_mode == "topk_block_cd":
+            topk = build_e8p12_vamp_topk_candidates(
+                r1=r1,
+                gamma1=gamma1,
+                Wr=Wr,
+                cb=cb,
+                blocks_per_chunk=blocks_per_chunk,
+                prior_tau=prior_tau,
+                prior_tau_scale_mode=prior_tau_scale_mode,
+                k=topk_k,
+            )
+        final_hatWr, final_Qidxs, err_after, polish_stats = polish_e8p12_rankspace(
+            x_init=final_hatWr,
+            idxs_init=final_Qidxs,
             Y_u=Y_u,
             Vs=Vs,
-            block_size=codesz,
-            provider=E8P12Provider(cb=cb, metric_rows_per_chunk=int(cfg.polish_metric_rows_per_chunk)),
-            cfg=BlockCDConfig(
-                sweeps=polish_sweeps,
-                metric="gram" if polish_metric == "gram" else "diag",
-                accept_tol=0.0,
-                metric_rows_per_chunk=int(cfg.polish_metric_rows_per_chunk),
-                max_blocks_per_sweep=int(getattr(cfg, "polish_max_blocks", 0) or 0),
-                order_mode="greedy_gain",
-            ),
-            idxs_init=final_Qidxs,
+            cb=cb,
+            sweeps=polish_sweeps,
+            polish_mode=polish_mode,
+            polish_metric=polish_metric,
+            metric_rows_per_chunk=int(cfg.polish_metric_rows_per_chunk),
+            polish_max_blocks=int(getattr(cfg, "polish_max_blocks", 0) or 0),
+            topk_idxs=None if topk is None else topk["topk_idxs"].to(device="cpu", dtype=torch.long),
         )
-        err_after = vamp_rankspace_error(Y_u=Y_u, x=final_hatWr, Vs=Vs)
         polish_gain = float((err_before - err_after).mean().item())
         polish_updates = float(polish_stats.get("accepted_updates", 0.0))
         final_err = err_after
+        if debug_out is not None and topk is not None:
+            debug_out["topk_idxs"] = topk["topk_idxs"].detach().to(device="cpu")
+
+    if debug_out is not None:
+        idxs_pre = debug_out.get("idxs_pre_polish")
+        idxs_post = final_Qidxs.detach().to(device="cpu")
+        debug_out["idxs_post_polish"] = idxs_post
+        if isinstance(idxs_pre, torch.Tensor) and idxs_pre.shape == idxs_post.shape:
+            debug_out["changed_mask"] = (idxs_pre != idxs_post)
 
     stats: Dict[str, Any] = {
         "solver": "e8p12_exact_vamp",
@@ -766,266 +961,11 @@ def solve_e8p12_rankspace_vamp(
         "mean_margin": float(sum(margin_values) / len(margin_values)) if margin_values else 0.0,
         "blocks_per_chunk": int(blocks_per_chunk),
         "polish_sweeps": int(polish_sweeps),
+        "polish_mode": str(polish_mode),
         "polish_metric": str(polish_metric),
+        "topk_k": int(topk_k),
         "polish_gain": float(polish_gain),
         "polish_updates": float(polish_updates),
         "rankspace_error_mean": float(final_err.mean().item()) if final_err.numel() else 0.0,
     }
     return final_hatWr, final_Qidxs, final_err, stats
-
-
-@torch.inference_mode()
-def solve_e8p12_rankspace_lrs_vasp(
-    *,
-    Wr: torch.Tensor,  # (B, n)
-    hatWr_init: torch.Tensor,  # (B, n)
-    cb: object,
-    V: torch.Tensor,  # (n, R)
-    Vh: torch.Tensor,  # (R, n)
-    S: torch.Tensor,  # (R,)
-    Vs: torch.Tensor,  # (n, R)
-    cfg: E8P12LrsVaspConfig,
-    module_name: str = "",
-    log_per_iter: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
-    """Run RS-VAMP / LRS-VASP on trace-normalized Hbar and score on the raw surrogate."""
-    from lrs_vasp_ptq.rs_vamp import RsVampConfig, run_rs_vamp_e8p12_rankspace
-    from lrs_vasp_ptq.survey_vamp import LrsVaspConfig, run_lrs_vasp_e8p12_rankspace
-
-    Wr = Wr.to(dtype=torch.float32)
-    hatWr_init = hatWr_init.to(dtype=torch.float32)
-
-    B, n = Wr.shape
-    codesz = int(getattr(cb, "codesz", 8))
-    if codesz != 8 or (n % codesz) != 0:
-        raise ValueError(f"E8P12 solver expects n divisible by 8; got n={n}, codesz={codesz}.")
-
-    # Diagnostics for Hbar init mismatch energy (not used by default scale).
-    eigs = S.to(dtype=torch.float32).square()
-    trace_avg = float(eigs.mean().clamp_min_(1e-30).item()) if eigs.numel() else 1.0
-    Vsbar = Vs.to(dtype=torch.float32) / float(trace_avg) ** 0.5
-    diff_u = (Wr - hatWr_init).matmul(Vsbar)
-    mse_u = float(diff_u.square().mean().clamp_min_(1e-12).item())
-
-    gamma1_init = float(cfg.gamma_start) * (0.25 / _rowwise_quant_mse(Wr, hatWr_init))
-    gamma1_init_mean = float(gamma1_init.mean().item())
-    lambda_base = float(gamma1_init_mean)
-    lambda_base_mode = "gamma1_init_mean"
-    gamma2_init_mean = 0.0
-    alpha1_init_mean = 0.0
-
-    scale_mode = str(cfg.lambda_eff_scale_mode or "auto").strip().lower()
-    raw_grid = tuple(float(x) for x in (cfg.lambda_eff_grid or (1.0,)))
-    if not raw_grid:
-        raw_grid = (1.0,)
-    if scale_mode == "auto":
-        # More robust auto scaling: initialize lambda_eff from the *extrinsic*
-        # linear-module precision implied by the RS denoiser at r1_init.
-        #
-        # With trace-normalized Hbar (mean eigenvalue ~= 1), the linear module's
-        # denom is (lambda_eff * eig + gamma2). Setting lambda_eff on the same
-        # order as gamma2 avoids alpha2 collapse and tends to be a better
-        # starting scale than gamma1_init or Hbar mismatch alone.
-        from lrs_vasp_ptq.denoisers.e8p_exact import rs_posterior_blocks
-
-        W_blocks = Wr.reshape(B, n // codesz, codesz)
-        prior_tau = float(cfg.prior_tau)
-        prior_tau_scale_mode = str(cfg.prior_tau_scale_mode or "absmax").strip().lower()
-        prior_scale_blocks = None
-        if prior_tau > 0.0:
-            prior_scale_blocks = prior_scale_from_center(W_blocks, prior_tau_scale_mode)
-
-        post = rs_posterior_blocks(
-            center_blocks=hatWr_init.reshape(B, n // codesz, codesz),
-            gamma=gamma1_init,
-            cb=cb,
-            blocks_per_chunk=int(cfg.blocks_per_chunk),
-            prior_center_blocks=W_blocks if prior_tau > 0.0 else None,
-            prior_scale_blocks=prior_scale_blocks,
-            prior_tau=prior_tau,
-            prior_tau_scale_mode=prior_tau_scale_mode,
-            return_var_diag=False,
-            return_logZ=False,
-            return_top2=False,
-            backend=str(cfg.backend),
-        )
-        cov_trace = post["cov_trace"]  # (B,nblocks)
-        alpha_eps = float(cfg.alpha_eps)
-        alpha1_init = (gamma1_init * cov_trace).sum(dim=1, keepdim=True) / float(n)
-        alpha1_init = torch.nan_to_num(alpha1_init, nan=0.5, posinf=1.0 - alpha_eps, neginf=alpha_eps).clamp(
-            min=alpha_eps, max=1.0 - alpha_eps
-        )
-        eta1_init = gamma1_init / alpha1_init
-        gamma2_init = torch.nan_to_num(
-            eta1_init - gamma1_init,
-            nan=float(cfg.gamma_min),
-            posinf=float(cfg.gamma_max),
-            neginf=float(cfg.gamma_min),
-        ).clamp(min=float(cfg.gamma_min), max=float(cfg.gamma_max))
-        alpha1_init_mean = float(alpha1_init.mean().item())
-        gamma2_init_mean = float(gamma2_init.mean().item())
-
-        # Scale 1/mse(init) by 1/alpha1_init to account for the VAMP extrinsic
-        # normalization (r2, gamma2) implied by the denoiser at init.
-        lambda_base = float((1.0 / float(mse_u)) / max(float(alpha1_init_mean), alpha_eps))
-        lambda_base_mode = "mse_u_inv_over_alpha1_init"
-        lambda_grid = tuple(float(lambda_base) * float(x) for x in raw_grid)
-    elif scale_mode == "none":
-        lambda_grid = raw_grid
-    else:
-        raise ValueError(f"unknown lambda_eff_scale_mode={scale_mode!r} (expected 'auto'|'none')")
-
-    method = str(cfg.method or "lrs-vasp").strip().lower()
-    if method not in {"rs-vamp", "lrs-vasp"}:
-        raise ValueError(f"unknown method={method!r} (expected 'rs-vamp'|'lrs-vasp')")
-
-    # Score candidates under the original (raw) rank-space surrogate.
-    Y_u = Wr.matmul(Vs.to(dtype=torch.float32))
-
-    best_hat = None
-    best_idxs = None
-    best_err = None
-    best_err_mean = float("inf")
-    best_stats: Dict[str, Any] = {}
-
-    polish_sweeps = max(int(cfg.polish_sweeps), 0)
-    polish_metric = str(cfg.polish_metric or "gram").strip().lower()
-    if polish_metric in ("isotropic", "diag"):
-        polish_metric = "diag"
-    elif polish_metric != "gram":
-        raise ValueError(f"unsupported polish_metric={polish_metric!r}; expected 'gram'|'diag'.")
-
-    for lam in lambda_grid:
-        if method == "rs-vamp" or not bool(cfg.enable_survey):
-            out = run_rs_vamp_e8p12_rankspace(
-                w=Wr,
-                r1_init=hatWr_init,
-                cb=cb,
-                V=V,
-                Vh=Vh,
-                S=S,
-                lambda_eff=float(lam),
-                cfg=RsVampConfig(
-                    max_iters=int(cfg.iters),
-                    damping=float(cfg.damping),
-                    gamma_start=float(cfg.gamma_start),
-                    gamma_retry_factor=float(cfg.gamma_retry_factor),
-                    gamma_retry_steps=int(cfg.gamma_retry_steps),
-                    alpha_eps=float(cfg.alpha_eps),
-                    gamma_min=float(cfg.gamma_min),
-                    gamma_max=float(cfg.gamma_max),
-                    blocks_per_chunk=int(cfg.blocks_per_chunk),
-                    tol=float(cfg.tol),
-                    prior_tau=float(cfg.prior_tau),
-                    prior_tau_scale_mode=str(cfg.prior_tau_scale_mode),
-                ),
-                backend=str(cfg.backend),
-                log_per_iter=bool(log_per_iter),
-            )
-            hat = out["q_hard"]
-            idxs = out["q_hard_idxs"]
-            logs = out.get("logs", [])
-            survey_meta: Dict[str, Any] = {"solver": "rs-vamp"}
-        else:
-            out = run_lrs_vasp_e8p12_rankspace(
-                w=Wr,
-                r1_init=hatWr_init,
-                cb=cb,
-                V=V,
-                Vh=Vh,
-                S=S,
-                lambda_eff=float(lam),
-                cfg=LrsVaspConfig(
-                    max_iters=int(cfg.iters),
-                    rs_warmup_iters=int(cfg.rs_warmup_iters),
-                    damping=float(cfg.damping),
-                    gamma_start=float(cfg.gamma_start),
-                    gamma_retry_factor=float(cfg.gamma_retry_factor),
-                    gamma_retry_steps=int(cfg.gamma_retry_steps),
-                    alpha_eps=float(cfg.alpha_eps),
-                    gamma_min=float(cfg.gamma_min),
-                    gamma_max=float(cfg.gamma_max),
-                    blocks_per_chunk=int(cfg.blocks_per_chunk),
-                    tol=float(cfg.tol),
-                    prior_tau=float(cfg.prior_tau),
-                    prior_tau_scale_mode=str(cfg.prior_tau_scale_mode),
-                    enable_survey=bool(cfg.enable_survey),
-                    survey_L=float(cfg.survey_L),
-                    survey_Q=int(cfg.survey_Q),
-                    survey_v1_init=float(cfg.survey_v1_init),
-                    survey_v1_min=float(cfg.survey_v1_min),
-                    hard_gap_thresh=float(cfg.hard_gap_thresh),
-                    hard_var_mult=float(cfg.hard_var_mult),
-                    hard_max_frac=float(cfg.hard_max_frac),
-                ),
-                backend=str(cfg.backend),
-                log_per_iter=bool(log_per_iter),
-            )
-            hat = out["q_hard"]
-            idxs = out["q_hard_idxs"]
-            logs = out.get("logs", [])
-            survey_meta = out.get("survey", {}) if isinstance(out.get("survey"), dict) else {"solver": "lrs-vasp"}
-
-        err = vamp_rankspace_error(Y_u=Y_u, x=hat, Vs=Vs.to(dtype=torch.float32))
-        err_mean = float(err.mean().item()) if err.numel() else 0.0
-
-        polish_gain = 0.0
-        polish_updates = 0.0
-        if polish_sweeps > 0 and Vs.numel() > 0:
-            err_before = err
-            hat, idxs, polish_stats = block_coordinate_descent_rankspace(
-                x=hat.to(dtype=torch.float32),
-                Y_u=Y_u.to(dtype=torch.float32),
-                Vs=Vs.to(dtype=torch.float32),
-                block_size=codesz,
-                provider=E8P12Provider(cb=cb, metric_rows_per_chunk=int(cfg.polish_metric_rows_per_chunk)),
-                cfg=BlockCDConfig(
-                    sweeps=polish_sweeps,
-                    metric="gram" if polish_metric == "gram" else "diag",
-                    accept_tol=0.0,
-                    metric_rows_per_chunk=int(cfg.polish_metric_rows_per_chunk),
-                    max_blocks_per_sweep=int(getattr(cfg, "polish_max_blocks", 0) or 0),
-                    order_mode="greedy_gain",
-                ),
-                idxs_init=idxs,
-            )
-            err = vamp_rankspace_error(Y_u=Y_u, x=hat, Vs=Vs.to(dtype=torch.float32))
-            err_mean = float(err.mean().item()) if err.numel() else 0.0
-            polish_gain = float((err_before - err).mean().item()) if err.numel() else 0.0
-            polish_updates = float(polish_stats.get("accepted_updates", 0.0))
-
-        if err_mean < best_err_mean:
-            best_err_mean = err_mean
-            best_hat = hat
-            best_idxs = idxs
-            best_err = err
-            best_stats = {
-                "solver": "e8p12_lrs_vasp",
-                "module": str(module_name),
-                "method": str(method),
-                "backend": str(cfg.backend),
-                "iters": int(cfg.iters),
-                "rs_warmup_iters": int(cfg.rs_warmup_iters),
-                "damping": float(cfg.damping),
-                "lambda_eff": float(lam),
-                "lambda_eff_grid": [float(x) for x in lambda_grid],
-                "lambda_eff_base": float(lambda_base),
-                "lambda_eff_base_mode": str(lambda_base_mode),
-                "lambda_eff_scale_mode": str(scale_mode),
-                "trace_avg": float(trace_avg),
-                "init_mse_u": float(mse_u),
-                "gamma1_init_mean": float(gamma1_init_mean),
-                "alpha1_init_mean": float(alpha1_init_mean),
-                "gamma2_init_mean": float(gamma2_init_mean),
-                "rankspace_error_mean": float(err_mean),
-                "survey": survey_meta,
-                "logs": logs,
-                "polish_sweeps": int(polish_sweeps),
-                "polish_metric": str(polish_metric),
-                "polish_gain": float(polish_gain),
-                "polish_updates": float(polish_updates),
-            }
-
-    if best_hat is None or best_idxs is None or best_err is None:
-        raise RuntimeError("LRS-VASP failed to produce a candidate solution")
-    return best_hat, best_idxs, best_err, best_stats

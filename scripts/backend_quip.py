@@ -16,6 +16,10 @@ import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 QUIP_ROOT = REPO_ROOT / "third_party" / "quip-sharp"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from mpgq.combo import QuantCombo, make_combo
 
 
 def _git_head(path: Path) -> str:
@@ -82,7 +86,8 @@ def _run_logged(
     log_fh = None
     if log_path is not None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_fh = log_path.open("w", encoding="utf-8")
+        log_fh = log_path.open("a", encoding="utf-8")
+        log_fh.write(f"\n# --- run {time.strftime('%Y-%m-%d %H:%M:%S')} cmd: {' '.join(cmd)}\n")
 
     proc = subprocess.Popen(
         cmd,
@@ -244,12 +249,71 @@ def _maybe_run_hessians(args, *, hessian_dir: Path, env: Dict[str, str], log_dir
     return float(time.time() - t0)
 
 
+def _route_native_quip(combo: QuantCombo) -> tuple[str, int]:
+    if combo.solver == "ldlq_tune10":
+        return "quip", 10
+    if combo.solver == "ldlq" and combo.polish_mode == "none":
+        return "quip", 0
+    return "mpgq", 0
+
+
+def _resolve_quip_combo(args) -> tuple[QuantCombo, str]:
+    quant_solver = getattr(args, "quant_solver", None)
+    if quant_solver is not None:
+        combo = make_combo(
+            backend=str(getattr(args, "quant_backend", "quip")),
+            codebook=str(getattr(args, "quant_codebook", "e8p12")),
+            preprocess=str(getattr(args, "quant_preprocess", "none")),
+            rotation=str(getattr(args, "quant_rotation", "had")),
+            solver=str(quant_solver),
+            polish_mode=str(getattr(args, "quant_polish_mode", "none")),
+            topk_source=str(getattr(args, "quant_topk_source", "aux_vamp")),
+        )
+        return combo, "combo"
+
+    method = str(getattr(args, "method", "") or "").strip().lower()
+    if method == "quip":
+        solver = "ldlq_tune10" if int(getattr(args, "quip_tune_iters", 10)) == 10 else "ldlq"
+        combo = make_combo(
+            backend="quip",
+            codebook="e8p12",
+            preprocess="none",
+            rotation=str(getattr(args, "quant_rotation", "had")),
+            solver=solver,
+            polish_mode="none",
+        )
+        return combo, method
+    if method == "quip+mpgq":
+        legacy_method = str(getattr(args, "mpgq_method", "vamp") or "vamp").strip().lower()
+        polish_mode = "topk_block_cd" if legacy_method == "vamp-topk-polish" else "block_cd"
+        if int(getattr(args, "mpgq_polish_sweeps", 3) or 0) <= 0:
+            polish_mode = "none"
+        combo = make_combo(
+            backend="quip",
+            codebook="e8p12",
+            preprocess="none",
+            rotation=str(getattr(args, "quant_rotation", "had")),
+            solver="vamp",
+            polish_mode=polish_mode,
+        )
+        return combo, method
+
+    combo = make_combo(
+        backend=str(getattr(args, "quant_backend", "quip")),
+        codebook=str(getattr(args, "quant_codebook", "e8p12")),
+        preprocess=str(getattr(args, "quant_preprocess", "none")),
+        rotation=str(getattr(args, "quant_rotation", "had")),
+        solver=str(getattr(args, "quant_solver", "ldlq_tune10")),
+        polish_mode=str(getattr(args, "quant_polish_mode", "none")),
+        topk_source=str(getattr(args, "quant_topk_source", "aux_vamp")),
+    )
+    return combo, "default"
+
+
 def run(args) -> Dict[str, Any]:
     _apply_patches()
-
-    method = str(args.method).strip().lower()
-    if method not in {"quip", "quip+mpgq"}:
-        raise ValueError(f"unsupported method={method!r} for backend_quip")
+    combo, request_source = _resolve_quip_combo(args)
+    solver_mode, native_tune_iters = _route_native_quip(combo)
 
     exp_dir = Path(args.output_dir).resolve()
     log_dir = exp_dir / "log"
@@ -269,11 +333,15 @@ def run(args) -> Dict[str, Any]:
     # Ensure Hessians exist once per (seed, base_model, devset).
     hessian_s = _maybe_run_hessians(args, hessian_dir=hessian_dir, env=env, log_dir=log_dir)
 
-    solver = "quip" if method == "quip" else "mpgq"
+    quant_entry = [sys.executable, "-m", "quantize_llama.quantize_finetune_llama"]
+    if solver_mode == "mpgq":
+        quant_entry = [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "quantize_llama_mpgq_wrapper.py"),
+        ]
+
     quant_cmd = [
-        sys.executable,
-        "-m",
-        "quantize_llama.quantize_finetune_llama",
+        *quant_entry,
         "--save_path",
         str(ckpt_dir),
         "--hessian_path",
@@ -283,7 +351,9 @@ def run(args) -> Dict[str, Any]:
         "--codebook",
         str(args.codebook),
         "--solver",
-        solver,
+        solver_mode,
+        "--quip_tune_iters",
+        str(int(native_tune_iters)),
         "--ft_epochs",
         "0",
         "--seed",
@@ -303,8 +373,26 @@ def run(args) -> Dict[str, Any]:
         "--sample_proc",
         str(int(args.sample_proc)),
     ]
-    if solver == "mpgq":
+    if solver_mode == "mpgq":
         quant_cmd += [
+            "--quant-backend",
+            str(combo.backend),
+            "--quant-codebook",
+            str(combo.codebook),
+            "--quant-preprocess",
+            str(combo.preprocess),
+            "--quant-rotation",
+            str(combo.rotation),
+            "--quant-solver",
+            str(combo.solver),
+            "--quant-polish-mode",
+            str(combo.polish_mode),
+            "--quant-topk-source",
+            str(combo.topk_source),
+            "--quant-topk-k",
+            str(int(getattr(args, "quant_topk_k", getattr(args, "mpgq_topk_k", 8)))),
+            "--mpgq-method",
+            str(getattr(args, "mpgq_method", "vamp")),
             "--mpgq_init",
             str(args.mpgq_init),
             "--mpgq_iters",
@@ -335,6 +423,8 @@ def run(args) -> Dict[str, Any]:
             str(int(args.mpgq_block_rows)),
             "--mpgq_metric_rows_per_chunk",
             str(int(args.mpgq_metric_rows_per_chunk)),
+            "--mpgq-topk-k",
+            str(int(getattr(args, "mpgq_topk_k", 8))),
         ]
         quant_cmd.append("--mpgq_em_obs_precision" if bool(args.mpgq_em_obs_precision) else "--no-mpgq_em_obs_precision")
 
@@ -383,18 +473,25 @@ def run(args) -> Dict[str, Any]:
     ppls = _load_ppl_from_json(log_dir / "eval_ppl.json")
     if not ppls:
         ppls = _parse_ppl_from_log(log_dir / "eval.log")
-    mpgq_layer_stats = _collect_mpgq_layer_stats(ckpt_dir) if solver == "mpgq" else {}
+    mpgq_layer_stats = _collect_mpgq_layer_stats(ckpt_dir) if solver_mode == "mpgq" else {}
 
     return {
-        "backend": "quip-sharp",
-        "method": method,
-        "resolved_method": solver,
-        "baseline_family": method,
+        "backend": combo.backend,
+        "backend_impl": "quip-sharp",
+        "codebook": combo.codebook,
+        "preprocess": combo.preprocess,
+        "rotation": combo.rotation,
+        "solver": combo.solver,
+        "polish_mode": combo.polish_mode,
+        "topk_source": combo.topk_source,
+        "requested_method": None if request_source in {"combo", "default"} else request_source,
+        "resolved_method": solver_mode,
+        "baseline_family": "quip" if combo.solver in {"ldlq", "ldlq_tune10"} else "mpgq",
         "quantization_path": {"dense": False, "packed": True},
         "bits": 2,
         "seed": int(args.seed),
         "base_model": str(args.base_model),
-        "codebook": str(args.codebook),
+        "codebook_impl": str(args.codebook),
         "calibration": {
             "dataset": str(args.calibration_dataset),
             "split": str(args.calibration_split),
@@ -403,6 +500,7 @@ def run(args) -> Dict[str, Any]:
             "batch_size": int(args.batch_size),
             "sample_proc": int(args.sample_proc),
             "scale_override": float(args.scale_override),
+            "quip_tune_iters": int(native_tune_iters),
         },
         "eval": {
             "datasets": list(getattr(args, "eval_datasets", ["wikitext2", "c4"])),
@@ -426,6 +524,7 @@ def run(args) -> Dict[str, Any]:
         "mpgq": mpgq_layer_stats,
         "mpgq_args": {
             "init": str(args.mpgq_init),
+            "method": str(getattr(args, "mpgq_method", "vamp")),
             "iters": int(args.mpgq_iters),
             "prior_tau": float(args.mpgq_prior_tau),
             "prior_tau_scale_mode": str(args.mpgq_prior_tau_scale_mode),
@@ -441,8 +540,9 @@ def run(args) -> Dict[str, Any]:
             "blocks_per_chunk": int(args.mpgq_blocks_per_chunk),
             "block_rows": int(args.mpgq_block_rows),
             "metric_rows_per_chunk": int(args.mpgq_metric_rows_per_chunk),
+            "topk_k": int(getattr(args, "mpgq_topk_k", 8)),
         }
-        if solver == "mpgq"
+        if solver_mode == "mpgq"
         else {},
         "meta": {
             "repo_sha": _git_head(REPO_ROOT),
@@ -456,7 +556,15 @@ def run(args) -> Dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--method", required=True, choices=["quip", "quip+mpgq"])
+    parser.add_argument("--method", default=None, choices=["quip", "quip+mpgq"])
+    parser.add_argument("--quant-backend", dest="quant_backend", type=str, default="quip")
+    parser.add_argument("--quant-codebook", dest="quant_codebook", type=str, default="e8p12")
+    parser.add_argument("--quant-preprocess", dest="quant_preprocess", type=str, default="none")
+    parser.add_argument("--quant-rotation", dest="quant_rotation", type=str, default="had")
+    parser.add_argument("--quant-solver", dest="quant_solver", type=str, default=None, choices=["ldlq", "vamp", "ldlq_tune10"])
+    parser.add_argument("--quant-polish-mode", dest="quant_polish_mode", type=str, default="none", choices=["none", "block_cd", "topk_block_cd"])
+    parser.add_argument("--quant-topk-source", dest="quant_topk_source", type=str, default="aux_vamp")
+    parser.add_argument("--quant-topk-k", dest="quant_topk_k", type=int, default=8)
     parser.add_argument("--base-model", required=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--codebook", type=str, default="E8P12")
@@ -472,6 +580,7 @@ def main() -> None:
     parser.add_argument("--hessian-dir", type=str, default=None)
     parser.add_argument("--force-hessians", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--hessian-batch-size", type=int, default=2)
+    parser.add_argument("--quip-tune-iters", dest="quip_tune_iters", type=int, default=10)
 
     # Eval
     parser.add_argument("--eval-seqlen", type=int, default=2048)
@@ -480,6 +589,7 @@ def main() -> None:
 
     # MPGQ (QUIP side) defaults aligned with Gate B recipe.
     parser.add_argument("--mpgq-init", type=str, default="random", choices=["random", "rtn", "ldlq"])
+    parser.add_argument("--mpgq-method", type=str, default="vamp", choices=["vamp", "vamp-topk-polish", "ep-diag"])
     parser.add_argument("--mpgq-iters", type=int, default=16)
     parser.add_argument("--mpgq-damping", type=float, default=0.5)
     parser.add_argument("--mpgq-prior-tau", type=float, default=0.25)
@@ -495,6 +605,7 @@ def main() -> None:
     parser.add_argument("--mpgq-polish-metric", type=str, default="gram", choices=["gram", "diag", "isotropic"])
     parser.add_argument("--mpgq-polish-max-blocks", type=int, default=0)
     parser.add_argument("--mpgq-metric-rows-per-chunk", type=int, default=0)
+    parser.add_argument("--mpgq-topk-k", type=int, default=8)
 
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--json-out", type=str, required=True)

@@ -6,13 +6,14 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
+from ..combo import QuantCombo, make_combo
 from ..solver import (
-    E8P12LrsVaspConfig,
     E8P12VampConfig,
-    resolve_e8p12_lrs_lambda_eff_grid,
-    solve_e8p12_rankspace_lrs_vasp,
+    build_e8p12_vamp_topk_candidates,
+    polish_e8p12_rankspace,
     solve_e8p12_rankspace_vamp,
 )
+from ..solvers.ep_diag import E8P12EpDiagConfig, solve_e8p12_rankspace_ep_diag
 from ..utils import stable_seed
 
 
@@ -184,6 +185,137 @@ def _zero_e8p12_init(
 
 
 @torch.inference_mode()
+def quip_tune_e8p12(
+    *,
+    Wr: torch.Tensor,
+    Hr: torch.Tensor,
+    hatWr: torch.Tensor,
+    cb: Any,
+    iters: int,
+    resid_scale_override: float | None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run QUIP#'s block-coordinate tune sweeps starting from a given hatWr.
+
+    Mirrors the update used in QUIP#'s LDLQ tune loop:
+
+        WXWX_k = hat_k + (Wr - hat) @ Hr[:,k] @ inv(Hr[k,k])
+        hat_k  = Q(WXWX_k)
+
+    Returns (hatWr_tuned, Qidxs_tuned).
+    """
+    iters = int(iters)
+    if iters <= 0:
+        n = int(Wr.shape[1])
+        codesz = int(getattr(cb, "codesz", 8))
+        if codesz != 8 or (n % codesz) != 0:
+            raise ValueError(f"quip_tune_e8p12 expects codesz=8 with n divisible by 8; got n={n}, codesz={codesz}.")
+        nblocks = n // codesz
+        # Best-effort indices for callers that need them.
+        blocks = hatWr.reshape(int(Wr.shape[0]) * int(nblocks), int(codesz))
+        _, idxs = cb.quantize(blocks, return_idx=True, resid_scale_override=resid_scale_override)
+        idxs = idxs.view(int(Wr.shape[0]), int(nblocks)).to(dtype=getattr(cb, "idx_dtype", torch.int64))
+        return hatWr, idxs
+
+    Wr = Wr.to(dtype=torch.float32)
+    Hr = Hr.to(dtype=torch.float32)
+    hat = hatWr.to(dtype=torch.float32).clone()
+    device = Wr.device
+    m, n = Wr.shape
+    codesz = int(getattr(cb, "codesz", 8))
+    if codesz != 8 or (n % codesz) != 0:
+        raise ValueError(f"quip_tune_e8p12 expects codesz=8 with n divisible by 8; got n={n}, codesz={codesz}.")
+    nblocks = n // codesz
+
+    inv_blocks = torch.empty(nblocks, codesz, codesz, dtype=torch.float32, device=device)
+    for k in range(nblocks):
+        s = codesz * k
+        e = s + codesz
+        inv_blocks[k] = torch.linalg.inv(Hr[s:e, s:e])
+
+    Qidxs = torch.empty(m, nblocks, dtype=getattr(cb, "idx_dtype", torch.int64), device=device)
+    quant_kwargs: Dict[str, Any] = {}
+    if resid_scale_override is not None:
+        quant_kwargs["resid_scale_override"] = float(resid_scale_override)
+
+    for ie in range(iters):
+        delta = Wr - hat
+        last = (ie == (iters - 1))
+        for k in reversed(range(nblocks)):
+            s = codesz * k
+            e = s + codesz
+            WXWX = hat[:, s:e] + delta.matmul(Hr[:, s:e]).matmul(inv_blocks[k])
+
+            # Update delta in-place so subsequent blocks see the new decision.
+            delta[:, s:e] = delta[:, s:e] + hat[:, s:e]
+            if not last:
+                hat[:, s:e] = cb.quantize(WXWX, return_idx=False, **quant_kwargs).to(dtype=torch.float32)
+            else:
+                q, qidx = cb.quantize(WXWX, return_idx=True, **quant_kwargs)
+                hat[:, s:e] = q.to(dtype=torch.float32)
+                Qidxs[:, k] = qidx.to(dtype=Qidxs.dtype)
+            delta[:, s:e] = delta[:, s:e] - hat[:, s:e]
+
+    return hat, Qidxs
+
+
+def _resolve_quip_combo(args: Any) -> Tuple[Optional[QuantCombo], Optional[str]]:
+    quant_solver = getattr(args, "quant_solver", None)
+    if quant_solver is None:
+        quant_solver = getattr(args, "mpgq_solver", None)
+    if quant_solver is not None:
+        combo = make_combo(
+            backend=str(getattr(args, "quant_backend", "quip")),
+            codebook=str(getattr(args, "quant_codebook", "e8p12")),
+            preprocess=str(getattr(args, "quant_preprocess", "none")),
+            rotation=str(getattr(args, "quant_rotation", getattr(args, "incoh_mode", "had"))),
+            solver=str(quant_solver),
+            polish_mode=str(getattr(args, "quant_polish_mode", getattr(args, "mpgq_polish_mode", "none"))),
+            topk_source=str(getattr(args, "quant_topk_source", "aux_vamp")),
+        )
+        return combo, None
+
+    legacy_method = str(getattr(args, "mpgq_method", "vamp") or "vamp").strip().lower()
+    if legacy_method == "ep-diag":
+        return None, legacy_method
+    polish_mode = "topk_block_cd" if legacy_method == "vamp-topk-polish" else "block_cd"
+    if int(getattr(args, "mpgq_polish_sweeps", 3) or 0) <= 0:
+        polish_mode = "none"
+    combo = make_combo(
+        backend="quip",
+        codebook="e8p12",
+        preprocess="none",
+        rotation=str(getattr(args, "incoh_mode", "had")),
+        solver="vamp",
+        polish_mode=polish_mode,
+    )
+    return combo, None
+
+
+def _build_vamp_cfg(args: Any, *, polish_mode: str) -> E8P12VampConfig:
+    return E8P12VampConfig(
+        iters=int(getattr(args, "mpgq_iters", 16)),
+        damping=float(getattr(args, "mpgq_damping", 0.5)),
+        gamma_start=float(getattr(args, "mpgq_gamma_start", 1.0)),
+        gamma_retry_factor=float(getattr(args, "mpgq_gamma_retry_factor", 4.0)),
+        gamma_retry_steps=int(getattr(args, "mpgq_gamma_retry_steps", 3)),
+        prior_tau=float(getattr(args, "mpgq_prior_tau", 0.25)),
+        prior_tau_scale_mode=str(getattr(args, "mpgq_prior_tau_scale_mode", "absmax")),
+        obs_precision=float(getattr(args, "mpgq_obs_precision", 0.0)),
+        em_obs_precision=bool(getattr(args, "mpgq_em_obs_precision", True)),
+        em_obs_precision_damping=float(getattr(args, "mpgq_em_obs_precision_damping", 0.3)),
+        em_obs_precision_min=float(getattr(args, "mpgq_em_obs_precision_min", 1e-4)),
+        em_obs_precision_max=float(getattr(args, "mpgq_em_obs_precision_max", 1e8)),
+        blocks_per_chunk=int(getattr(args, "mpgq_blocks_per_chunk", 16)),
+        polish_sweeps=int(getattr(args, "mpgq_polish_sweeps", 3)),
+        polish_mode=str(polish_mode),
+        polish_metric=str(getattr(args, "mpgq_polish_metric", "gram")),
+        polish_metric_rows_per_chunk=int(getattr(args, "mpgq_metric_rows_per_chunk", 0)),
+        polish_max_blocks=int(getattr(args, "mpgq_polish_max_blocks", 0)),
+        topk_k=int(getattr(args, "mpgq_topk_k", getattr(args, "quant_topk_k", 8)) or 8),
+    )
+
+
+@torch.inference_mode()
 def mpgq_refine_codebook(
     Wr: torch.Tensor,
     Hr: torch.Tensor,
@@ -261,106 +393,75 @@ def mpgq_refine_codebook(
         mse = max(sum_sq / max(count, 1), 1e-12)
         obs_precision = 1.0 / float(mse)
 
-    method = str(getattr(args, "mpgq_method", "vamp") or "vamp").strip().lower()
-    if method not in {"vamp", "rs-vamp", "lrs-vasp"}:
-        raise ValueError(f"unknown mpgq_method={method!r} (expected vamp|rs-vamp|lrs-vasp)")
+    combo, legacy_method = _resolve_quip_combo(args)
+    if combo is not None:
+        if combo.solver == "ldlq_tune10":
+            raise ValueError("QUIP adapter does not handle solver=ldlq_tune10; route it through the native QUIP backend path.")
+        vamp_cfg = _build_vamp_cfg(args, polish_mode=combo.polish_mode)
+    else:
+        vamp_cfg = _build_vamp_cfg(args, polish_mode="block_cd")
 
-    vamp_cfg = E8P12VampConfig(
+    ep_cfg = E8P12EpDiagConfig(
         iters=int(getattr(args, "mpgq_iters", 16)),
         damping=float(getattr(args, "mpgq_damping", 0.5)),
         gamma_start=float(getattr(args, "mpgq_gamma_start", 1.0)),
-        gamma_retry_factor=float(getattr(args, "mpgq_gamma_retry_factor", 4.0)),
-        gamma_retry_steps=int(getattr(args, "mpgq_gamma_retry_steps", 3)),
+        gamma_min=float(getattr(args, "mpgq_ep_gamma_min", 1e-8)),
+        gamma_max=float(getattr(args, "mpgq_ep_gamma_max", 1e12)),
+        v_min=float(getattr(args, "mpgq_ep_vmin", 1e-6)),
+        v_max=float(getattr(args, "mpgq_ep_vmax", 1e6)),
+        probes=int(getattr(args, "mpgq_ep_probes", 2)),
+        probe_seed=int(getattr(args, "mpgq_ep_probe_seed", 0)),
+        pcg_max_iters=int(getattr(args, "mpgq_ep_pcg_iters", 64)),
+        pcg_tol=float(getattr(args, "mpgq_ep_pcg_tol", 1e-4)),
         prior_tau=float(getattr(args, "mpgq_prior_tau", 0.25)),
         prior_tau_scale_mode=str(getattr(args, "mpgq_prior_tau_scale_mode", "absmax")),
-        obs_precision=float(requested_obs),
-        em_obs_precision=bool(getattr(args, "mpgq_em_obs_precision", True)),
-        em_obs_precision_damping=float(getattr(args, "mpgq_em_obs_precision_damping", 0.3)),
-        em_obs_precision_min=float(getattr(args, "mpgq_em_obs_precision_min", 1e-4)),
-        em_obs_precision_max=float(getattr(args, "mpgq_em_obs_precision_max", 1e8)),
         blocks_per_chunk=int(getattr(args, "mpgq_blocks_per_chunk", 16)),
+        obs_precision=float(getattr(args, "mpgq_obs_precision", 0.0)),
         polish_sweeps=int(getattr(args, "mpgq_polish_sweeps", 3)),
         polish_metric=str(getattr(args, "mpgq_polish_metric", "gram")),
         polish_metric_rows_per_chunk=int(getattr(args, "mpgq_metric_rows_per_chunk", 0)),
         polish_max_blocks=int(getattr(args, "mpgq_polish_max_blocks", 0)),
     )
-
-    lambda_grid_str = str(getattr(args, "mpgq_lambda_eff_grid", "0.25,1.0,4.0") or "").strip()
-    lambda_grid = []
-    for tok in lambda_grid_str.split(","):
-        tok = tok.strip()
-        if tok:
-            lambda_grid.append(float(tok))
-    if not lambda_grid:
-        lambda_grid = [1.0]
-    lrs_cfg = E8P12LrsVaspConfig(
-        method="rs-vamp" if method == "rs-vamp" else "lrs-vasp",
-        iters=int(getattr(args, "mpgq_iters", 16)),
-        rs_warmup_iters=int(getattr(args, "mpgq_rs_warmup_iters", 4)),
-        damping=float(getattr(args, "mpgq_damping", 0.5)),
-        gamma_start=float(getattr(args, "mpgq_gamma_start", 1.0)),
-        gamma_retry_factor=float(getattr(args, "mpgq_gamma_retry_factor", 4.0)),
-        gamma_retry_steps=int(getattr(args, "mpgq_gamma_retry_steps", 3)),
-        alpha_eps=1e-6,
-        blocks_per_chunk=int(getattr(args, "mpgq_blocks_per_chunk", 16)),
-        tol=1e-4,
-        prior_tau=float(getattr(args, "mpgq_prior_tau", 0.25)),
-        prior_tau_scale_mode=str(getattr(args, "mpgq_prior_tau_scale_mode", "absmax")),
-        lambda_eff_grid=tuple(lambda_grid),
-        lambda_eff_scale_mode=str(getattr(args, "mpgq_lambda_eff_scale_mode", "auto")),
-        enable_survey=(method == "lrs-vasp"),
-        survey_L=float(getattr(args, "mpgq_survey_L", 2.0)),
-        survey_Q=int(getattr(args, "mpgq_survey_Q", 9)),
-        survey_v1_init=float(getattr(args, "mpgq_survey_v1_init", 0.0)),
-        survey_v1_min=float(getattr(args, "mpgq_survey_v1_min", 1e-6)),
-        hard_gap_thresh=float(getattr(args, "mpgq_hard_gap_thresh", 0.5)),
-        hard_var_mult=float(getattr(args, "mpgq_hard_var_mult", 2.0)),
-        hard_max_frac=float(getattr(args, "mpgq_hard_max_frac", 0.25)),
-        backend=str(getattr(args, "mpgq_lrs_backend", "factorized")),
-        polish_sweeps=int(getattr(args, "mpgq_polish_sweeps", 3)),
-        polish_metric=str(getattr(args, "mpgq_polish_metric", "gram")),
-        polish_metric_rows_per_chunk=int(getattr(args, "mpgq_metric_rows_per_chunk", 0)),
-        polish_max_blocks=int(getattr(args, "mpgq_polish_max_blocks", 0)),
-    )
-
-    # Resolve absolute lambda grid once per module so all row chunks share the same scale.
-    if method in {"rs-vamp", "lrs-vasp"} and str(lrs_cfg.lambda_eff_scale_mode).strip().lower() == "auto":
-        from dataclasses import replace
-
-        sample_rows = _resolve_block_rows(
-            m,
-            int(getattr(args, "mpgq_block_rows", adapter_cfg.block_rows) or adapter_cfg.block_rows),
-        )
-        abs_grid, _lambda_stats = resolve_e8p12_lrs_lambda_eff_grid(
-            Wr=Wr,
-            hatWr_init=hatWr_init,
-            cb=cb,
-            S=S,
-            Vs=Vs,
-            cfg=lrs_cfg,
-            sample_rows=int(sample_rows),
-        )
-        lrs_cfg = replace(lrs_cfg, lambda_eff_grid=abs_grid, lambda_eff_scale_mode="none")
 
     block_rows = _resolve_block_rows(
         m,
         int(getattr(args, "mpgq_block_rows", adapter_cfg.block_rows) or adapter_cfg.block_rows),
     )
-    final_hatWr = hatWr_init.clone()
-    final_Qidxs = Qidxs_init.clone()
-
     exact_ldlq, exact_ldlq_chunks = _exact_surrogate_chunk_means(
         Wr,
         hatWr0.to(dtype=torch.float32),
         Hr,
         block_rows=block_rows,
     )
-    exact_before, exact_before_chunks = _exact_surrogate_chunk_means(Wr, hatWr_init, Hr, block_rows=block_rows)
+    if combo is not None and combo.solver == "ldlq":
+        final_hatWr = hatWr0.to(dtype=torch.float32).clone()
+        final_Qidxs = Qidxs0.to(dtype=getattr(cb, "idx_dtype", torch.int64)).clone()
+        exact_before, exact_before_chunks = exact_ldlq, list(exact_ldlq_chunks)
+    else:
+        final_hatWr = hatWr_init.clone()
+        final_Qidxs = Qidxs_init.clone()
+        exact_before, exact_before_chunks = _exact_surrogate_chunk_means(Wr, hatWr_init, Hr, block_rows=block_rows)
     obs_precision_block = float(obs_precision)
+    stats_chunk: Dict[str, Any] = {}
     for row_start in range(0, m, block_rows):
         row_end = min(row_start + block_rows, m)
         rb = slice(row_start, row_end)
-        if method == "vamp":
+        if legacy_method == "ep-diag":
+            hat_chunk, idx_chunk, _err_chunk, stats_chunk = solve_e8p12_rankspace_ep_diag(
+                Wr=Wr[rb],
+                hatWr_init=final_hatWr[rb],
+                cb=cb,
+                V=V,
+                Vh=Vh,
+                S=S,
+                Vs=Vs,
+                cfg=ep_cfg,
+                module_name=module_name,
+                obs_precision_init=obs_precision_block,
+            )
+            final_hatWr[rb] = hat_chunk
+            final_Qidxs[rb] = idx_chunk
+        elif combo is not None and combo.solver == "vamp":
             hat_chunk, idx_chunk, _err_chunk, stats_chunk = solve_e8p12_rankspace_vamp(
                 Wr=Wr[rb],
                 hatWr_init=final_hatWr[rb],
@@ -378,21 +479,81 @@ def mpgq_refine_codebook(
             final_Qidxs[rb] = idx_chunk
             if bool(vamp_cfg.em_obs_precision) and float(vamp_cfg.obs_precision) <= 0.0:
                 obs_precision_block = float(stats_chunk.get("obs_precision_final", obs_precision_block))
-        else:
-            hat_chunk, idx_chunk, _err_chunk, stats_chunk = solve_e8p12_rankspace_lrs_vasp(
-                Wr=Wr[rb],
-                hatWr_init=final_hatWr[rb],
-                cb=cb,
-                V=V,
-                Vh=Vh,
-                S=S,
-                Vs=Vs,
-                cfg=lrs_cfg,
-                module_name=module_name,
-                log_per_iter=False,
-            )
+        elif combo is not None and combo.solver == "ldlq":
+            if combo.polish_mode == "none":
+                hat_chunk = final_hatWr[rb]
+                idx_chunk = final_Qidxs[rb]
+                stats_chunk = {"solver": "e8p12_ldlq", "polish_mode": "none", "accepted_updates": 0.0}
+            elif combo.polish_mode == "block_cd":
+                hat_chunk, idx_chunk, _err_chunk, polish_stats = polish_e8p12_rankspace(
+                    x_init=final_hatWr[rb],
+                    idxs_init=final_Qidxs[rb],
+                    Y_u=Wr[rb].matmul(Vs),
+                    Vs=Vs,
+                    cb=cb,
+                    sweeps=int(getattr(args, "mpgq_polish_sweeps", 3)),
+                    polish_mode="block_cd",
+                    polish_metric=str(getattr(args, "mpgq_polish_metric", "gram")),
+                    metric_rows_per_chunk=int(getattr(args, "mpgq_metric_rows_per_chunk", 0)),
+                    polish_max_blocks=int(getattr(args, "mpgq_polish_max_blocks", 0)),
+                )
+                stats_chunk = {
+                    "solver": "e8p12_ldlq",
+                    "polish_mode": "block_cd",
+                    "polish_updates": float(polish_stats.get("accepted_updates", 0.0)),
+                }
+            else:
+                aux_cfg = _build_vamp_cfg(args, polish_mode="none")
+                aux_debug: Dict[str, Any] = {}
+                _aux_hat, _aux_idx, _aux_err, aux_stats = solve_e8p12_rankspace_vamp(
+                    Wr=Wr[rb],
+                    hatWr_init=final_hatWr[rb],
+                    cb=cb,
+                    V=V,
+                    Vh=Vh,
+                    S=S,
+                    Vs=Vs,
+                    cfg=aux_cfg,
+                    module_name=module_name,
+                    obs_precision_init=obs_precision_block,
+                    log_stats=False,
+                    debug_out=aux_debug,
+                )
+                topk = build_e8p12_vamp_topk_candidates(
+                    r1=aux_debug["r1"].to(device=Wr.device, dtype=torch.float32),
+                    gamma1=aux_debug["gamma1"].to(device=Wr.device, dtype=torch.float32),
+                    Wr=Wr[rb],
+                    cb=cb,
+                    blocks_per_chunk=int(getattr(args, "mpgq_blocks_per_chunk", 16)),
+                    prior_tau=float(getattr(args, "mpgq_prior_tau", 0.25)),
+                    prior_tau_scale_mode=str(getattr(args, "mpgq_prior_tau_scale_mode", "absmax")),
+                    k=int(getattr(args, "mpgq_topk_k", getattr(args, "quant_topk_k", 8)) or 8),
+                )
+                hat_chunk, idx_chunk, _err_chunk, polish_stats = polish_e8p12_rankspace(
+                    x_init=final_hatWr[rb],
+                    idxs_init=final_Qidxs[rb],
+                    Y_u=Wr[rb].matmul(Vs),
+                    Vs=Vs,
+                    cb=cb,
+                    sweeps=int(getattr(args, "mpgq_polish_sweeps", 3)),
+                    polish_mode="topk_block_cd",
+                    polish_metric=str(getattr(args, "mpgq_polish_metric", "gram")),
+                    metric_rows_per_chunk=int(getattr(args, "mpgq_metric_rows_per_chunk", 0)),
+                    polish_max_blocks=int(getattr(args, "mpgq_polish_max_blocks", 0)),
+                    topk_idxs=topk["topk_idxs"].to(device="cpu", dtype=torch.long),
+                )
+                if bool(aux_cfg.em_obs_precision) and float(aux_cfg.obs_precision) <= 0.0:
+                    obs_precision_block = float(aux_stats.get("obs_precision_final", obs_precision_block))
+                stats_chunk = {
+                    "solver": "e8p12_ldlq",
+                    "polish_mode": "topk_block_cd",
+                    "topk_k": int(topk["topk_idxs"].shape[-1]),
+                    "polish_updates": float(polish_stats.get("accepted_updates", 0.0)),
+                }
             final_hatWr[rb] = hat_chunk
             final_Qidxs[rb] = idx_chunk
+        else:
+            raise RuntimeError("failed to resolve QUIP solver combination")
 
     exact_after, exact_after_chunks = _exact_surrogate_chunk_means(Wr, final_hatWr, Hr, block_rows=block_rows)
 
@@ -410,6 +571,9 @@ def mpgq_refine_codebook(
 
     stats: Dict[str, Any] = {
         "method": "mpgq",
+        "backend": "quip",
+        "solver": str(combo.solver) if combo is not None else str(legacy_method or "ep-diag"),
+        "polish_mode": str(combo.polish_mode) if combo is not None else "block_cd",
         "module": str(module_name),
         "init_mode": str(init_mode),
         "seed": int(seed),
@@ -431,6 +595,6 @@ def mpgq_refine_codebook(
         "surrogate_chunk_violation_max_delta": float(max_delta),
         "surrogate_chunk_violation_max_ratio": float(max_ratio),
         "solver_time_s": float(time.time() - start),
-        "vamp": stats_chunk if "stats_chunk" in locals() else {},
+        "solver_stats": stats_chunk if "stats_chunk" in locals() else {},
     }
     return final_hatWr.to(dtype=hatWr0.dtype), final_Qidxs, stats
