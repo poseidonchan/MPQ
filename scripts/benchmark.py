@@ -189,14 +189,14 @@ def _flatten_result(row: Dict[str, Any]) -> Dict[str, Any]:
 def _resolve_combo_matrix(bits: int, args) -> List[QuantCombo]:
     if int(bits) == 2:
         preprocesses = list(args.quant_preprocesses) if args.quant_preprocesses else ["none"]
-        rotations = list(args.quant_rotations) if args.quant_rotations else ["had", "kron"]
+        rotations = list(args.quant_rotations) if args.quant_rotations else ["had"]
         solvers = list(args.quant_solvers) if args.quant_solvers else ["ldlq", "vamp", "ldlq_tune10"]
         polish_modes = list(args.quant_polish_modes) if args.quant_polish_modes else ["none", "block_cd", "topk_block_cd"]
         backend = "quip"
         codebook = "e8p12"
     else:
         preprocesses = list(args.quant_preprocesses) if args.quant_preprocesses else ["none", "awq"]
-        rotations = list(args.quant_rotations) if args.quant_rotations else ["none", "hadamard", "random"]
+        rotations = list(args.quant_rotations) if args.quant_rotations else ["hadamard"]
         solvers = list(args.quant_solvers) if args.quant_solvers else ["gptq", "vamp"]
         polish_modes = list(args.quant_polish_modes) if args.quant_polish_modes else ["none", "block_cd", "topk_block_cd"]
         backend = "gptqmodel"
