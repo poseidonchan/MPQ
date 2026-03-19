@@ -212,6 +212,8 @@ def main() -> None:
     parser.add_argument("--mpq-blocks-per-chunk", type=int, default=16, help="MPQ block chunk size (passed to QUIP# --mpq_blocks_per_chunk).")
     parser.add_argument("--mpq-polish-sweeps", type=int, default=3)
     parser.add_argument("--mpq-polish-metric", type=str, default="gram", choices=["gram", "isotropic", "diag"])
+    parser.add_argument("--mpq-method", type=str, default="vamp", choices=["vamp", "vamp-topk-polish"])
+    parser.add_argument("--mpq-topk-k", type=int, default=8)
     parser.add_argument("--skip-quip-baseline", action=argparse.BooleanOptionalAction, default=False, help="Skip the standalone QUIP pass and only run MPQ (LDLQ baseline is still available via mpq_stats).")
     parser.add_argument("--reference-json", type=str, default=None, help="Reuse overhead/quip timing from a previous smoke json and only rerun MPQ.")
     parser.add_argument("--output-dir", type=str, default=None)
@@ -309,6 +311,10 @@ def main() -> None:
         str(int(args.mpq_polish_sweeps)),
         "--mpq_polish_metric",
         str(args.mpq_polish_metric),
+        "--mpq-method",
+        str(args.mpq_method),
+        "--mpq-topk-k",
+        str(int(args.mpq_topk_k)),
     ]
     mpq_total_s = _run(mpq_cmd, cwd=QUIP_ROOT, env=env)
 
@@ -321,6 +327,14 @@ def main() -> None:
         "base_model": str(args.base_model),
         "seed": int(args.seed),
         "layers": list(layers),
+        "mpq": {
+            "method": str(args.mpq_method),
+            "topk_k": int(args.mpq_topk_k),
+            "iters": int(args.mpq_iters),
+            "damping": float(args.mpq_damping),
+            "prior_tau": float(args.mpq_prior_tau),
+            "polish_sweeps": int(args.mpq_polish_sweeps),
+        },
         "timing": {
             "overhead_s": timing.overhead_s,
             "quip_total_s": timing.quip_total_s,

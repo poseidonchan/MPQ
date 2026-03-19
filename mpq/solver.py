@@ -420,6 +420,44 @@ def solve_uniform_rankspace_vamp(
     alpha_eps = 1e-7
     gamma_retry_factor = max(float(cfg.gamma_retry_factor), 1.000001)
     gamma_retry_steps = max(int(cfg.gamma_retry_steps), 0)
+    best_iter_abs_tol = 1e-10
+    best_iter_rel_tol = 1e-8
+
+    def _current_hard_state(
+        r1_state: torch.Tensor,
+        gamma1_state: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        post_state = discrete_uniform_mmse(
+            r1=r1_state,
+            gamma1=gamma1_state,
+            scale_full=scale_full,
+            zero_full=zero_full,
+            maxq=maxq,
+            prior_center=W,
+            prior_tau=prior_tau,
+            need_stats=False,
+            atoms=atoms,
+        )
+        q_state, x_state = _uniform_hard_decision(
+            x_mean=post_state["mean"],  # type: ignore[arg-type]
+            x_map=post_state["map_value"],  # type: ignore[arg-type]
+            scale_full=scale_full,
+            zero_full=zero_full,
+            maxq=maxq,
+            final_decision=final_decision,
+        )
+        err_state = vamp_rankspace_error(Y_u=Y_u, x=x_state, Vs=Vs)
+        return q_state, x_state, err_state
+
+    best_q, best_x, best_err = _current_hard_state(r1, gamma1)
+    best_err_mean = float(best_err.mean().item()) if best_err.numel() else 0.0
+    best_r1 = r1.clone()
+    best_gamma1 = gamma1.clone()
+    best_r2_prev = None
+    best_gamma2_prev = None
+    best_obs_precision = float(obs_precision_local)
+    best_iter_idx = -1
+    stop_iter_idx = -1
 
     for it in range(iters):
         gamma1_work = gamma1
@@ -542,26 +580,32 @@ def solve_uniform_rankspace_vamp(
                 }
             )
 
-    final_post = discrete_uniform_mmse(
-        r1=r1,
-        gamma1=gamma1,
-        scale_full=scale_full,
-        zero_full=zero_full,
-        maxq=maxq,
-        prior_center=W,
-        prior_tau=prior_tau,
-        need_stats=False,
-        atoms=atoms,
-    )
-    q_final, x_final = _uniform_hard_decision(
-        x_mean=final_post["mean"],  # type: ignore[arg-type]
-        x_map=final_post["map_value"],  # type: ignore[arg-type]
-        scale_full=scale_full,
-        zero_full=zero_full,
-        maxq=maxq,
-        final_decision=final_decision,
-    )
-    err_final = vamp_rankspace_error(Y_u=Y_u, x=x_final, Vs=Vs)
+        current_q, current_x, current_err = _current_hard_state(r1, gamma1)
+        current_err_mean = float(current_err.mean().item()) if current_err.numel() else 0.0
+        improve_tol = max(best_iter_abs_tol, abs(best_err_mean) * best_iter_rel_tol)
+        if current_err_mean + improve_tol < best_err_mean:
+            best_q = current_q
+            best_x = current_x
+            best_err = current_err
+            best_err_mean = current_err_mean
+            best_r1 = r1.clone()
+            best_gamma1 = gamma1.clone()
+            best_r2_prev = None if r2_prev is None else r2_prev.clone()
+            best_gamma2_prev = None if gamma2_prev is None else gamma2_prev.clone()
+            best_obs_precision = float(obs_precision_local)
+            best_iter_idx = int(it)
+        else:
+            r1 = best_r1.clone()
+            gamma1 = best_gamma1.clone()
+            r2_prev = None if best_r2_prev is None else best_r2_prev.clone()
+            gamma2_prev = None if best_gamma2_prev is None else best_gamma2_prev.clone()
+            obs_precision_local = float(best_obs_precision)
+            stop_iter_idx = int(it)
+            break
+
+    q_final = best_q
+    x_final = best_x
+    err_final = best_err
 
     polish_sweeps = max(int(cfg.polish_sweeps), 0)
     polish_mode = _resolve_polish_mode(sweeps=polish_sweeps, mode=str(getattr(cfg, "polish_mode", "block_cd")))
@@ -633,6 +677,10 @@ def solve_uniform_rankspace_vamp(
         "mean_entropy": float(sum(entropy_values) / len(entropy_values)) if entropy_values else 0.0,
         "mean_margin": float(sum(margin_values) / len(margin_values)) if margin_values else 0.0,
         "final_decision": str(final_decision),
+        "best_iterate_enabled": True,
+        "best_iter": int(best_iter_idx),
+        "stop_iter": int(stop_iter_idx),
+        "best_rankspace_error_mean": float(best_err_mean),
         "polish_sweeps": int(polish_sweeps),
         "polish_mode": str(polish_mode),
         "topk_k": int(topk_k),

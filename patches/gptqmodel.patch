@@ -222,11 +222,19 @@ diff --git a/gptqmodel/quantization/gptq.py b/gptqmodel/quantization/gptq.py
 index ae0921aa..b8185211 100644
 --- a/gptqmodel/quantization/gptq.py
 +++ b/gptqmodel/quantization/gptq.py
-@@ -935,6 +935,77 @@ class GPTQ:
+@@ -935,6 +935,85 @@ class GPTQ:
              W = self.module_copy.to(device=self.H.device)
              del self.module_copy
  
 +        mpq_cfg = getattr(self.qcfg, "mpq", None)
++        mpq_gptq_postprocess = bool(
++            mpq_cfg is not None
++            and bool(getattr(mpq_cfg, "enabled", False))
++            and str(getattr(mpq_cfg, "solver", "")) == "gptq"
++            and str(getattr(mpq_cfg, "polish_mode", "none")) != "none"
++        )
++        W_mpq_ref = W.clone() if mpq_gptq_postprocess else None
++        H_mpq_ref = self.H.clone() if mpq_gptq_postprocess else None
 +        if (
 +            mpq_cfg is not None
 +            and bool(getattr(mpq_cfg, "enabled", False))
@@ -300,7 +308,7 @@ index ae0921aa..b8185211 100644
          self.quantizer.find_params(W, weight=True)
  
          # H = self.H.to(device=self.H.device)
-@@ -990,6 +1061,51 @@ class GPTQ:
+@@ -990,6 +1069,51 @@ class GPTQ:
          else:
              Hinv, damp = None, 0.0
  
@@ -363,7 +371,7 @@ index ae0921aa..b8185211 100644
          group_size = self.qcfg.group_size if self.qcfg.group_size != -1 else self.columns
  
          if self.qcfg.static_groups and self.qcfg.desc_act:
-@@ -1200,11 +1312,54 @@ class GPTQ:
+@@ -1200,11 +1320,56 @@ class GPTQ:
              zero = temp_zero
              del final_perm, inv_final, global_perm, inv_global_perm, inv_global_perm_list, local_perms
  
@@ -390,8 +398,8 @@ index ae0921aa..b8185211 100644
 +                rotation_seed=int(getattr(mpq_cfg, "rotation_seed", 0)),
 +            )
 +            Q, _q_int_post, scale, zero, g_idx, _duration_post, _stats_post = postprocess_gptq_quantization(
-+                W=W,
-+                H=self.H,
++                W=W_mpq_ref if W_mpq_ref is not None else W,
++                H=H_mpq_ref if H_mpq_ref is not None else self.H,
 +                Q_init=Q,
 +                scale_groups=scale,
 +                zero_groups=zero,
@@ -402,6 +410,8 @@ index ae0921aa..b8185211 100644
 +            )
 +
 +        del Losses
++        del H_mpq_ref
++        del W_mpq_ref
 +        del self.H
 +        del W
 +

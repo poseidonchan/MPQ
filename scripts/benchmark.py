@@ -198,7 +198,7 @@ def _resolve_combo_matrix(bits: int, args) -> List[QuantCombo]:
         preprocesses = list(args.quant_preprocesses) if args.quant_preprocesses else ["none", "awq"]
         rotations = list(args.quant_rotations) if args.quant_rotations else ["hadamard"]
         solvers = list(args.quant_solvers) if args.quant_solvers else ["gptq", "vamp"]
-        polish_modes = list(args.quant_polish_modes) if args.quant_polish_modes else ["none", "block_cd", "topk_block_cd"]
+        polish_modes = list(args.quant_polish_modes) if args.quant_polish_modes else ["none", "block_cd"]
         backend = "gptqmodel"
         codebook = "grid_g128"
 
@@ -227,7 +227,7 @@ def _resolve_combo_matrix(bits: int, args) -> List[QuantCombo]:
 def _default_sanity_eval_label(bits: int) -> str:
     if int(bits) == 2:
         return "backend-quip__codebook-e8p12__pre-none__rot-had__solver-vamp__polish-topk_block_cd"
-    return "backend-gptqmodel__codebook-grid_g128__pre-none__rot-hadamard__solver-vamp__polish-topk_block_cd"
+    return "backend-gptqmodel__codebook-grid_g128__pre-none__rot-hadamard__solver-vamp__polish-block_cd"
 
 
 def _build_job_args(args, *, bits: int, label: str, combo: Optional[QuantCombo]):

@@ -453,6 +453,16 @@ def postprocess_gptq_quantization(
         Q_final = Q_init
         q_final = q_init
 
+    err_final = vamp_rankspace_error(Y_u=Y_u, x=Q_final, Vs=Vs)
+    module_before_mean = float(err_before.mean().item()) if err_before.numel() else 0.0
+    module_final_mean = float(err_final.mean().item()) if err_final.numel() else 0.0
+    fail_closed = (not torch.isfinite(err_final).all()) or (module_final_mean > module_before_mean + 1e-9)
+    if fail_closed:
+        Q_final = Q_init
+        q_final = q_init
+        err_final = err_before
+        module_final_mean = module_before_mean
+
     stats: Dict[str, Any] = {
         "method": "mpq",
         "solver": "gptq",
@@ -467,10 +477,12 @@ def postprocess_gptq_quantization(
         "block_rows": int(block_rows),
         "polish_sweeps": int(polish_sweeps),
         "topk_k": int(getattr(mpq_cfg, "topk_k", 8) or 8),
-        "rankspace_error_mean_before": float(err_before.mean().item()) if err_before.numel() else 0.0,
+        "rankspace_error_mean_before": module_before_mean,
         "rankspace_error_mean_after": float(err_after.mean().item()) if err_after.numel() else 0.0,
+        "rankspace_error_mean_final": module_final_mean,
         "polish_gain": float((err_before - err_after).mean().item()) if err_after.numel() else 0.0,
         "polish_updates": float(polish_stats.get("accepted_updates", 0.0)),
+        "module_fail_closed": bool(fail_closed),
         "aux_vamp": aux_stats if topk is not None else {},
         "quant_time_s": float(time.time() - start),
     }

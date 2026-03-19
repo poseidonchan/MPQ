@@ -264,7 +264,13 @@ def _load_or_build_c4_tokens(tokenizer, *, model_ref: str, max_eval_tokens: int,
         tokens = torch.load(cache_path, map_location="cpu")
         return tokens[:, :max_eval_tokens].contiguous()
 
-    from lib.utils import gptq_data_utils
+    import importlib.util
+    _spec = importlib.util.spec_from_file_location(
+        "gptq_data_utils",
+        REPO_ROOT / "third_party" / "quip-sharp" / "lib" / "utils" / "gptq_data_utils.py",
+    )
+    gptq_data_utils = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(gptq_data_utils)
 
     tokens = gptq_data_utils.get_test_tokens("c4", seed=int(seed), seqlen=int(seqlen), model=str(model_ref))
     tokens = tokens[:, :max_eval_tokens].cpu().contiguous()
@@ -595,7 +601,7 @@ def run(args) -> Dict[str, Any]:
         "solver": combo.solver if combo is not None else "gptq",
         "polish_mode": combo.polish_mode if combo is not None else "none",
         "topk_source": combo.topk_source if combo is not None else "aux_vamp",
-        "desc_act": bool(runtime["desc_act"]),
+        "desc_act": bool(getattr(qcfg, "desc_act", runtime["desc_act"])),
         "seed": int(args.seed),
         "model_id": str(args.model_id),
         "awq_preprocess": {

@@ -790,6 +790,12 @@ index af33222..e5ce82a 100644
 +parser.add_argument('--mpq_polish_metric', default='gram', type=str, choices=['gram', 'isotropic', 'diag'])
 +parser.add_argument('--mpq_polish_max_blocks', default=0, type=int)
 +parser.add_argument('--mpq_metric_rows_per_chunk', default=0, type=int)
++parser.add_argument('--mpq-method',
++                    dest='mpq_method',
++                    default='vamp',
++                    type=str,
++                    choices=['vamp', 'vamp-topk-polish'])
++parser.add_argument('--mpq-topk-k', dest='mpq_topk_k', default=8, type=int)
 +
  
  def check_exist(idx, args):

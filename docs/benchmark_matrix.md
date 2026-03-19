@@ -8,16 +8,12 @@ This is the intended public matrix for benchmark runs.
 | --- | --- | --- | --- | --- | --- | --- |
 | `gptqmodel` | `grid_g128` | `none` | `hadamard` | `gptq` | `none` | GPTQ baseline (desc_act=True) |
 | `gptqmodel` | `grid_g128` | `none` | `hadamard` | `gptq` | `block_cd` | GPTQ + block CD polish |
-| `gptqmodel` | `grid_g128` | `none` | `hadamard` | `gptq` | `topk_block_cd` | GPTQ + top-k block CD polish |
 | `gptqmodel` | `grid_g128` | `none` | `hadamard` | `vamp` | `none` | VAMP baseline |
 | `gptqmodel` | `grid_g128` | `none` | `hadamard` | `vamp` | `block_cd` | VAMP + block CD |
-| `gptqmodel` | `grid_g128` | `none` | `hadamard` | `vamp` | `topk_block_cd` | VAMP + top-k block CD |
 | `gptqmodel` | `grid_g128` | `awq` | `hadamard` | `gptq` | `none` | AWQ + GPTQ |
 | `gptqmodel` | `grid_g128` | `awq` | `hadamard` | `gptq` | `block_cd` | AWQ + GPTQ + block CD |
-| `gptqmodel` | `grid_g128` | `awq` | `hadamard` | `gptq` | `topk_block_cd` | AWQ + GPTQ + top-k block CD |
 | `gptqmodel` | `grid_g128` | `awq` | `hadamard` | `vamp` | `none` | AWQ + VAMP |
 | `gptqmodel` | `grid_g128` | `awq` | `hadamard` | `vamp` | `block_cd` | AWQ + VAMP + block CD |
-| `gptqmodel` | `grid_g128` | `awq` | `hadamard` | `vamp` | `topk_block_cd` | AWQ + VAMP + top-k block CD |
 
 ## E8P12: QUIP#
 
@@ -33,6 +29,7 @@ This is the intended public matrix for benchmark runs.
 
 ## Notes
 
+- `topk_block_cd` remains available for manual/debug runs, but the public benchmark matrix only uses it on `e8p12`.
 - `topk_block_cd` always uses `topk_source=aux_vamp`.
 - `solver=ldlq_tune10` is only valid with `polish_mode=none`.
 - `preprocess=awq` is only valid on `backend=gptqmodel`.
