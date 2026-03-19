@@ -478,20 +478,21 @@ def collect_hessians_generic(args: Any) -> None:
         done_down = quip_utils.register_H_hook(handles.down_proj, device)
 
         out_emb = torch.zeros_like(dev_emb)
-        for start in range(0, len(dev_emb), args.batch_size):
-            end = min(start + args.batch_size, len(dev_emb))
-            batch = dev_emb[start:end].to(device)
-            batch_pos = position_ids[: end - start].to(device)
-            batch_mask = attention_mask[: end - start].to(device) if attention_mask is not None else None
-            out_emb[start:end] = adapter.forward_layer(
-                model,
-                layer,
-                batch,
-                position_ids=batch_pos,
-                attention_mask=batch_mask,
-                use_cache=False,
-                output_attentions=False,
-            ).cpu()
+        with torch.no_grad():
+            for start in range(0, len(dev_emb), args.batch_size):
+                end = min(start + args.batch_size, len(dev_emb))
+                batch = dev_emb[start:end].to(device)
+                batch_pos = position_ids[: end - start].to(device)
+                batch_mask = attention_mask[: end - start].to(device) if attention_mask is not None else None
+                out_emb[start:end] = adapter.forward_layer(
+                    model,
+                    layer,
+                    batch,
+                    position_ids=batch_pos,
+                    attention_mask=batch_mask,
+                    use_cache=False,
+                    output_attentions=False,
+                ).cpu()
 
         for name, done in {
             "qkv": done_qkv,

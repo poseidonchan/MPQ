@@ -663,7 +663,7 @@ def main() -> None:
     parser.add_argument("--codebook", type=str, default="E8P12")
     parser.add_argument("--devset-size", type=int, default=128)
     parser.add_argument("--ctx-size", type=int, default=2048)
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--sample-proc", type=int, default=1)
     parser.add_argument("--scale-override", type=float, default=0.9)
     parser.add_argument("--hessian-batch-size", type=int, default=2)
