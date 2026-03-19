@@ -635,7 +635,7 @@ def run(args) -> Dict[str, Any]:
             "--model-path", str(hf_dir),
             "--quip",
             "--tasks", ",".join(lm_eval_tasks),
-            "--batch-size", str(int(getattr(args, "lm_eval_batch_size", 1))),
+            "--batch-size", str(getattr(args, "lm_eval_batch_size", "1")),
             "--num-fewshot", str(int(getattr(args, "lm_eval_num_fewshot", 0))),
             "--json-out", str(lm_eval_json),
         ]
@@ -789,7 +789,7 @@ def main() -> None:
 
     # lm-evaluation-harness
     parser.add_argument("--lm-eval-tasks", nargs="*", default=None)
-    parser.add_argument("--lm-eval-batch-size", type=int, default=1)
+    parser.add_argument("--lm-eval-batch-size", default="1")
     parser.add_argument("--lm-eval-num-fewshot", type=int, default=0)
 
     # MPQ (QUIP side) defaults aligned with Gate B recipe.

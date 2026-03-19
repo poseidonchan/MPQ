@@ -7,56 +7,48 @@ set -euo pipefail
 
 export HF_ALLOW_CODE_EVAL=1
 
-COMMON_TASKS="mmlu arc_challenge gsm8k humaneval hellaswag"
+COMMON_TASKS="arc_easy arc_challenge piqa winogrande hellaswag"
+COMMON_ARGS="--lm-eval-batch-size auto --resume-existing"
 
 log() { echo "===== $(date '+%Y-%m-%d %H:%M:%S') $* ====="; }
 
 # === Qwen3-0.6B ===
 log "Qwen3-0.6B 4-bit (1/9)"
 python scripts/benchmark.py --bits 4 --model-id Qwen/Qwen3-0.6B --seeds 0 \
-  --lm-eval-tasks $COMMON_TASKS \
-  --run-id qwen3_0.6b_b4 --resume-existing
+  --lm-eval-tasks $COMMON_TASKS $COMMON_ARGS --run-id qwen3_0.6b_b4
 
 log "Qwen3-0.6B 3-bit (2/9)"
 python scripts/benchmark.py --bits 3 --model-id Qwen/Qwen3-0.6B --seeds 0 \
-  --lm-eval-tasks $COMMON_TASKS \
-  --run-id qwen3_0.6b_b3 --resume-existing
+  --lm-eval-tasks $COMMON_TASKS $COMMON_ARGS --run-id qwen3_0.6b_b3
 
 log "Qwen3-0.6B 2-bit (3/9)"
 python scripts/benchmark.py --bits 2 --base-model Qwen/Qwen3-0.6B --seeds 0 \
-  --lm-eval-tasks $COMMON_TASKS \
-  --run-id qwen3_0.6b_b2 --resume-existing
+  --lm-eval-tasks $COMMON_TASKS $COMMON_ARGS --run-id qwen3_0.6b_b2
 
 # === Qwen3-4B ===
 log "Qwen3-4B 4-bit (4/9)"
 python scripts/benchmark.py --bits 4 --model-id Qwen/Qwen3-4B --seeds 0 \
-  --lm-eval-tasks $COMMON_TASKS \
-  --run-id qwen3_4b_b4 --resume-existing
+  --lm-eval-tasks $COMMON_TASKS $COMMON_ARGS --run-id qwen3_4b_b4
 
 log "Qwen3-4B 3-bit (5/9)"
 python scripts/benchmark.py --bits 3 --model-id Qwen/Qwen3-4B --seeds 0 \
-  --lm-eval-tasks $COMMON_TASKS \
-  --run-id qwen3_4b_b3 --resume-existing
+  --lm-eval-tasks $COMMON_TASKS $COMMON_ARGS --run-id qwen3_4b_b3
 
 log "Qwen3-4B 2-bit (6/9)"
 python scripts/benchmark.py --bits 2 --base-model Qwen/Qwen3-4B --seeds 0 \
-  --lm-eval-tasks $COMMON_TASKS \
-  --run-id qwen3_4b_b2 --resume-existing
+  --lm-eval-tasks $COMMON_TASKS $COMMON_ARGS --run-id qwen3_4b_b2
 
 # === Qwen3-8B ===
 log "Qwen3-8B 4-bit (7/9)"
 python scripts/benchmark.py --bits 4 --model-id Qwen/Qwen3-8B --seeds 0 \
-  --lm-eval-tasks $COMMON_TASKS \
-  --run-id qwen3_8b_b4 --resume-existing
+  --lm-eval-tasks $COMMON_TASKS $COMMON_ARGS --run-id qwen3_8b_b4
 
 log "Qwen3-8B 3-bit (8/9)"
 python scripts/benchmark.py --bits 3 --model-id Qwen/Qwen3-8B --seeds 0 \
-  --lm-eval-tasks $COMMON_TASKS \
-  --run-id qwen3_8b_b3 --resume-existing
+  --lm-eval-tasks $COMMON_TASKS $COMMON_ARGS --run-id qwen3_8b_b3
 
 log "Qwen3-8B 2-bit (9/9)"
 python scripts/benchmark.py --bits 2 --base-model Qwen/Qwen3-8B --seeds 0 \
-  --lm-eval-tasks $COMMON_TASKS \
-  --run-id qwen3_8b_b2 --resume-existing
+  --lm-eval-tasks $COMMON_TASKS $COMMON_ARGS --run-id qwen3_8b_b2
 
 log "ALL DONE"

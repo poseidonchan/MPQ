@@ -616,7 +616,7 @@ def run(args) -> Dict[str, Any]:
         lm_eval_result = _run_lm_eval(
             hf_model, tokenizer,
             tasks=lm_eval_tasks,
-            batch_size=int(getattr(args, "lm_eval_batch_size", 1)),
+            batch_size=getattr(args, "lm_eval_batch_size", "1"),
             num_fewshot=int(getattr(args, "lm_eval_num_fewshot", 0)),
         )
         lm_eval_time_s = float(time.time() - t_lm)
@@ -777,7 +777,7 @@ def main() -> None:
 
     # lm-evaluation-harness
     parser.add_argument("--lm-eval-tasks", nargs="*", default=None)
-    parser.add_argument("--lm-eval-batch-size", type=int, default=1)
+    parser.add_argument("--lm-eval-batch-size", default="1")
     parser.add_argument("--lm-eval-num-fewshot", type=int, default=0)
 
     # AWQ preprocess

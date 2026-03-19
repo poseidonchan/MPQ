@@ -42,7 +42,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--tasks", required=True, help="Comma-separated task list")
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--batch-size", default="1")
     parser.add_argument("--num-fewshot", type=int, default=0)
     parser.add_argument("--json-out", required=True)
     parser.add_argument("--quip", action="store_true")

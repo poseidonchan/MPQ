@@ -632,7 +632,7 @@ def main() -> None:
     parser.add_argument("--eval-max-eval-tokens", type=int, default=131072)
     parser.add_argument("--eval-datasets", nargs="*", default=["wikitext2", "c4"])
     parser.add_argument("--lm-eval-tasks", nargs="*", default=None)
-    parser.add_argument("--lm-eval-batch-size", type=int, default=1)
+    parser.add_argument("--lm-eval-batch-size", default="1")
     parser.add_argument("--lm-eval-num-fewshot", type=int, default=0)
     parser.add_argument(
         "--gptqmodel-extra-site-packages",
@@ -692,7 +692,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.lm_eval_tasks is not None and len(args.lm_eval_tasks) == 0:
-        args.lm_eval_tasks = ["mmlu", "arc_challenge", "gsm8k", "humaneval", "hellaswag"]
+        args.lm_eval_tasks = ["arc_easy", "arc_challenge", "piqa", "winogrande", "hellaswag"]
 
     bits = int(args.bits)
     seeds = _parse_seeds(list(args.seeds))
