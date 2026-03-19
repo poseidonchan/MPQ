@@ -174,7 +174,7 @@ index 97998f41..93268c75 100644
 +    solver: str = "vamp"
 +    polish_mode: str = "block_cd"
 +    topk_source: str = "aux_vamp"
-+    topk_k: int = 8
++    topk_k: int = 16
 +
 +    # VAMP loop
 +    iters: int = 10
@@ -259,7 +259,7 @@ index ae0921aa..b8185211 100644
 +                em_obs_precision_max=float(getattr(mpq_cfg, "em_obs_precision_max", 1e8)),
 +                polish_sweeps=int(getattr(mpq_cfg, "polish_sweeps", 3)),
 +                polish_mode=str(getattr(mpq_cfg, "polish_mode", "block_cd") or "block_cd"),
-+                topk_k=int(getattr(mpq_cfg, "topk_k", 8) or 8),
++                topk_k=int(getattr(mpq_cfg, "topk_k", 16) or 16),
 +            )
 +            adapter_cfg = GPTQAdapterConfig(
 +                hessian_scale=float(getattr(mpq_cfg, "hessian_scale", 0.5)),

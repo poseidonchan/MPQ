@@ -48,7 +48,7 @@ class UniformVampConfig:
     em_obs_precision_max: float = 1e8
     polish_sweeps: int = 3
     polish_mode: str = "block_cd"  # "none" | "block_cd" | "topk_block_cd"
-    topk_k: int = 8
+    topk_k: int = 16
 
 
 @dataclass(frozen=True)
@@ -74,7 +74,7 @@ class E8P12VampConfig:
     polish_metric: str = "gram"  # "gram" | "diag"
     polish_metric_rows_per_chunk: int = 0
     polish_max_blocks: int = 0
-    topk_k: int = 8
+    topk_k: int = 16
 
 
 @torch.inference_mode()
@@ -609,7 +609,7 @@ def solve_uniform_rankspace_vamp(
 
     polish_sweeps = max(int(cfg.polish_sweeps), 0)
     polish_mode = _resolve_polish_mode(sweeps=polish_sweeps, mode=str(getattr(cfg, "polish_mode", "block_cd")))
-    topk_k = max(int(getattr(cfg, "topk_k", 8) or 8), 1)
+    topk_k = max(int(getattr(cfg, "topk_k", 16) or 16), 1)
     polish_gain = 0.0
     polish_updates = 0.0
     if polish_mode != "none" and Vs.numel() > 0:
@@ -944,7 +944,7 @@ def solve_e8p12_rankspace_vamp(
     polish_sweeps = max(int(cfg.polish_sweeps), 0)
     polish_mode = _resolve_polish_mode(sweeps=polish_sweeps, mode=str(getattr(cfg, "polish_mode", "block_cd")))
     polish_metric = _resolve_e8p12_polish_metric(str(cfg.polish_metric or "gram"))
-    topk_k = max(int(getattr(cfg, "topk_k", 8) or 8), 1)
+    topk_k = max(int(getattr(cfg, "topk_k", 16) or 16), 1)
 
     polish_gain = 0.0
     polish_updates = 0.0

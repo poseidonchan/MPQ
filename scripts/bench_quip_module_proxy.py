@@ -122,7 +122,7 @@ def _build_quip_args(base: argparse.Namespace) -> Any:
     args.mpq_metric_rows_per_chunk = int(base.mpq_metric_rows_per_chunk)
     # Optional solver selection (consumed by MPQ wrapper, not QUIP# proper).
     args.mpq_method = str(getattr(base, "mpq_method", "vamp"))
-    args.mpq_topk_k = int(getattr(base, "mpq_topk_k", 8))
+    args.mpq_topk_k = int(getattr(base, "mpq_topk_k", 16))
     args.mpq_debug_export = getattr(base, "mpq_debug_export", None)
     args.mpq_debug_summary = bool(getattr(base, "mpq_debug_summary", False))
     return args
@@ -370,7 +370,7 @@ def _run_mpq_refine_cached(
                 S=S,
                 Vs=Vs,
                 cfg=vamp_cfg,
-                candidate_k=int(getattr(args, "mpq_topk_k", 8) or 8),
+                candidate_k=int(getattr(args, "mpq_topk_k", 16) or 16),
                 module_name=module_name,
                 obs_precision_init=obs_precision_block,
                 log_stats=True,
@@ -541,7 +541,7 @@ def main() -> None:
     parser.add_argument("--mpq-polish-metric", type=str, default="gram", choices=["gram", "isotropic", "diag"])
     parser.add_argument("--mpq-polish-max-blocks", type=int, default=0)
     parser.add_argument("--mpq-metric-rows-per-chunk", type=int, default=0)
-    parser.add_argument("--mpq-topk-k", type=int, default=8)
+    parser.add_argument("--mpq-topk-k", type=int, default=16)
 
     parser.add_argument(
         "--mpq-debug-export",

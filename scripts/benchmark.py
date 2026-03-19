@@ -589,7 +589,7 @@ def main() -> None:
     parser.add_argument("--quant-solvers", nargs="*", default=None)
     parser.add_argument("--quant-polish-modes", nargs="*", default=None)
     parser.add_argument("--quant-topk-source", type=str, default="aux_vamp")
-    parser.add_argument("--quant-topk-k", type=int, default=8)
+    parser.add_argument("--quant-topk-k", type=int, default=16)
 
     parser.add_argument("--model-id", type=str, default=None, help="HF model id for GPTQModel backend (bits=3/4)")
     parser.add_argument("--group-size", type=int, default=128)

@@ -213,7 +213,7 @@ def main() -> None:
     parser.add_argument("--mpq-polish-sweeps", type=int, default=3)
     parser.add_argument("--mpq-polish-metric", type=str, default="gram", choices=["gram", "isotropic", "diag"])
     parser.add_argument("--mpq-method", type=str, default="vamp", choices=["vamp", "vamp-topk-polish"])
-    parser.add_argument("--mpq-topk-k", type=int, default=8)
+    parser.add_argument("--mpq-topk-k", type=int, default=16)
     parser.add_argument("--skip-quip-baseline", action=argparse.BooleanOptionalAction, default=False, help="Skip the standalone QUIP pass and only run MPQ (LDLQ baseline is still available via mpq_stats).")
     parser.add_argument("--reference-json", type=str, default=None, help="Reuse overhead/quip timing from a previous smoke json and only rerun MPQ.")
     parser.add_argument("--output-dir", type=str, default=None)

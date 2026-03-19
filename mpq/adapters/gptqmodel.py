@@ -113,7 +113,7 @@ def _uniform_vamp_cfg_from_qcfg(qcfg: Any) -> UniformVampConfig:
         em_obs_precision_max=float(getattr(mpq_cfg, "em_obs_precision_max", 1e8)),
         polish_sweeps=int(getattr(mpq_cfg, "polish_sweeps", 3)),
         polish_mode=str(getattr(mpq_cfg, "polish_mode", "block_cd") or "block_cd"),
-        topk_k=int(getattr(mpq_cfg, "topk_k", 8) or 8),
+        topk_k=int(getattr(mpq_cfg, "topk_k", 16) or 16),
     )
 
 
@@ -476,7 +476,7 @@ def postprocess_gptq_quantization(
         "eigen_floor": float(eigen_floor),
         "block_rows": int(block_rows),
         "polish_sweeps": int(polish_sweeps),
-        "topk_k": int(getattr(mpq_cfg, "topk_k", 8) or 8),
+        "topk_k": int(getattr(mpq_cfg, "topk_k", 16) or 16),
         "rankspace_error_mean_before": module_before_mean,
         "rankspace_error_mean_after": float(err_after.mean().item()) if err_after.numel() else 0.0,
         "rankspace_error_mean_final": module_final_mean,

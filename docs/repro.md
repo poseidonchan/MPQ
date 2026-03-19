@@ -2,6 +2,27 @@
 
 This repo integrates `mpq` into `GPTQModel` and `QUIP#` while keeping third-party logic patch-only.
 
+Repository:
+- GitHub: `https://github.com/poseidonchan/MPQ`
+- Clone URL: `https://github.com/poseidonchan/MPQ.git`
+
+## Clone with submodules
+
+Recommended:
+
+```bash
+git clone --recurse-submodules https://github.com/poseidonchan/MPQ.git
+cd MPQ
+```
+
+If the repo is already cloned without submodules:
+
+```bash
+git submodule update --init --recursive
+```
+
+Do not manually clone arbitrary upstream revisions into `third_party/`. The repo expects the pinned submodule SHAs and applies local compatibility patches on top.
+
 ## Patch workflow
 
 - Apply patches before building CUDA extensions:
@@ -89,7 +110,7 @@ python scripts/backend_gptq.py \
   --quant-rotation hadamard \
   --quant-solver gptq \
   --quant-polish-mode topk_block_cd \
-  --quant-topk-k 8 \
+  --quant-topk-k 16 \
   --model-id Qwen/Qwen3-0.6B \
   --bits 4 \
   --group-size 128 \
@@ -98,7 +119,7 @@ python scripts/backend_gptq.py \
   --json-out runs/gptq_topk_example/backend_results.json
 ```
 
-`VAMP + topk block CD`:
+`VAMP + block CD`:
 
 ```bash
 python scripts/backend_gptq.py \
@@ -107,8 +128,7 @@ python scripts/backend_gptq.py \
   --quant-preprocess none \
   --quant-rotation hadamard \
   --quant-solver vamp \
-  --quant-polish-mode topk_block_cd \
-  --quant-topk-k 8 \
+  --quant-polish-mode block_cd \
   --model-id Qwen/Qwen3-0.6B \
   --bits 4 \
   --group-size 128 \
@@ -182,7 +202,7 @@ python scripts/backend_quip.py \
   --quant-rotation had \
   --quant-solver vamp \
   --quant-polish-mode topk_block_cd \
-  --quant-topk-k 8 \
+  --quant-topk-k 16 \
   --base-model meta-llama/Llama-3.2-1B \
   --seed 0 \
   --mpq-iters 16 \
@@ -202,8 +222,7 @@ To quantize a custom HuggingFace model, use the single-backend scripts directly.
 conda run -n mpq-gptq python scripts/backend_gptq.py \
   --model-id <your-hf-model> \
   --bits 4 --group-size 128 \
-  --quant-solver vamp --quant-polish-mode topk_block_cd \
-  --quant-topk-k 8 \
+  --quant-solver vamp --quant-polish-mode block_cd \
   --output-dir runs/my_model \
   --json-out runs/my_model/results.json
 ```
@@ -212,7 +231,7 @@ Key flags:
 - `--bits`: 2, 3, 4, or 8
 - `--group-size`: quantization group size (128 is standard for 4-bit)
 - `--quant-solver`: `gptq` (baseline) or `vamp` (MPQ)
-- `--quant-polish-mode`: `none`, `block_cd`, or `topk_block_cd`
+- `--quant-polish-mode`: `none` or `block_cd` for the public scalar benchmark path
 
 ### 2-bit (QUIP#)
 
@@ -220,7 +239,7 @@ Key flags:
 conda run -n mpq-quip python scripts/backend_quip.py \
   --base-model <your-hf-model> \
   --quant-solver vamp --quant-polish-mode topk_block_cd \
-  --quant-topk-k 8 \
+  --quant-topk-k 16 \
   --output-dir runs/my_model \
   --json-out runs/my_model/results.json
 ```
@@ -251,7 +270,7 @@ python scripts/benchmark.py \
   --bits 4 \
   --model-id Qwen/Qwen3-0.6B \
   --quant-solvers gptq vamp \
-  --quant-polish-modes none block_cd topk_block_cd \
+  --quant-polish-modes none block_cd \
   --quant-preprocesses none awq \
   --quant-rotations hadamard \
   --seeds 0
@@ -274,7 +293,7 @@ python scripts/ablation.py \
   --quant-rotation hadamard \
   --quant-solver vamp \
   --quant-polish-mode topk_block_cd \
-  --quant-topk-k 8
+  --quant-topk-k 16
 ```
 
 QUIP-side ablation:
@@ -286,7 +305,7 @@ python scripts/ablation.py \
   --quant-rotation had \
   --quant-solver vamp \
   --quant-polish-mode topk_block_cd \
-  --quant-topk-k 8
+  --quant-topk-k 16
 ```
 
 ## Legacy compatibility

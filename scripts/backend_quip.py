@@ -397,7 +397,7 @@ def run(args) -> Dict[str, Any]:
             "--quant-topk-source",
             str(combo.topk_source),
             "--quant-topk-k",
-            str(int(getattr(args, "quant_topk_k", getattr(args, "mpq_topk_k", 8)))),
+            str(int(getattr(args, "quant_topk_k", getattr(args, "mpq_topk_k", 16)))),
             "--mpq-method",
             str(getattr(args, "mpq_method", "vamp")),
             "--mpq_init",
@@ -431,7 +431,7 @@ def run(args) -> Dict[str, Any]:
             "--mpq_metric_rows_per_chunk",
             str(int(args.mpq_metric_rows_per_chunk)),
             "--mpq-topk-k",
-            str(int(getattr(args, "mpq_topk_k", 8))),
+            str(int(getattr(args, "mpq_topk_k", 16))),
         ]
         quant_cmd.append("--mpq_em_obs_precision" if bool(args.mpq_em_obs_precision) else "--no-mpq_em_obs_precision")
         quant_cmd.append("--mpq_compile_prior" if bool(getattr(args, "mpq_compile_prior", True)) else "--no-mpq_compile_prior")
@@ -578,7 +578,7 @@ def run(args) -> Dict[str, Any]:
             "blocks_per_chunk": int(args.mpq_blocks_per_chunk),
             "block_rows": int(args.mpq_block_rows),
             "metric_rows_per_chunk": int(args.mpq_metric_rows_per_chunk),
-            "topk_k": int(getattr(args, "mpq_topk_k", 8)),
+            "topk_k": int(getattr(args, "mpq_topk_k", 16)),
         }
         if solver_mode == "mpq"
         else {},
@@ -602,7 +602,7 @@ def main() -> None:
     parser.add_argument("--quant-solver", dest="quant_solver", type=str, default=None, choices=["ldlq", "vamp", "ldlq_tune10"])
     parser.add_argument("--quant-polish-mode", dest="quant_polish_mode", type=str, default="none", choices=["none", "block_cd", "topk_block_cd"])
     parser.add_argument("--quant-topk-source", dest="quant_topk_source", type=str, default="aux_vamp")
-    parser.add_argument("--quant-topk-k", dest="quant_topk_k", type=int, default=8)
+    parser.add_argument("--quant-topk-k", dest="quant_topk_k", type=int, default=16)
     parser.add_argument("--base-model", required=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--codebook", type=str, default="E8P12")
@@ -645,7 +645,7 @@ def main() -> None:
     parser.add_argument("--mpq-polish-metric", type=str, default="gram", choices=["gram", "diag", "isotropic"])
     parser.add_argument("--mpq-polish-max-blocks", type=int, default=0)
     parser.add_argument("--mpq-metric-rows-per-chunk", type=int, default=0)
-    parser.add_argument("--mpq-topk-k", type=int, default=8)
+    parser.add_argument("--mpq-topk-k", type=int, default=16)
 
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--json-out", type=str, required=True)

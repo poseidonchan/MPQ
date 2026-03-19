@@ -20,7 +20,7 @@ def main() -> None:
     parser.add_argument("--mpq-method", type=str, default="vamp")
     parser.add_argument("--mpq-solver", type=str, default=None)
     parser.add_argument("--mpq-polish-mode", type=str, default=None)
-    parser.add_argument("--mpq-topk-k", type=int, default=8)
+    parser.add_argument("--mpq-topk-k", type=int, default=16)
     parser.add_argument("--mpq-compile-prior", "--mpq_compile_prior", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--quant-backend", type=str, default=None)
     parser.add_argument("--quant-codebook", type=str, default=None)

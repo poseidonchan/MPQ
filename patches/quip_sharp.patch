@@ -795,7 +795,7 @@ index af33222..e5ce82a 100644
 +                    default='vamp',
 +                    type=str,
 +                    choices=['vamp', 'vamp-topk-polish'])
-+parser.add_argument('--mpq-topk-k', dest='mpq_topk_k', default=8, type=int)
++parser.add_argument('--mpq-topk-k', dest='mpq_topk_k', default=16, type=int)
 +
  
  def check_exist(idx, args):

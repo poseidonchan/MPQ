@@ -136,7 +136,7 @@ def main() -> None:
     parser.add_argument("--quant-solver", type=str, default=None)
     parser.add_argument("--quant-polish-mode", type=str, default=None)
     parser.add_argument("--quant-topk-source", type=str, default="aux_vamp")
-    parser.add_argument("--quant-topk-k", type=int, default=8)
+    parser.add_argument("--quant-topk-k", type=int, default=16)
 
     parser.add_argument("--calibration-dataset", type=str, default="c4")
     parser.add_argument("--calibration-split", type=str, default="train")

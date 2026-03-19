@@ -309,7 +309,7 @@ def _build_vamp_cfg(args: Any, *, polish_mode: str) -> E8P12VampConfig:
         polish_metric=str(getattr(args, "mpq_polish_metric", "gram")),
         polish_metric_rows_per_chunk=int(getattr(args, "mpq_metric_rows_per_chunk", 0)),
         polish_max_blocks=int(getattr(args, "mpq_polish_max_blocks", 0)),
-        topk_k=int(getattr(args, "mpq_topk_k", getattr(args, "quant_topk_k", 8)) or 8),
+        topk_k=int(getattr(args, "mpq_topk_k", getattr(args, "quant_topk_k", 16)) or 16),
     )
 
 
@@ -488,7 +488,7 @@ def mpq_refine_codebook(
                     blocks_per_chunk=int(getattr(args, "mpq_blocks_per_chunk", 16)),
                     prior_tau=float(getattr(args, "mpq_prior_tau", 0.25)),
                     prior_tau_scale_mode=str(getattr(args, "mpq_prior_tau_scale_mode", "absmax")),
-                    k=int(getattr(args, "mpq_topk_k", getattr(args, "quant_topk_k", 8)) or 8),
+                    k=int(getattr(args, "mpq_topk_k", getattr(args, "quant_topk_k", 16)) or 16),
                 )
                 hat_chunk, idx_chunk, _err_chunk, polish_stats = polish_e8p12_rankspace(
                     x_init=final_hatWr[rb],
