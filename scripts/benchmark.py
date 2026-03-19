@@ -180,7 +180,11 @@ def _flatten_result(row: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(lm_eval_results, dict):
             for task_name, task_metrics in sorted(lm_eval_results.items()):
                 if isinstance(task_metrics, dict):
-                    val = task_metrics.get("acc_norm,none", task_metrics.get("acc,none"))
+                    val = task_metrics.get("acc_norm,none",
+                          task_metrics.get("acc,none",
+                          task_metrics.get("exact_match,strict-match",
+                          task_metrics.get("exact_match,flexible-extract",
+                          task_metrics.get("pass@1,none")))))
                     if val is not None:
                         try:
                             flat[f"lm_eval_{task_name}"] = float(val)
@@ -688,7 +692,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.lm_eval_tasks is not None and len(args.lm_eval_tasks) == 0:
-        args.lm_eval_tasks = ["mmlu", "gpqa", "gsm8k", "humaneval", "hellaswag"]
+        args.lm_eval_tasks = ["mmlu", "arc_challenge", "gsm8k", "humaneval", "hellaswag"]
 
     bits = int(args.bits)
     seeds = _parse_seeds(list(args.seeds))

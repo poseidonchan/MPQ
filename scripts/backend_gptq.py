@@ -467,8 +467,11 @@ def _run_lm_eval(hf_model, tokenizer, *, tasks, batch_size, num_fewshot):
     from lm_eval.models.huggingface import HFLM
 
     lm = HFLM(pretrained=hf_model, tokenizer=tokenizer, batch_size=batch_size)
+    import os
+    os.environ["HF_ALLOW_CODE_EVAL"] = "1"
     eval_results = simple_evaluate(
         model=lm, tasks=tasks, batch_size=batch_size, num_fewshot=num_fewshot,
+        confirm_run_unsafe_code=True,
     )
     results = {}
     for task_name, task_metrics in eval_results.get("results", {}).items():
