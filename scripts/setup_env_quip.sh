@@ -15,6 +15,16 @@ if ! conda env list | awk '{print $1}' | grep -qx "${ENV_NAME}"; then
   conda create -y -n "${ENV_NAME}" "python=${PYTHON_VERSION}" pip
 fi
 
+conda_run_cuda_build() {
+  conda run -n "${ENV_NAME}" bash -lc "
+    export CUDA_HOME=\"\$CONDA_PREFIX\"
+    export PATH=\"\$CONDA_PREFIX/bin:\$PATH\"
+    export CUDACXX=\"\$CONDA_PREFIX/bin/nvcc\"
+    export TORCH_CUDA_ARCH_LIST=\"${TORCH_CUDA_ARCH_LIST}\"
+    $*
+  "
+}
+
 conda run -n "${ENV_NAME}" python -m pip install --no-cache-dir -U pip
 conda run -n "${ENV_NAME}" python -m pip install --no-cache-dir -e .
 
@@ -50,10 +60,10 @@ conda run -n "${ENV_NAME}" python -m pip install --no-cache-dir -U "transformers
 
 # Build fast_hadamard_transform from source against the already-installed torch.
 # We pin and patch the upstream repo as a submodule for reproducibility.
-conda run -n "${ENV_NAME}" env TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" FAST_HADAMARD_TRANSFORM_FORCE_BUILD=TRUE python -m pip install --no-cache-dir --no-build-isolation -v third_party/fast-hadamard-transform
+conda_run_cuda_build "FAST_HADAMARD_TRANSFORM_FORCE_BUILD=TRUE python -m pip install --no-cache-dir --no-build-isolation -v third_party/fast-hadamard-transform"
 
 # Build quiptools_cuda; force a PTX-only arch to avoid requiring a brand-new nvcc.
 # quiptools' setup.py imports torch; disable build isolation so the build env can see the installed torch.
-conda run -n "${ENV_NAME}" env TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" python -m pip install --no-cache-dir -e third_party/quip-sharp/quiptools --no-build-isolation
+conda_run_cuda_build "python -m pip install --no-cache-dir -e third_party/quip-sharp/quiptools --no-build-isolation"
 
 echo "OK: created/updated conda env ${ENV_NAME}"

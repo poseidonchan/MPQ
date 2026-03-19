@@ -24,6 +24,24 @@ bash install.sh --gptq-only  # GPTQModel only
 bash install.sh --quip-only  # QUIP# only
 ```
 
+### Installation environment variables
+
+These variables affect environment creation and CUDA extension builds, so they should be set before running `install.sh`.
+
+| Variable | Default | Description |
+|---|---|---|
+| `ENV_NAME` | backend default | Override the conda env name, e.g. `mpq-gptq-test` or `mpq-quip-test` |
+| `PYTHON_VERSION` | `3.11` | Python version used when creating the conda env |
+| `CUDA_TOOLKIT_VERSION` | `12.8` | CUDA toolkit version installed into the conda env |
+| `TORCH_CUDA_ARCH_LIST` | `8.0+PTX` | GPU arch list used when compiling CUDA extensions |
+| `INSTALL_FLASH_ATTN` | `0` | QUIP# env only; set to `1` to install flash-attention from upstream requirements |
+
+Example:
+
+```bash
+ENV_NAME=mpq-quip-test CUDA_TOOLKIT_VERSION=12.8 TORCH_CUDA_ARCH_LIST=8.0+PTX bash install.sh --quip-only
+```
+
 If you already cloned without submodules:
 
 ```bash
@@ -137,11 +155,3 @@ Both backends save a native artifact and a HuggingFace-exported artifact by defa
 `backend_results.json` also exposes normalized paths:
 - `paths.native_dir`
 - `paths.hf_dir`
-
-## Environment variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `CUDA_TOOLKIT_VERSION` | `12.8` | CUDA toolkit version for conda install |
-| `TORCH_CUDA_ARCH_LIST` | `8.0+PTX` | GPU arch for CUDA extension compilation |
-| `INSTALL_FLASH_ATTN` | `0` | Set to `1` to install flash-attention (QUIP# env) |
