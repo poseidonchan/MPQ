@@ -2,6 +2,11 @@
 
 This is the intended public matrix for benchmark runs.
 
+Model scope for both backend families:
+- dense decoder-only HuggingFace causal LMs
+- validated target families currently include Llama-like and Qwen-like stacks
+- unsupported families should fail early through adapter/model-map checks
+
 ## Normal grid: GPTQModel
 
 | backend | codebook | preprocess | rotation | solver | polish_mode | notes |

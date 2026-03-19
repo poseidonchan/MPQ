@@ -15,6 +15,9 @@ from transformers import AutoModelForCausalLM
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 QUIP_ROOT = REPO_ROOT / "third_party" / "quip-sharp"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+from mpq.dense_decoder_adapter import resolve_dense_decoder_adapter_for_model
 
 
 def _setup_pythonpath() -> None:
@@ -41,28 +44,9 @@ def _maybe_reexec_with_conda_ld_library_path() -> None:
     os.execvpe(sys.executable, [sys.executable, *sys.argv], env)
 
 
-def _extract_llama_weights(model: Any, layer: int, suffix: str) -> List[torch.Tensor]:
-    suffix = str(suffix).strip().lower()
-    layers = None
-    for attr in ("model", "transformer"):
-        root = getattr(model, attr, None)
-        if root is not None and hasattr(root, "layers"):
-            layers = root.layers
-            break
-    if layers is None:
-        raise RuntimeError("could not locate Llama layers at model.model.layers")
-    block = layers[int(layer)]
-    if suffix == "qkv":
-        attn = block.self_attn
-        return [attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight]
-    if suffix == "o":
-        return [block.self_attn.o_proj.weight]
-    if suffix == "down":
-        return [block.mlp.down_proj.weight]
-    if suffix == "up":
-        # Match QUIP# convention: stack gate + up for the 'up' module.
-        return [block.mlp.gate_proj.weight, block.mlp.up_proj.weight]
-    raise ValueError(f"unsupported suffix={suffix!r}; expected qkv|o|up|down")
+def _extract_decoder_weights(model: Any, layer: int, suffix: str) -> List[torch.Tensor]:
+    adapter = resolve_dense_decoder_adapter_for_model(model)
+    return adapter.extract_logical_weights(model, int(layer), str(suffix))
 
 
 @torch.inference_mode()
@@ -573,7 +557,7 @@ def main() -> None:
         device_map=None,
     )
     model.eval()
-    weights = _extract_llama_weights(model, int(args.layer), str(args.suffix))
+    weights = _extract_decoder_weights(model, int(args.layer), str(args.suffix))
     weights = [w.detach().cpu() for w in weights]
     del model
 

@@ -21,6 +21,9 @@ cd "${SCRIPT_DIR}"
 echo "==> Initializing submodules..."
 git submodule update --init --recursive
 
+echo "==> Verifying patch health..."
+python patches/apply_patches.py --check
+
 echo "==> Applying patches..."
 python patches/apply_patches.py
 

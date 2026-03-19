@@ -18,6 +18,7 @@ Documentation:
 ```bash
 git clone --recurse-submodules https://github.com/poseidonchan/MPQ.git
 cd MPQ
+python patches/apply_patches.py --check
 bash install.sh              # both envs
 bash install.sh --gptq-only  # GPTQModel only
 bash install.sh --quip-only  # QUIP# only
@@ -36,6 +37,12 @@ bash install.sh
 ```
 
 For the full environment and patch workflow, see [docs/repro.md](docs/repro.md).
+
+Patch health can be checked independently at any time:
+
+```bash
+python patches/apply_patches.py --check
+```
 
 ## Running benchmarks
 
@@ -60,6 +67,15 @@ The same solver code is used in both integration paths:
 - QUIP# adapter: `mpq/adapters/quip_sharp.py` (E8P12 codebook refinement)
 
 The primary solver family lives behind an orthogonal combo interface (`backend`, `codebook`, `preprocess`, `rotation`, `solver`, `polish_mode`). The main research path is `VAMP + topk block CD polish`.
+
+## Supported model backbones
+
+Public benchmark paths target dense decoder-only HuggingFace causal LMs.
+
+- `scripts/backend_gptq.py` follows GPTQModel's architecture support, including Llama and Qwen families.
+- Public `3-bit` and `4-bit` runs are handled through the GPTQModel backend path.
+- `scripts/backend_quip.py` now supports Llama/Qwen/Mistral-like dense decoder stacks through a repo-side adapter layer.
+- Multimodal, MoE, and non-decoder architectures are still out of scope for the public benchmark path.
 
 ## Key entrypoints
 
@@ -106,6 +122,21 @@ conda run -n mpq-quip python scripts/backend_quip.py \
   --output-dir runs/my_model \
   --json-out runs/my_model/results.json
 ```
+
+## Saved artifacts
+
+Both backends save a native artifact and a HuggingFace-exported artifact by default.
+
+- GPTQModel backend:
+  - native packed model: `<output-dir>/quantized`
+  - HF export: `<output-dir>/hf`
+- QUIP# backend:
+  - native packed checkpoint: `<output-dir>/ckpt`
+  - HF export: `<output-dir>/hf`
+
+`backend_results.json` also exposes normalized paths:
+- `paths.native_dir`
+- `paths.hf_dir`
 
 ## Environment variables
 

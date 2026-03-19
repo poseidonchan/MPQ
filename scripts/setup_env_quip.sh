@@ -42,6 +42,9 @@ else
   rm -f "${TMP_REQ}"
 fi
 
+# Upgrade lm_eval to 0.4+ for unified lm-evaluation-harness API.
+conda run -n "${ENV_NAME}" python -m pip install --no-cache-dir "lm_eval>=0.4.7"
+
 # Llama-3.2 configs require a newer `transformers` for `rope_scaling.rope_type="llama3"`.
 conda run -n "${ENV_NAME}" python -m pip install --no-cache-dir -U "transformers>=4.45,<5" "huggingface_hub>=0.34"
 

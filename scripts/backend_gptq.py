@@ -461,6 +461,23 @@ def _build_quantize_config(combo: Optional[QuantCombo], runtime: Dict[str, Any],
     return qcfg
 
 
+def _run_lm_eval(hf_model, tokenizer, *, tasks, batch_size, num_fewshot):
+    """Run lm-evaluation-harness tasks in-process."""
+    from lm_eval import simple_evaluate
+    from lm_eval.models.huggingface import HFLM
+
+    lm = HFLM(pretrained=hf_model, tokenizer=tokenizer, batch_size=batch_size)
+    eval_results = simple_evaluate(
+        model=lm, tasks=tasks, batch_size=batch_size, num_fewshot=num_fewshot,
+    )
+    results = {}
+    for task_name, task_metrics in eval_results.get("results", {}).items():
+        results[task_name] = {
+            k: v for k, v in task_metrics.items() if k != "alias"
+        }
+    return {"tasks": list(tasks), "results": results}
+
+
 def run(args) -> Dict[str, Any]:
     resolved_device = _resolve_device_str(getattr(args, "device", None))
     if args.device and str(args.device).startswith("cuda") and not resolved_device.startswith("cuda"):
@@ -518,7 +535,9 @@ def run(args) -> Dict[str, Any]:
     quant_time = float(time.time() - t_quant)
 
     quantized_dir = Path(args.output_dir) / "quantized"
+    hf_dir = Path(args.output_dir) / "hf"
     quantized_dir.mkdir(parents=True, exist_ok=True)
+    hf_dir.mkdir(parents=True, exist_ok=True)
     t_save = time.time()
     model.save(str(quantized_dir))
     tokenizer.save_pretrained(str(quantized_dir))
@@ -586,6 +605,34 @@ def run(args) -> Dict[str, Any]:
     else:
         eval_datasets = []
 
+    lm_eval_tasks = list(getattr(args, "lm_eval_tasks", None) or [])
+    lm_eval_result = {}
+    lm_eval_time_s = 0.0
+    if lm_eval_tasks and not skip_eval:
+        t_lm = time.time()
+        lm_eval_result = _run_lm_eval(
+            hf_model, tokenizer,
+            tasks=lm_eval_tasks,
+            batch_size=int(getattr(args, "lm_eval_batch_size", 1)),
+            num_fewshot=int(getattr(args, "lm_eval_num_fewshot", 0)),
+        )
+        lm_eval_time_s = float(time.time() - t_lm)
+
+    if "hf_model" in locals():
+        del hf_model
+    if "model" in locals():
+        del model
+    gc.collect()
+    if device.type == "cuda":
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    t_hfize = time.time()
+    GPTQModel.export(str(quantized_dir), str(hf_dir), format="hf")
+    hfize_s = float(time.time() - t_hfize)
+
     return {
         "backend": "gptqmodel",
         "requested_method": runtime["requested_method"],
@@ -622,18 +669,27 @@ def run(args) -> Dict[str, Any]:
             "max_eval_tokens": int(args.eval_max_eval_tokens),
             "ppl": ppls,
         },
+        "lm_eval": lm_eval_result,
         "timing": {
             "awq_preprocess_s": float(awq_time_s),
             "load_s": float(load_time_s),
             "quantize_s": float(quant_time),
             "save_quantized_s": float(save_quantized_s),
+            "hfize_s": float(hfize_s),
             **eval_times,
-            "eval_total_s": float(sum(eval_times.values())),
-            "quantize_total_s": float(load_time_s + awq_time_s + quant_time + save_quantized_s),
-            "total_s": float(load_time_s + awq_time_s + quant_time + save_quantized_s + sum(eval_times.values())),
+            "lm_eval_s": float(lm_eval_time_s),
+            "eval_total_s": float(sum(eval_times.values()) + lm_eval_time_s),
+            "quantize_total_s": float(load_time_s + awq_time_s + quant_time + save_quantized_s + hfize_s),
+            "total_s": float(load_time_s + awq_time_s + quant_time + save_quantized_s + hfize_s + sum(eval_times.values()) + lm_eval_time_s),
         },
         "paths": {
+            "native_dir": str(quantized_dir),
+            "hf_dir": str(hf_dir),
             "quantized_dir": str(quantized_dir),
+        },
+        "artifact_format": {
+            "native": "gptqmodel",
+            "hf": "huggingface",
         },
         "quantization_path": {
             "dense": bool(
@@ -715,6 +771,11 @@ def main() -> None:
     parser.add_argument("--eval-max-eval-tokens", type=int, default=131072)
     parser.add_argument("--eval-datasets", nargs="*", default=["wikitext2", "c4"])
     parser.add_argument("--skip-eval", action=argparse.BooleanOptionalAction, default=False)
+
+    # lm-evaluation-harness
+    parser.add_argument("--lm-eval-tasks", nargs="*", default=None)
+    parser.add_argument("--lm-eval-batch-size", type=int, default=1)
+    parser.add_argument("--lm-eval-num-fewshot", type=int, default=0)
 
     # AWQ preprocess
     parser.add_argument("--awq-batch-size", type=int, default=1)

@@ -4,6 +4,7 @@ import argparse
 import pathlib
 import subprocess
 import sys
+import tempfile
 from typing import Sequence
 
 
@@ -11,18 +12,15 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 SUBMODULES = {
     "GPTQModel": {
-        "path": REPO_ROOT / "third_party" / "GPTQModel",
-        "expected_sha": "ed96f2e04ec868b04f969733a242ce3b5bb7cb1e",
+        "path": pathlib.Path("third_party") / "GPTQModel",
         "patch": REPO_ROOT / "patches" / "gptqmodel.patch",
     },
     "fast-hadamard-transform": {
-        "path": REPO_ROOT / "third_party" / "fast-hadamard-transform",
-        "expected_sha": "e7706faf8d1c3b9f241e36860640ad1dac644ede",
+        "path": pathlib.Path("third_party") / "fast-hadamard-transform",
         "patch": REPO_ROOT / "patches" / "fast_hadamard_transform.patch",
     },
     "quip-sharp": {
-        "path": REPO_ROOT / "third_party" / "quip-sharp",
-        "expected_sha": "1d8f873e9a2a8b86b12bb1064c312c5689b77d98",
+        "path": pathlib.Path("third_party") / "quip-sharp",
         "patch": REPO_ROOT / "patches" / "quip_sharp.patch",
     },
 }
@@ -54,6 +52,19 @@ def _rev_parse_head(path: pathlib.Path, *, name: str) -> str:
     return proc.stdout.strip()
 
 
+def _gitlink_sha(path: pathlib.Path, *, name: str) -> str:
+    proc = _run(["git", "ls-tree", "HEAD", "--", str(path)], cwd=REPO_ROOT)
+    if proc.returncode != 0:
+        raise RuntimeError(f"{name}: failed to query pinned gitlink:\n{proc.stdout}")
+    line = proc.stdout.strip()
+    if not line:
+        raise RuntimeError(f"{name}: no gitlink found for {path}")
+    fields = line.split()
+    if len(fields) < 3 or fields[1] != "commit":
+        raise RuntimeError(f"{name}: expected submodule gitlink entry, got:\n{line}")
+    return fields[2]
+
+
 def _git_apply(path: pathlib.Path, patch: pathlib.Path, *, reverse: bool = False, check: bool = False) -> subprocess.CompletedProcess[str]:
     cmd = ["git", "apply"]
     if reverse:
@@ -64,7 +75,25 @@ def _git_apply(path: pathlib.Path, patch: pathlib.Path, *, reverse: bool = False
     return _run(cmd, cwd=path)
 
 
-def apply_patch(*, name: str, path: pathlib.Path, expected_sha: str, patch: pathlib.Path, allow_sha_mismatch: bool) -> None:
+def _verify_patch_against_pinned_revision(*, name: str, repo_path: pathlib.Path, expected_sha: str, patch: pathlib.Path) -> None:
+    with tempfile.TemporaryDirectory(prefix=f"patchcheck_{name.replace('/', '_')}_") as tmpdir:
+        tmpdir_path = pathlib.Path(tmpdir)
+        add_proc = _run(["git", "worktree", "add", "--detach", "--force", str(tmpdir_path), expected_sha], cwd=repo_path)
+        if add_proc.returncode != 0:
+            raise RuntimeError(f"{name}: failed to create temporary worktree for patch verification:\n{add_proc.stdout}")
+        try:
+            check_proc = _git_apply(tmpdir_path, patch, check=True)
+            if check_proc.returncode != 0:
+                raise RuntimeError(
+                    f"{name}: patch does not apply cleanly to pinned revision {expected_sha}:\n{check_proc.stdout}"
+                )
+        finally:
+            remove_proc = _run(["git", "worktree", "remove", "--force", str(tmpdir_path)], cwd=repo_path)
+            if remove_proc.returncode != 0:
+                raise RuntimeError(f"{name}: failed to remove temporary worktree:\n{remove_proc.stdout}")
+
+
+def _check_patch_state(*, name: str, path: pathlib.Path, expected_sha: str, patch: pathlib.Path, allow_sha_mismatch: bool) -> None:
     if not patch.exists():
         raise FileNotFoundError(f"{name}: patch file not found: {patch}")
     if not path.exists():
@@ -80,19 +109,26 @@ def apply_patch(*, name: str, path: pathlib.Path, expected_sha: str, patch: path
             f"Re-checkout submodules or run with --allow-sha-mismatch."
         )
 
-    # Idempotent apply:
-    # - If already applied, `git apply --reverse --check` succeeds even if the worktree is dirty.
+    reverse_check = _git_apply(path, patch, reverse=True, check=True)
+    already_applied = reverse_check.returncode == 0
+    _verify_patch_against_pinned_revision(name=name, repo_path=path, expected_sha=expected_sha, patch=patch)
+    if not already_applied:
+        _require_clean_worktree(path, name=name)
+    state = "patch already applied" if already_applied else "patch ready to apply"
+    print(f"{name}: {state}")
+
+
+def apply_patch(*, name: str, path: pathlib.Path, expected_sha: str, patch: pathlib.Path, allow_sha_mismatch: bool) -> None:
+    _check_patch_state(
+        name=name,
+        path=path,
+        expected_sha=expected_sha,
+        patch=patch,
+        allow_sha_mismatch=allow_sha_mismatch,
+    )
     reverse_check = _git_apply(path, patch, reverse=True, check=True)
     if reverse_check.returncode == 0:
-        print(f"{name}: patch already applied")
         return
-
-    # Patch not detected; require a clean worktree before applying to avoid clobbering local edits.
-    _require_clean_worktree(path, name=name)
-
-    check_proc = _git_apply(path, patch, check=True)
-    if check_proc.returncode != 0:
-        raise RuntimeError(f"{name}: patch does not apply cleanly:\n{check_proc.stdout}")
 
     apply_proc = _git_apply(path, patch, check=False)
     if apply_proc.returncode != 0:
@@ -104,16 +140,28 @@ def apply_patch(*, name: str, path: pathlib.Path, expected_sha: str, patch: path
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--allow-sha-mismatch", action="store_true", help="Apply patches even if submodule SHA differs.")
+    parser.add_argument("--check", action="store_true", help="Validate pinned submodules and patch health without applying.")
     args = parser.parse_args()
 
     for name, meta in SUBMODULES.items():
-        apply_patch(
-            name=name,
-            path=meta["path"],
-            expected_sha=meta["expected_sha"],
-            patch=meta["patch"],
-            allow_sha_mismatch=bool(args.allow_sha_mismatch),
-        )
+        path = REPO_ROOT / meta["path"]
+        expected_sha = _gitlink_sha(meta["path"], name=name)
+        if args.check:
+            _check_patch_state(
+                name=name,
+                path=path,
+                expected_sha=expected_sha,
+                patch=meta["patch"],
+                allow_sha_mismatch=bool(args.allow_sha_mismatch),
+            )
+        else:
+            apply_patch(
+                name=name,
+                path=path,
+                expected_sha=expected_sha,
+                patch=meta["patch"],
+                allow_sha_mismatch=bool(args.allow_sha_mismatch),
+            )
     return 0
 
 

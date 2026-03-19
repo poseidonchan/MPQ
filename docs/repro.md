@@ -6,6 +6,11 @@ Repository:
 - GitHub: `https://github.com/poseidonchan/MPQ`
 - Clone URL: `https://github.com/poseidonchan/MPQ.git`
 
+Public backend scope:
+- dense decoder-only HuggingFace causal LMs
+- currently validated on Llama-like and Qwen-like decoder stacks
+- not intended for MoE, vision-language, or encoder-decoder backbones
+
 ## Clone with submodules
 
 Recommended:
@@ -13,6 +18,8 @@ Recommended:
 ```bash
 git clone --recurse-submodules https://github.com/poseidonchan/MPQ.git
 cd MPQ
+python patches/apply_patches.py --check
+bash install.sh
 ```
 
 If the repo is already cloned without submodules:
@@ -25,11 +32,23 @@ Do not manually clone arbitrary upstream revisions into `third_party/`. The repo
 
 ## Patch workflow
 
+- Validate patch health against the pinned submodule revisions:
+
+```bash
+python patches/apply_patches.py --check
+```
+
 - Apply patches before building CUDA extensions:
 
 ```bash
 python patches/apply_patches.py
 ```
+
+`install.sh` runs both steps in order:
+1. initialize pinned submodules
+2. validate patch health
+3. apply patches
+4. build backend environments
 
 - Keep algorithm code in this repo:
   - `mpq/solver.py`
@@ -65,6 +84,21 @@ python -m pip install -r third_party/GPTQModel/requirements.txt
 # QUIP env
 python -m pip install -r third_party/quip-sharp/requirements.txt
 ```
+
+## Saved artifacts
+
+Both public backends save a native artifact plus an HF-exported artifact.
+
+- GPTQModel backend:
+  - native packed artifact: `<output-dir>/quantized`
+  - HF export: `<output-dir>/hf`
+- QUIP# backend:
+  - native packed artifact: `<output-dir>/ckpt`
+  - HF export: `<output-dir>/hf`
+
+The backend result JSON also includes normalized paths:
+- `paths.native_dir`
+- `paths.hf_dir`
 
 ### fast-hadamard-transform
 

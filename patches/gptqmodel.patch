@@ -15,7 +15,7 @@ index 7a054508..5d5c8554 100644
  from typing import Dict, List, Optional, Tuple, Union
  
 diff --git a/gptqmodel/looper/gptq_processor.py b/gptqmodel/looper/gptq_processor.py
-index e9b342a5..91f26b29 100644
+index e9b342a5..ace53bf6 100644
 --- a/gptqmodel/looper/gptq_processor.py
 +++ b/gptqmodel/looper/gptq_processor.py
 @@ -322,6 +322,23 @@ class GPTQProcessor(LoopProcessor):
@@ -43,7 +43,7 @@ index e9b342a5..91f26b29 100644
              # if calculate_w_wq_diff is enabled (eora), we need to revert our original wq
              if self.calculate_w_wq_diff:
 diff --git a/gptqmodel/models/base.py b/gptqmodel/models/base.py
-index 7d16f5ae..6d3b4eb8 100644
+index 7d16f5ae..e6c63923 100644
 --- a/gptqmodel/models/base.py
 +++ b/gptqmodel/models/base.py
 @@ -749,30 +749,39 @@ class BaseQModel(nn.Module):
@@ -141,7 +141,7 @@ index 9cb7a38d..9ad6cd86 100644
          if adapter is not None:
              if adapter.path in LORA_MERGED_WEIGHT_PATHS:
 diff --git a/gptqmodel/quantization/config.py b/gptqmodel/quantization/config.py
-index 97998f41..93268c75 100644
+index 97998f41..68f76e28 100644
 --- a/gptqmodel/quantization/config.py
 +++ b/gptqmodel/quantization/config.py
 @@ -10,7 +10,10 @@ from enum import Enum
@@ -174,7 +174,7 @@ index 97998f41..93268c75 100644
 +    solver: str = "vamp"
 +    polish_mode: str = "block_cd"
 +    topk_source: str = "aux_vamp"
-+    topk_k: int = 16
++    topk_k: int = 8
 +
 +    # VAMP loop
 +    iters: int = 10
@@ -219,7 +219,7 @@ index 97998f41..93268c75 100644
      # Takes a list of devices and returns either the original list or a filtered subset
      compute_device_filter: Optional[callable] = field(
 diff --git a/gptqmodel/quantization/gptq.py b/gptqmodel/quantization/gptq.py
-index ae0921aa..b8185211 100644
+index ae0921aa..edded766 100644
 --- a/gptqmodel/quantization/gptq.py
 +++ b/gptqmodel/quantization/gptq.py
 @@ -935,6 +935,85 @@ class GPTQ:
@@ -259,7 +259,7 @@ index ae0921aa..b8185211 100644
 +                em_obs_precision_max=float(getattr(mpq_cfg, "em_obs_precision_max", 1e8)),
 +                polish_sweeps=int(getattr(mpq_cfg, "polish_sweeps", 3)),
 +                polish_mode=str(getattr(mpq_cfg, "polish_mode", "block_cd") or "block_cd"),
-+                topk_k=int(getattr(mpq_cfg, "topk_k", 16) or 16),
++                topk_k=int(getattr(mpq_cfg, "topk_k", 8) or 8),
 +            )
 +            adapter_cfg = GPTQAdapterConfig(
 +                hessian_scale=float(getattr(mpq_cfg, "hessian_scale", 0.5)),
@@ -360,7 +360,7 @@ index ae0921aa..b8185211 100644
          # Use simplified loop when mock_quantization is active
          if self.qcfg.mock_quantization:
              for i1 in range(0, self.columns, blocksize):
-@@ -1171,10 +1287,6 @@ class GPTQ:
+@@ -1171,10 +1295,6 @@ class GPTQ:
          else:
              avg_loss = f"{resolved_strategy.value} failsafe" if failsafe_configured else 999999999
  
@@ -428,7 +428,7 @@ index ae0921aa..b8185211 100644
          if isinstance(self.module, transformers.Conv1D):
              Q = Q.t()
  
-@@ -1213,18 +1368,6 @@ class GPTQ:
+@@ -1213,18 +1378,6 @@ class GPTQ:
          else:
              Q = Q.to(self.module.weight.dtype)
  

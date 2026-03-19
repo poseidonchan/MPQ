@@ -150,7 +150,7 @@ def _flatten_result(row: Dict[str, Any]) -> Dict[str, Any]:
         topk_k = int(row["mpq"].get("topk_k", 0) or 0)
     elif isinstance(row.get("awq_preprocess"), dict):
         topk_k = int(row.get("topk_k", 0) or 0)
-    return {
+    flat = {
         "model_id": str(model_id),
         "backend": str(row.get("backend", "")),
         "codebook": str(row.get("codebook", row.get("codebook_impl", ""))),
@@ -174,6 +174,19 @@ def _flatten_result(row: Dict[str, Any]) -> Dict[str, Any]:
         "eval_total_s": float(timing.get("eval_total_s", 0.0) or 0.0),
         "total_s": float(timing.get("total_s", 0.0) or 0.0),
     }
+    lm_eval_payload = row.get("lm_eval", {})
+    if isinstance(lm_eval_payload, dict):
+        lm_eval_results = lm_eval_payload.get("results", {})
+        if isinstance(lm_eval_results, dict):
+            for task_name, task_metrics in sorted(lm_eval_results.items()):
+                if isinstance(task_metrics, dict):
+                    val = task_metrics.get("acc_norm,none", task_metrics.get("acc,none"))
+                    if val is not None:
+                        try:
+                            flat[f"lm_eval_{task_name}"] = float(val)
+                        except (TypeError, ValueError):
+                            pass
+    return flat
     ppl = eval_payload.get("ppl")
     if isinstance(ppl, dict):
         try:
@@ -244,6 +257,7 @@ def _build_job_args(args, *, bits: int, label: str, combo: Optional[QuantCombo])
                 job_args.calibration_limit = min(int(args.calibration_limit), int(args.sanity_smoke_calibration_limit))
             job_args.skip_eval = True
             job_args.eval_datasets = []
+            job_args.lm_eval_tasks = []
         else:
             job_args.skip_eval = False
     else:
@@ -325,6 +339,9 @@ def _legacy_quip_cmd(method: str, *, seed: int, seed_dir: Path, method_dir: Path
         str(int(args.mpq_metric_rows_per_chunk)),
         "--mpq-topk-k",
         str(int(args.quant_topk_k)),
+        *(["--lm-eval-tasks", *list(args.lm_eval_tasks)] if getattr(args, "lm_eval_tasks", None) else []),
+        *(["--lm-eval-batch-size", str(args.lm_eval_batch_size)] if getattr(args, "lm_eval_tasks", None) else []),
+        *(["--lm-eval-num-fewshot", str(args.lm_eval_num_fewshot)] if getattr(args, "lm_eval_tasks", None) else []),
         "--output-dir",
         str(method_dir),
         "--json-out",
@@ -420,6 +437,9 @@ def _combo_quip_cmd(combo: QuantCombo, *, seed: int, seed_dir: Path, method_dir:
         str(int(args.mpq_metric_rows_per_chunk)),
         "--mpq-topk-k",
         str(int(args.quant_topk_k)),
+        *(["--lm-eval-tasks", *list(args.lm_eval_tasks)] if getattr(args, "lm_eval_tasks", None) else []),
+        *(["--lm-eval-batch-size", str(args.lm_eval_batch_size)] if getattr(args, "lm_eval_tasks", None) else []),
+        *(["--lm-eval-num-fewshot", str(args.lm_eval_num_fewshot)] if getattr(args, "lm_eval_tasks", None) else []),
         "--output-dir",
         str(method_dir),
         "--json-out",
@@ -489,6 +509,9 @@ def _legacy_gptq_cmd(method: str, *, seed: int, method_dir: Path, json_out: Path
         str(float(args.ojbkq_alpha_scale)),
         *(["--ojbkq-sample-topk", str(int(args.ojbkq_sample_topk))] if args.ojbkq_sample_topk is not None else []),
         *(["--gptqmodel-extra-site-packages", str(args.gptqmodel_extra_site_packages)] if args.gptqmodel_extra_site_packages else []),
+        *(["--lm-eval-tasks", *list(args.lm_eval_tasks)] if getattr(args, "lm_eval_tasks", None) else []),
+        *(["--lm-eval-batch-size", str(args.lm_eval_batch_size)] if getattr(args, "lm_eval_tasks", None) else []),
+        *(["--lm-eval-num-fewshot", str(args.lm_eval_num_fewshot)] if getattr(args, "lm_eval_tasks", None) else []),
         "--output-dir",
         str(method_dir),
         "--json-out",
@@ -572,6 +595,9 @@ def _combo_gptq_cmd(combo: QuantCombo, *, seed: int, method_dir: Path, json_out:
         str(float(args.ojbkq_alpha_scale)),
         *(["--ojbkq-sample-topk", str(int(args.ojbkq_sample_topk))] if args.ojbkq_sample_topk is not None else []),
         *(["--gptqmodel-extra-site-packages", str(args.gptqmodel_extra_site_packages)] if args.gptqmodel_extra_site_packages else []),
+        *(["--lm-eval-tasks", *list(args.lm_eval_tasks)] if getattr(args, "lm_eval_tasks", None) else []),
+        *(["--lm-eval-batch-size", str(args.lm_eval_batch_size)] if getattr(args, "lm_eval_tasks", None) else []),
+        *(["--lm-eval-num-fewshot", str(args.lm_eval_num_fewshot)] if getattr(args, "lm_eval_tasks", None) else []),
         "--output-dir",
         str(method_dir),
         "--json-out",
@@ -601,6 +627,9 @@ def main() -> None:
     parser.add_argument("--eval-seqlen", type=int, default=2048)
     parser.add_argument("--eval-max-eval-tokens", type=int, default=131072)
     parser.add_argument("--eval-datasets", nargs="*", default=["wikitext2", "c4"])
+    parser.add_argument("--lm-eval-tasks", nargs="*", default=None)
+    parser.add_argument("--lm-eval-batch-size", type=int, default=1)
+    parser.add_argument("--lm-eval-num-fewshot", type=int, default=0)
     parser.add_argument(
         "--gptqmodel-extra-site-packages",
         type=str,
@@ -657,6 +686,9 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args()
+
+    if args.lm_eval_tasks is not None and len(args.lm_eval_tasks) == 0:
+        args.lm_eval_tasks = ["mmlu", "gpqa", "gsm8k", "humaneval", "hellaswag"]
 
     bits = int(args.bits)
     seeds = _parse_seeds(list(args.seeds))
@@ -753,16 +785,30 @@ def main() -> None:
             fh.write(json.dumps(row, sort_keys=True) + "\n")
     csv_path = run_dir / "results.csv"
     if flat_rows:
+        all_keys = list(flat_rows[0].keys())
+        seen = set(all_keys)
+        for row in flat_rows[1:]:
+            for k in row:
+                if k not in seen:
+                    all_keys.append(k)
+                    seen.add(k)
         with csv_path.open("w", encoding="utf-8", newline="") as fh:
-            writer = csv.DictWriter(fh, fieldnames=list(flat_rows[0].keys()))
+            writer = csv.DictWriter(fh, fieldnames=all_keys, restval="")
             writer.writeheader()
             writer.writerows(flat_rows)
 
+    lm_eval_cols = sorted({k for row in flat_rows for k in row if k.startswith("lm_eval_")})
+    base_headers = ["Model", "Backend", "Codebook", "Preprocess", "Rotation", "Solver", "Polish", "Seed", "Wikitext2 PPL", "C4 PPL"]
+    base_sep = ["---", "---", "---", "---", "---", "---", "---", "---:", "---:", "---:"]
+    lm_eval_headers = [col.replace("lm_eval_", "") for col in lm_eval_cols]
+    lm_eval_sep = ["---:"] * len(lm_eval_cols)
+    end_headers = ["Quantize Total (s)"]
+    end_sep = ["---:"]
     lines = [
         f"# Benchmark (bits={bits})",
         "",
-        "| Model | Backend | Codebook | Preprocess | Rotation | Solver | Polish | Seed | Wikitext2 PPL | C4 PPL | Quantize Total (s) |",
-        "| --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: |",
+        "| " + " | ".join(base_headers + lm_eval_headers + end_headers) + " |",
+        "| " + " | ".join(base_sep + lm_eval_sep + end_sep) + " |",
     ]
     for row in sorted(
         flat_rows,
@@ -777,25 +823,21 @@ def main() -> None:
             int(item.get("seed", 0)),
         ),
     ):
-        lines.append(
-            "| "
-            + " | ".join(
-                [
-                    str(row.get("model_id", "")),
-                    str(row.get("backend", "")),
-                    str(row.get("codebook", "")),
-                    str(row.get("preprocess", "")),
-                    str(row.get("rotation", "")),
-                    str(row.get("solver", "")),
-                    str(row.get("polish_mode", "")),
-                    str(int(row.get("seed", 0))),
-                    f"{float(row.get('wikitext2_ppl', float('nan'))):.4f}",
-                    f"{float(row.get('c4_ppl', float('nan'))):.4f}",
-                    f"{float(row.get('quantize_total_s', 0.0)):.2f}",
-                ]
-            )
-            + " |"
-        )
+        base_values = [
+            str(row.get("model_id", "")),
+            str(row.get("backend", "")),
+            str(row.get("codebook", "")),
+            str(row.get("preprocess", "")),
+            str(row.get("rotation", "")),
+            str(row.get("solver", "")),
+            str(row.get("polish_mode", "")),
+            str(int(row.get("seed", 0))),
+            f"{float(row.get('wikitext2_ppl', float('nan'))):.4f}",
+            f"{float(row.get('c4_ppl', float('nan'))):.4f}",
+        ]
+        lm_eval_values = [f"{float(row.get(col, float('nan'))):.4f}" for col in lm_eval_cols]
+        end_values = [f"{float(row.get('quantize_total_s', 0.0)):.2f}"]
+        lines.append("| " + " | ".join(base_values + lm_eval_values + end_values) + " |")
     md_path = run_dir / "benchmark.md"
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"WROTE {out_path}")

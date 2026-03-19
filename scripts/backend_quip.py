@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
 
@@ -20,6 +20,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from mpq.combo import QuantCombo, make_combo
+from mpq.dense_decoder_adapter import resolve_dense_decoder_adapter_for_model_id
 
 
 def _git_head(path: Path) -> str:
@@ -256,6 +257,80 @@ def _maybe_run_hessians(args, *, hessian_dir: Path, env: Dict[str, str], log_dir
     return float(time.time() - t0)
 
 
+def _resolve_quip_model_runtime(args) -> Dict[str, Any]:
+    import json as _json
+    from transformers import AutoConfig
+
+    cfg = AutoConfig.from_pretrained(str(args.base_model))
+    model_type = str(getattr(cfg, "model_type", "") or "").strip().lower()
+    adapter = resolve_dense_decoder_adapter_for_model_id(
+        str(args.base_model), override=getattr(args, "model_arch", None)
+    )
+    return {
+        "model_type": model_type,
+        "adapter_name": adapter.name,
+        "use_legacy_llama_path": model_type == "llama",
+    }
+
+
+def _maybe_run_hessians_generic(args, *, hessian_dir: Path, env: Dict[str, str], log_dir: Path) -> float:
+    hessian_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = hessian_dir / "meta.json"
+    have_any = any(hessian_dir.glob("*.pt"))
+    expected_meta = {
+        "base_model": str(args.base_model),
+        "seed": int(args.seed),
+        "devset_size": int(args.devset_size),
+        "ctx_size": int(args.ctx_size),
+        "sample_proc": int(args.sample_proc),
+        "hessian_batch_size": int(args.hessian_batch_size),
+        "calibration_dataset": str(args.calibration_dataset),
+        "calibration_split": str(args.calibration_split),
+        "model_arch": str(getattr(args, "model_arch", "auto")),
+        "pipeline": "dense_decoder_generic",
+    }
+    if have_any and not bool(args.force_hessians) and meta_path.exists():
+        try:
+            on_disk = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            on_disk = None
+        if isinstance(on_disk, dict) and on_disk == expected_meta:
+            print(f"[hess] cache hit: {hessian_dir}", flush=True)
+            return 0.0
+        print(f"[hess] cache meta mismatch; recomputing: {hessian_dir}", flush=True)
+
+    cmd = [
+        sys.executable,
+        str(REPO_ROOT / "scripts" / "hessian_offline_dense.py"),
+        "--save_path",
+        str(hessian_dir),
+        "--base_model",
+        str(args.base_model),
+        "--seed",
+        str(int(args.seed)),
+        "--batch_size",
+        str(int(args.hessian_batch_size)),
+        "--devset_size",
+        str(int(args.devset_size)),
+        "--ctx_size",
+        str(int(args.ctx_size)),
+        "--sample_proc",
+        str(int(args.sample_proc)),
+        "--calibration_dataset",
+        str(args.calibration_dataset),
+        "--calibration_split",
+        str(args.calibration_split),
+        "--model-arch",
+        str(getattr(args, "model_arch", "auto")),
+    ]
+    t0 = time.time()
+    rc = _run_logged(cmd, cwd=REPO_ROOT, env=env, log_path=log_dir / "hessian.log")
+    if rc != 0:
+        raise RuntimeError(f"hessian_offline_dense failed with code {rc}")
+    meta_path.write_text(json.dumps(expected_meta, indent=2, sort_keys=True), encoding="utf-8")
+    return float(time.time() - t0)
+
+
 def _route_native_quip(combo: QuantCombo) -> tuple[str, int]:
     if combo.solver == "ldlq_tune10":
         return "quip", 10
@@ -321,6 +396,8 @@ def run(args) -> Dict[str, Any]:
     _apply_patches()
     combo, request_source = _resolve_quip_combo(args)
     solver_mode, native_tune_iters = _route_native_quip(combo)
+    runtime_arch = _resolve_quip_model_runtime(args)
+    use_legacy_llama_path = bool(runtime_arch["use_legacy_llama_path"])
 
     exp_dir = Path(args.output_dir).resolve()
     log_dir = exp_dir / "log"
@@ -338,14 +415,20 @@ def run(args) -> Dict[str, Any]:
     env = _ensure_ld_library_path(env)
 
     # Ensure Hessians exist once per (seed, base_model, devset).
-    hessian_s = _maybe_run_hessians(args, hessian_dir=hessian_dir, env=env, log_dir=log_dir)
+    if use_legacy_llama_path:
+        hessian_s = _maybe_run_hessians(args, hessian_dir=hessian_dir, env=env, log_dir=log_dir)
+    else:
+        hessian_s = _maybe_run_hessians_generic(args, hessian_dir=hessian_dir, env=env, log_dir=log_dir)
 
-    quant_entry = [sys.executable, "-m", "quantize_llama.quantize_finetune_llama"]
-    if solver_mode == "mpq":
-        quant_entry = [
-            sys.executable,
-            str(REPO_ROOT / "scripts" / "quantize_llama_mpq_wrapper.py"),
-        ]
+    if use_legacy_llama_path:
+        quant_entry = [sys.executable, "-m", "quantize_llama.quantize_finetune_llama"]
+        if solver_mode == "mpq":
+            quant_entry = [
+                sys.executable,
+                str(REPO_ROOT / "scripts" / "quantize_llama_mpq_wrapper.py"),
+            ]
+    else:
+        quant_entry = [sys.executable, str(REPO_ROOT / "scripts" / "quantize_dense_decoder.py")]
 
     quant_cmd = [
         *quant_entry,
@@ -379,6 +462,8 @@ def run(args) -> Dict[str, Any]:
         str(float(args.scale_override)),
         "--sample_proc",
         str(int(args.sample_proc)),
+        "--model-arch",
+        str(getattr(args, "model_arch", "auto")),
     ]
     if solver_mode == "mpq":
         quant_cmd += [
@@ -437,53 +522,85 @@ def run(args) -> Dict[str, Any]:
         quant_cmd.append("--mpq_compile_prior" if bool(getattr(args, "mpq_compile_prior", True)) else "--no-mpq_compile_prior")
 
     t0 = time.time()
-    rc = _run_logged(quant_cmd, cwd=QUIP_ROOT, env=env, log_path=log_dir / "quantize.log")
+    rc = _run_logged(
+        quant_cmd,
+        cwd=QUIP_ROOT if use_legacy_llama_path else REPO_ROOT,
+        env=env,
+        log_path=log_dir / "quantize.log",
+    )
     if rc != 0:
-        raise RuntimeError(f"quantize_finetune_llama failed with code {rc}")
+        raise RuntimeError(f"quantize failed with code {rc}")
     quantize_s = float(time.time() - t0)
 
-    skip_eval = bool(getattr(args, "skip_eval", False))
-    eval_datasets = list(getattr(args, "eval_datasets", ["wikitext2", "c4"]))
     hfize_s = 0.0
-    if not skip_eval:
-        t1 = time.time()
-        rc = _run_logged(
-            [sys.executable, "-m", "quantize_llama.hfize_llama", "--quantized_path", str(ckpt_dir), "--hf_output_path", str(hf_dir)],
-            cwd=QUIP_ROOT,
-            env=env,
-            log_path=log_dir / "hfize.log",
-        )
-        if rc != 0:
-            raise RuntimeError(f"hfize_llama failed with code {rc}")
-        hfize_s = float(time.time() - t1)
-    else:
-        eval_datasets = []
+    t1 = time.time()
+    hfize_cmd = (
+        [sys.executable, "-m", "quantize_llama.hfize_llama", "--quantized_path", str(ckpt_dir), "--hf_output_path", str(hf_dir)]
+        if use_legacy_llama_path
+        else [sys.executable, str(REPO_ROOT / "scripts" / "hfize_dense_decoder.py"), "--quantized_path", str(ckpt_dir), "--hf_output_path", str(hf_dir)]
+    )
+    rc = _run_logged(
+        hfize_cmd,
+        cwd=QUIP_ROOT if use_legacy_llama_path else REPO_ROOT,
+        env=env,
+        log_path=log_dir / "hfize.log",
+    )
+    if rc != 0:
+        raise RuntimeError(f"hfize failed with code {rc}")
+    hfize_s = float(time.time() - t1)
+
+    skip_eval = bool(getattr(args, "skip_eval", False))
+    eval_datasets = [] if skip_eval else list(getattr(args, "eval_datasets", ["wikitext2", "c4"]))
 
     ppls: Dict[str, float] = {}
     eval_times: Dict[str, float] = {}
     for dataset in eval_datasets:
         dataset_norm = str(dataset).strip().lower()
-        eval_cmd = [
-            sys.executable,
-            "-m",
-            "eval.eval_ppl",
-            "--hf_path",
-            str(hf_dir),
-            "--seed",
-            str(int(args.seed)),
-            "--seqlen",
-            str(int(args.eval_seqlen)),
-            "--datasets",
-            dataset_norm,
-            "--max_eval_tokens",
-            str(int(getattr(args, "eval_max_eval_tokens", 0))),
-            "--json_out",
-            str(log_dir / f"eval_{dataset_norm}.json"),
-            "--no_use_cuda_graph",
-            "--no_use_flash_attn",
-        ]
+        eval_cmd = (
+            [
+                sys.executable,
+                "-m",
+                "eval.eval_ppl",
+                "--hf_path",
+                str(hf_dir),
+                "--seed",
+                str(int(args.seed)),
+                "--seqlen",
+                str(int(args.eval_seqlen)),
+                "--datasets",
+                dataset_norm,
+                "--max_eval_tokens",
+                str(int(getattr(args, "eval_max_eval_tokens", 0))),
+                "--json_out",
+                str(log_dir / f"eval_{dataset_norm}.json"),
+                "--no_use_cuda_graph",
+                "--no_use_flash_attn",
+            ]
+            if use_legacy_llama_path
+            else [
+                sys.executable,
+                str(REPO_ROOT / "scripts" / "eval_hf_ppl.py"),
+                "--hf_path",
+                str(hf_dir),
+                "--seed",
+                str(int(args.seed)),
+                "--seqlen",
+                str(int(args.eval_seqlen)),
+                "--datasets",
+                dataset_norm,
+                "--max_eval_tokens",
+                str(int(getattr(args, "eval_max_eval_tokens", 0))),
+                "--json_out",
+                str(log_dir / f"eval_{dataset_norm}.json"),
+            ]
+        )
         t_eval = time.time()
-        rc = _run_logged(eval_cmd, cwd=QUIP_ROOT, env=env, log_path=log_dir / f"eval_{dataset_norm}.log")
+        rc = _run_logged(
+            eval_cmd,
+            cwd=QUIP_ROOT if use_legacy_llama_path else REPO_ROOT,
+            env=env,
+            log_path=log_dir / f"eval_{dataset_norm}.log",
+        )
         if rc != 0:
             raise RuntimeError(f"eval_ppl failed with code {rc} on dataset={dataset_norm}")
         eval_times[f"eval_{dataset_norm}_s"] = float(time.time() - t_eval)
@@ -506,11 +623,43 @@ def run(args) -> Dict[str, Any]:
         ),
         encoding="utf-8",
     )
+    lm_eval_tasks = list(getattr(args, "lm_eval_tasks", None) or [])
+    lm_eval_result = {}
+    lm_eval_time_s = 0.0
+    if lm_eval_tasks and not skip_eval:
+        t_lm = time.time()
+        lm_eval_json = log_dir / "lm_eval_results.json"
+        lm_eval_cmd = [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "eval_lm_eval.py"),
+            "--model-path", str(hf_dir),
+            "--quip",
+            "--tasks", ",".join(lm_eval_tasks),
+            "--batch-size", str(int(getattr(args, "lm_eval_batch_size", 1))),
+            "--num-fewshot", str(int(getattr(args, "lm_eval_num_fewshot", 0))),
+            "--json-out", str(lm_eval_json),
+        ]
+        rc = _run_logged(
+            lm_eval_cmd,
+            cwd=QUIP_ROOT if use_legacy_llama_path else REPO_ROOT,
+            env=env,
+            log_path=log_dir / "lm_eval.log",
+        )
+        if rc != 0:
+            raise RuntimeError(f"eval_lm_eval.py failed with code {rc}")
+        lm_eval_time_s = float(time.time() - t_lm)
+        try:
+            lm_eval_result = json.loads(lm_eval_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            lm_eval_result = {}
+
     mpq_layer_stats = _collect_mpq_layer_stats(ckpt_dir) if solver_mode == "mpq" else {}
 
     return {
         "backend": combo.backend,
         "backend_impl": "quip-sharp",
+        "model_type": str(runtime_arch["model_type"]),
+        "model_arch": str(runtime_arch["adapter_name"]),
         "codebook": combo.codebook,
         "preprocess": combo.preprocess,
         "rotation": combo.rotation,
@@ -520,7 +669,11 @@ def run(args) -> Dict[str, Any]:
         "requested_method": None if request_source in {"combo", "default"} else request_source,
         "resolved_method": solver_mode,
         "baseline_family": "quip" if combo.solver in {"ldlq", "ldlq_tune10"} else "mpq",
-        "quantization_path": {"dense": False, "packed": True},
+        "quantization_path": {
+            "dense": not use_legacy_llama_path,
+            "packed": True,
+            "legacy_llama_runtime": bool(use_legacy_llama_path),
+        },
         "bits": 2,
         "seed": int(args.seed),
         "base_model": str(args.base_model),
@@ -541,22 +694,29 @@ def run(args) -> Dict[str, Any]:
             "max_eval_tokens": int(getattr(args, "eval_max_eval_tokens", 0)),
             "ppl": ppls,
         },
+        "lm_eval": lm_eval_result,
         "timing": {
             "hessian_s": float(hessian_s),
             "quantize_s": float(quantize_s),
             "hfize_s": float(hfize_s),
             "eval_s": float(eval_s),
             **eval_times,
+            "lm_eval_s": float(lm_eval_time_s),
             "quantize_total_s": float(hessian_s + quantize_s + hfize_s),
-            "eval_total_s": float(eval_s),
-            "total_s": float(hessian_s + quantize_s + hfize_s + eval_s),
+            "eval_total_s": float(eval_s + lm_eval_time_s),
+            "total_s": float(hessian_s + quantize_s + hfize_s + eval_s + lm_eval_time_s),
         },
         "paths": {
+            "native_dir": str(ckpt_dir),
+            "hf_dir": str(hf_dir),
             "exp_dir": str(exp_dir),
             "hessian_dir": str(hessian_dir),
             "ckpt_dir": str(ckpt_dir),
-            "hf_dir": str(hf_dir),
             "log_dir": str(log_dir),
+        },
+        "artifact_format": {
+            "native": "quip",
+            "hf": "huggingface",
         },
         "mpq": mpq_layer_stats,
         "mpq_args": {
@@ -603,6 +763,7 @@ def main() -> None:
     parser.add_argument("--quant-polish-mode", dest="quant_polish_mode", type=str, default="none", choices=["none", "block_cd", "topk_block_cd"])
     parser.add_argument("--quant-topk-source", dest="quant_topk_source", type=str, default="aux_vamp")
     parser.add_argument("--quant-topk-k", dest="quant_topk_k", type=int, default=16)
+    parser.add_argument("--model-arch", type=str, default="auto")
     parser.add_argument("--base-model", required=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--codebook", type=str, default="E8P12")
@@ -625,6 +786,11 @@ def main() -> None:
     parser.add_argument("--eval-datasets", nargs="*", default=["wikitext2", "c4"])
     parser.add_argument("--eval-max-eval-tokens", type=int, default=131072)
     parser.add_argument("--skip-eval", action=argparse.BooleanOptionalAction, default=False)
+
+    # lm-evaluation-harness
+    parser.add_argument("--lm-eval-tasks", nargs="*", default=None)
+    parser.add_argument("--lm-eval-batch-size", type=int, default=1)
+    parser.add_argument("--lm-eval-num-fewshot", type=int, default=0)
 
     # MPQ (QUIP side) defaults aligned with Gate B recipe.
     parser.add_argument("--mpq-init", type=str, default="random", choices=["random", "rtn", "ldlq"])
