@@ -7,7 +7,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from ..rotation import apply_right_hadamard, apply_right_hadamard_inverse, sample_hadamard_signs
+from ..rotation import (
+    apply_right_block_hadamard,
+    apply_right_block_hadamard_inverse,
+    resolve_block_hadamard_plan,
+    sample_rademacher_signs,
+)
 from ..linear import vamp_rankspace_error
 from ..solver import (
     UniformVampConfig,
@@ -24,6 +29,81 @@ class GPTQAdapterConfig:
     jitter_base: float = 1e-6
     eigen_floor_scale: float = 1e-6
     rotation_seed: int = 0
+
+
+@torch.inference_mode()
+def _resolve_internal_rotation(
+    *,
+    requested: str,
+    cols: int,
+    module_name: str,
+    seed: int,
+    device: torch.device,
+) -> Dict[str, Any]:
+    requested_norm = str(requested or "none").strip().lower()
+    if requested_norm in {"", "none"}:
+        return {
+            "requested": "none",
+            "effective": "none",
+            "mode": "none",
+            "signs": None,
+            "block_dim": 1,
+            "fallback_reason": "",
+            "internal": False,
+        }
+    if requested_norm == "model_random":
+        return {
+            "requested": "model_random",
+            "effective": "model_random",
+            "mode": "none",
+            "signs": None,
+            "block_dim": 1,
+            "fallback_reason": "",
+            "internal": False,
+        }
+    if requested_norm == "model_hadamard":
+        return {
+            "requested": "model_hadamard",
+            "effective": "model_hadamard",
+            "mode": "none",
+            "signs": None,
+            "block_dim": 1,
+            "fallback_reason": "",
+            "internal": False,
+        }
+    if requested_norm != "internal_hadamard":
+        raise ValueError(
+            "mpq only supports rotation in {none, model_hadamard, model_random, internal_hadamard}; "
+            f"got rotation={requested!r}."
+        )
+
+    mode, block_dim = resolve_block_hadamard_plan(int(cols))
+    if mode == "none":
+        return {
+            "requested": "internal_hadamard",
+            "effective": "none",
+            "mode": "none",
+            "signs": None,
+            "block_dim": 1,
+            "fallback_reason": f"unsupported_block_hadamard_width:{int(cols)}",
+            "internal": False,
+        }
+
+    signs = sample_rademacher_signs(
+        width=int(cols),
+        key=f"{module_name}:full",
+        seed=int(seed),
+        device=device,
+    )
+    return {
+        "requested": "internal_hadamard",
+        "effective": "internal_block_hadamard",
+        "mode": "block",
+        "signs": signs,
+        "block_dim": int(block_dim),
+        "fallback_reason": "",
+        "internal": True,
+    }
 
 
 @torch.inference_mode()
@@ -114,6 +194,7 @@ def _uniform_vamp_cfg_from_qcfg(qcfg: Any) -> UniformVampConfig:
         polish_sweeps=int(getattr(mpq_cfg, "polish_sweeps", 3)),
         polish_mode=str(getattr(mpq_cfg, "polish_mode", "block_cd") or "block_cd"),
         topk_k=int(getattr(mpq_cfg, "topk_k", 16) or 16),
+        compile_block_cd=bool(getattr(mpq_cfg, "compile_block_cd", False)),
     )
 
 
@@ -127,6 +208,48 @@ def _adapter_cfg_from_qcfg(qcfg: Any) -> GPTQAdapterConfig:
         eigen_floor_scale=float(getattr(mpq_cfg, "eigen_floor_scale", 1e-6)),
         rotation_seed=int(getattr(mpq_cfg, "rotation_seed", 0)),
     )
+
+
+@torch.inference_mode()
+def prepare_gptq_internal_hadamard(
+    *,
+    W: torch.Tensor,
+    H: torch.Tensor,
+    qcfg: Any,
+    module_name: str,
+    adapter_cfg: GPTQAdapterConfig = GPTQAdapterConfig(),
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
+    rotation_plan = _resolve_internal_rotation(
+        requested=str(getattr(getattr(qcfg, "mpq", None), "rotation_mode", getattr(qcfg, "rotation", None) or "none")),
+        cols=int(W.shape[1]),
+        module_name=str(module_name),
+        seed=int(adapter_cfg.rotation_seed),
+        device=W.device,
+    )
+    if not bool(rotation_plan["internal"]):
+        return W.to(dtype=torch.float32), H.to(dtype=torch.float32), rotation_plan
+
+    had_dim = int(rotation_plan["block_dim"])
+    signs = rotation_plan["signs"]
+    W_work = apply_right_block_hadamard(W.to(dtype=torch.float32), signs=signs, had_dim=had_dim)
+    H_work = apply_right_block_hadamard(H.to(dtype=torch.float32).T.contiguous(), signs=signs, had_dim=had_dim).T.contiguous()
+    H_work = apply_right_block_hadamard(H_work, signs=signs, had_dim=had_dim).contiguous()
+    return W_work, H_work, rotation_plan
+
+
+@torch.inference_mode()
+def finalize_gptq_internal_hadamard(
+    *,
+    Q_work: torch.Tensor,
+    rotation_plan: Dict[str, Any],
+) -> torch.Tensor:
+    if not bool(rotation_plan.get("internal", False)):
+        return Q_work.to(dtype=torch.float32).contiguous()
+    return apply_right_block_hadamard_inverse(
+        Q_work.to(dtype=torch.float32),
+        signs=rotation_plan["signs"],
+        had_dim=int(rotation_plan["block_dim"]),
+    ).contiguous()
 
 
 @torch.inference_mode()
@@ -171,10 +294,14 @@ def run_mpq_quantization(
     if group_size == -1:
         group_size = cols
 
-    rotation = str(getattr(qcfg, "rotation", None) or "none").strip().lower()
-    if rotation not in ("none", "hadamard", "random", ""):
-        raise ValueError(f"mpq only supports rotation in {{none, hadamard, random}}; got rotation={rotation!r}.")
-    use_hadamard = rotation == "hadamard"
+    rotation_plan = _resolve_internal_rotation(
+        requested=str(getattr(getattr(qcfg, "mpq", None), "rotation_mode", getattr(qcfg, "rotation", None) or "none")),
+        cols=int(cols),
+        module_name=str(module_name),
+        seed=int(adapter_cfg.rotation_seed),
+        device=device,
+    )
+    use_internal_rotation = bool(rotation_plan["internal"])
     if bool(getattr(qcfg, "desc_act", False)):
         raise ValueError("mpq exact-full path does not support desc_act=True.")
 
@@ -189,15 +316,13 @@ def run_mpq_quantization(
     Vh = V.T.contiguous()
     S = torch.sqrt(eigenvalues).contiguous()
 
-    if use_hadamard:
-        key = f"{module_name}:full"
-        signs = sample_hadamard_signs(width=cols, key=key, seed=int(adapter_cfg.rotation_seed), device=device)
-        W_work = apply_right_hadamard(W, signs=signs)
-        V_work = apply_right_hadamard(V.T.contiguous(), signs=signs).T.contiguous()
-        V = V_work
+    signs = rotation_plan["signs"]
+    if rotation_plan["mode"] == "block" and signs is not None:
+        had_dim = int(rotation_plan["block_dim"])
+        W_work = apply_right_block_hadamard(W, signs=signs, had_dim=had_dim)
+        V = apply_right_block_hadamard(V.T.contiguous(), signs=signs, had_dim=had_dim).T.contiguous()
         Vh = V.T.contiguous()
     else:
-        signs = None
         W_work = W
 
     Vs = V * S.unsqueeze(0)
@@ -247,7 +372,7 @@ def run_mpq_quantization(
         obs_precision = 1.0 / float(mse)
 
     Q_work = torch.empty_like(W_work, dtype=torch.float32)
-    q_int_work = torch.empty((rows, cols), dtype=torch.int32, device=device) if not use_hadamard else None
+    q_int_work = torch.empty((rows, cols), dtype=torch.int32, device=device) if not use_internal_rotation else None
     layer_err_sum = 0.0
     rtn_err_sum = 0.0
     obs_precision_block = float(obs_precision)
@@ -286,8 +411,8 @@ def run_mpq_quantization(
 
     g_idx = torch.arange(cols, device=device, dtype=torch.int32) // int(group_size)
 
-    if use_hadamard and signs is not None:
-        Q = apply_right_hadamard_inverse(Q_work, signs=signs)
+    if rotation_plan["mode"] == "block" and signs is not None:
+        Q = apply_right_block_hadamard_inverse(Q_work, signs=signs, had_dim=int(rotation_plan["block_dim"]))
         q_int_out = None
         scale_out = None
         zero_out = None
@@ -299,6 +424,15 @@ def run_mpq_quantization(
         zero_out = zero_groups
         g_idx_out = g_idx
 
+    mpq_cfg = getattr(qcfg, "mpq", None)
+    if mpq_cfg is not None:
+        setattr(mpq_cfg, "rotation_requested", str(rotation_plan["requested"]))
+        setattr(mpq_cfg, "rotation_effective", str(rotation_plan["effective"]))
+        setattr(mpq_cfg, "rotation_internal", bool(rotation_plan["internal"]))
+        setattr(mpq_cfg, "rotation_mode_effective", "internal_rotation" if bool(rotation_plan["internal"]) else ("model_rotation" if str(rotation_plan["effective"]).startswith("model_") else "none"))
+        setattr(mpq_cfg, "rotation_fallback_reason", str(rotation_plan["fallback_reason"]))
+        setattr(mpq_cfg, "rotation_block_dim", int(rotation_plan["block_dim"]))
+
     stats: Dict[str, Any] = {
         "method": "mpq",
         "solver": str(getattr(getattr(qcfg, "mpq", None), "solver", "vamp") or "vamp"),
@@ -306,7 +440,12 @@ def run_mpq_quantization(
         "module": str(module_name),
         "bits": int(bits),
         "group_size": int(group_size),
-        "rotation": "hadamard" if use_hadamard else "none",
+        "rotation_requested": str(rotation_plan["requested"]),
+        "rotation_effective": str(rotation_plan["effective"]),
+        "rotation_mode": "internal_rotation" if bool(rotation_plan["internal"]) else ("model_rotation" if str(rotation_plan["effective"]).startswith("model_") else "none"),
+        "rotation_internal": bool(rotation_plan["internal"]),
+        "rotation_block_dim": int(rotation_plan["block_dim"]),
+        "rotation_fallback_reason": str(rotation_plan["fallback_reason"]),
         "rows": int(rows),
         "cols": int(cols),
         "rank": int(S.numel()),
@@ -444,6 +583,7 @@ def postprocess_gptq_quantization(
         polish_mode=polish_mode,
         topk_values=None if topk is None else topk["topk_values"],
         topk_q=None if topk is None else topk["topk_q"],
+        compile_block_cd=bool(getattr(vamp_cfg, "compile_block_cd", False)),
     )
     improve = err_after + 1e-12 < err_before
     if bool(improve.any().item()):

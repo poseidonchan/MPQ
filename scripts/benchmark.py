@@ -213,7 +213,7 @@ def _resolve_combo_matrix(bits: int, args) -> List[QuantCombo]:
         codebook = "e8p12"
     else:
         preprocesses = list(args.quant_preprocesses) if args.quant_preprocesses else ["none", "awq"]
-        rotations = list(args.quant_rotations) if args.quant_rotations else ["hadamard"]
+        rotations = list(args.quant_rotations) if args.quant_rotations else []
         solvers = list(args.quant_solvers) if args.quant_solvers else ["gptq", "vamp"]
         polish_modes = list(args.quant_polish_modes) if args.quant_polish_modes else ["none", "block_cd"]
         backend = "gptqmodel"
@@ -221,8 +221,13 @@ def _resolve_combo_matrix(bits: int, args) -> List[QuantCombo]:
 
     combos: List[QuantCombo] = []
     for preprocess in preprocesses:
-        for rotation in rotations:
-            for solver in solvers:
+        for solver in solvers:
+            solver_rotations = (
+                rotations
+                if rotations
+                else (["model_hadamard"] if solver == "gptq" else ["internal_hadamard"])
+            )
+            for rotation in solver_rotations:
                 for polish_mode in polish_modes:
                     try:
                         combo = make_combo(
@@ -244,7 +249,7 @@ def _resolve_combo_matrix(bits: int, args) -> List[QuantCombo]:
 def _default_sanity_eval_label(bits: int) -> str:
     if int(bits) == 2:
         return "backend-quip__codebook-e8p12__pre-none__rot-had__solver-vamp__polish-topk_block_cd"
-    return "backend-gptqmodel__codebook-grid_g128__pre-none__rot-hadamard__solver-vamp__polish-block_cd"
+    return "backend-gptqmodel__codebook-grid_g128__pre-none__rot-internal_hadamard__solver-vamp__polish-block_cd"
 
 
 def _build_job_args(args, *, bits: int, label: str, combo: Optional[QuantCombo]):
@@ -629,7 +634,7 @@ def main() -> None:
     parser.add_argument("--calibration-limit", type=int, default=128)
     parser.add_argument("--calibration-seqlen", type=int, default=2048)
     parser.add_argument("--eval-seqlen", type=int, default=2048)
-    parser.add_argument("--eval-max-eval-tokens", type=int, default=131072)
+    parser.add_argument("--eval-max-eval-tokens", type=int, default=0, help="0 => paper-style defaults: full Wikitext2, C4 = 256*seqlen")
     parser.add_argument("--eval-datasets", nargs="*", default=["wikitext2", "c4"])
     parser.add_argument("--lm-eval-tasks", nargs="*", default=None)
     parser.add_argument("--lm-eval-batch-size", default="1")
@@ -755,14 +760,18 @@ def main() -> None:
                 print("$ " + " ".join(shlex.quote(x) for x in cmd))
                 continue
 
-            _run_logged(
-                cmd,
-                log_path=log_path,
-                cwd=REPO_ROOT,
-                retries=int(args.backend_retries),
-                retry_sleep_s=float(args.backend_retry_sleep),
-            )
-            all_results.append(_json_load(json_out))
+            try:
+                _run_logged(
+                    cmd,
+                    log_path=log_path,
+                    cwd=REPO_ROOT,
+                    retries=int(args.backend_retries),
+                    retry_sleep_s=float(args.backend_retry_sleep),
+                )
+                all_results.append(_json_load(json_out))
+            except RuntimeError as exc:
+                print(f"FAILED combo {label}: {exc}", flush=True)
+                continue
 
             # Clean up model artifacts to save disk space.
             for _subdir_name in ("ckpt", "hf", "quantized"):

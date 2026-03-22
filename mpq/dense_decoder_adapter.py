@@ -82,9 +82,9 @@ class DenseDecoderAdapter:
         batch_size: int,
         ctx_size: int,
         hidden_states: torch.Tensor,
+        layer: Optional[Any] = None,
     ) -> torch.Tensor:
-        config = getattr(model, "config", None)
-        sliding_window = getattr(config, "sliding_window", None)
+        sliding_window = self.get_layer_sliding_window(model, layer=layer)
         return _prepare_4d_causal_attention_mask(
             None,
             (int(batch_size), int(ctx_size)),
@@ -92,6 +92,10 @@ class DenseDecoderAdapter:
             0,
             sliding_window=sliding_window,
         )
+
+    def get_layer_sliding_window(self, model: Any, *, layer: Optional[Any] = None) -> Optional[int]:
+        config = getattr(model, "config", None)
+        return getattr(config, "sliding_window", None)
 
     def forward_layer(
         self,
@@ -135,16 +139,64 @@ class DenseDecoderAdapter:
             return [h.up_proj.weight, h.gate_proj.weight]
         raise ValueError(f"unsupported suffix={suffix!r}; expected qkv|o|up|down")
 
+    def extra_state_dict(self, layer: Any) -> dict[str, torch.Tensor]:
+        return {}
+
+    def load_extra_state_dict(self, layer: Any, state: dict[str, torch.Tensor]) -> None:
+        del layer, state
+
+
+class QwenLikeDenseDecoderAdapter(DenseDecoderAdapter):
+    def get_layer_sliding_window(self, model: Any, *, layer: Optional[Any] = None) -> Optional[int]:
+        del model
+        if layer is None:
+            return None
+        return getattr(getattr(layer, "self_attn", None), "sliding_window", None)
+
+    def extra_state_dict(self, layer: Any) -> dict[str, torch.Tensor]:
+        out: dict[str, torch.Tensor] = {}
+        attn = getattr(layer, "self_attn", None)
+        for name in ("q_norm", "k_norm"):
+            norm = getattr(attn, name, None)
+            weight = getattr(norm, "weight", None)
+            if isinstance(weight, torch.Tensor):
+                out[name] = weight.detach().cpu()
+            bias = getattr(norm, "bias", None)
+            if isinstance(bias, torch.Tensor):
+                out[f"{name}_bias"] = bias.detach().cpu()
+        return out
+
+    def load_extra_state_dict(self, layer: Any, state: dict[str, torch.Tensor]) -> None:
+        attn = getattr(layer, "self_attn", None)
+        for name in ("q_norm", "k_norm"):
+            norm = getattr(attn, name, None)
+            if norm is None:
+                continue
+            weight = getattr(norm, "weight", None)
+            if isinstance(weight, torch.Tensor) and name in state:
+                weight.copy_(state[name])
+            bias = getattr(norm, "bias", None)
+            bias_key = f"{name}_bias"
+            if isinstance(bias, torch.Tensor) and bias_key in state:
+                bias.copy_(state[bias_key])
+
 
 _DENSE_DECODER_ADAPTERS: tuple[DenseDecoderAdapter, ...] = (
+    QwenLikeDenseDecoderAdapter(
+        name="qwen_like_dense_decoder",
+        model_types=frozenset(
+            {
+                "qwen2",
+                "qwen3",
+            }
+        ),
+    ),
     DenseDecoderAdapter(
         name="llama_like_dense_decoder",
         model_types=frozenset(
             {
                 "llama",
                 "mistral",
-                "qwen2",
-                "qwen3",
             }
         ),
     ),
@@ -180,4 +232,3 @@ def resolve_dense_decoder_adapter_for_model_id(model_id: str, *, override: Optio
         if adapter.supports(model_type):
             return adapter
     raise RuntimeError(f"unsupported dense decoder model_type for QUIP/MPQ path: {model_type!r}")
-

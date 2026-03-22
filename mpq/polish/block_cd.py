@@ -248,6 +248,7 @@ class BlockCDConfig:
     metric_rows_per_chunk: int = 0  # for large codebooks (optional)
     max_blocks_per_sweep: int = 0  # if >0, only polish top-K blocks by static importance
     order_mode: str = "greedy_gain"  # "static" | "greedy_gain"
+    compile_steps: bool = True
 
 
 @torch.inference_mode()
@@ -336,8 +337,11 @@ def block_coordinate_descent_rankspace(
     idxs_out: Optional[torch.Tensor] = idxs_init.clone() if idxs_init is not None else None
 
     # Detect compiled block-step paths.
-    _use_compiled_topk = isinstance(provider, E8P12TopKProvider) and metric == "gram"
+    compile_steps = bool(getattr(cfg, "compile_steps", True))
+    _use_compiled_topk = compile_steps and isinstance(provider, E8P12TopKProvider) and metric == "gram"
     _use_compiled_cd = (
+        compile_steps
+        and
         isinstance(provider, E8P12Provider)
         and not isinstance(provider, E8P12TopKProvider)
         and metric == "gram"

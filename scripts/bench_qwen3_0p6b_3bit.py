@@ -58,7 +58,7 @@ def main() -> None:
     parser.add_argument("--calibration-seqlen", type=int, default=2048)
 
     parser.add_argument("--eval-seqlen", type=int, default=2048)
-    parser.add_argument("--eval-max-eval-tokens", type=int, default=131072)
+    parser.add_argument("--eval-max-eval-tokens", type=int, default=0, help="0 => paper-style defaults: full Wikitext2, C4 = 256*seqlen")
 
     parser.add_argument("--mpq-damping", type=float, default=0.5)
     parser.add_argument("--mpq-prior-tau", type=float, default=0.2)

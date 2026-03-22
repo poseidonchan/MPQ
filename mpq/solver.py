@@ -49,6 +49,7 @@ class UniformVampConfig:
     polish_sweeps: int = 3
     polish_mode: str = "block_cd"  # "none" | "block_cd" | "topk_block_cd"
     topk_k: int = 16
+    compile_block_cd: bool = True
 
 
 @dataclass(frozen=True)
@@ -254,6 +255,7 @@ def polish_uniform_rankspace(
     polish_mode: str,
     topk_values: Optional[torch.Tensor] = None,
     topk_q: Optional[torch.Tensor] = None,
+    compile_block_cd: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
     mode = _resolve_polish_mode(sweeps=int(sweeps), mode=str(polish_mode))
     x_work = x_init.to(dtype=torch.float32)
@@ -276,7 +278,13 @@ def polish_uniform_rankspace(
         Vs=Vs,
         block_size=1,
         provider=provider,
-        cfg=BlockCDConfig(sweeps=int(sweeps), metric="diag", accept_tol=0.0, order_mode="greedy_gain"),
+        cfg=BlockCDConfig(
+            sweeps=int(sweeps),
+            metric="diag",
+            accept_tol=0.0,
+            order_mode="greedy_gain",
+            compile_steps=bool(compile_block_cd),
+        ),
     )
     if q_topk is not None:
         q_polished = q_topk.to(dtype=torch.int32)
@@ -638,6 +646,7 @@ def solve_uniform_rankspace_vamp(
             polish_mode=polish_mode,
             topk_values=None if topk is None else topk["topk_values"],
             topk_q=None if topk is None else topk["topk_q"],
+            compile_block_cd=bool(getattr(cfg, "compile_block_cd", True)),
         )
         improve = err_after + 1e-12 < err_before
         if bool(improve.any().item()):

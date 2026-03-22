@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import torch
+from huggingface_hub import snapshot_download
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +23,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from mpq.combo import QuantCombo, make_combo
+from mpq.eval_utils import (
+    eval_ppl_from_tokens as shared_eval_ppl_from_tokens,
+    eval_protocol_for_dataset,
+    load_or_build_c4_tokens as shared_load_or_build_c4_tokens,
+    load_or_build_wikitext2_tokens as shared_load_or_build_wikitext2_tokens,
+)
 
 
 def _resolve_device_str(requested: Optional[str]) -> str:
@@ -95,6 +102,18 @@ def _ensure_gptqmodel_importable(*, extra_site_packages: Optional[str]) -> None:
     if extra_site_packages:
         sys.path.append(str(extra_site_packages))
     import gptqmodel  # noqa: F401
+
+
+def _resolve_model_path(model_ref: str) -> str:
+    path = Path(model_ref)
+    if path.exists() and (path / "config.json").exists():
+        return str(path)
+    return str(
+        snapshot_download(
+            model_ref,
+            allow_patterns=["*.json", "*.safetensors", "tokenizer*", "merges.txt", "vocab.json"],
+        )
+    )
 
 
 def _apply_awq_preprocess(
@@ -244,38 +263,25 @@ def _eval_cache_path(output_dir: str, tokenizer, dataset: str, max_eval_tokens: 
 
 
 def _load_or_build_wikitext2_tokens(tokenizer, *, max_eval_tokens: int, seqlen: int, seed: int, output_dir: str) -> torch.Tensor:
-    cache_path = _eval_cache_path(output_dir, tokenizer, "wikitext2", max_eval_tokens, seqlen, seed)
-    if os.path.exists(cache_path):
-        tokens = torch.load(cache_path, map_location="cpu")
-        return tokens[:, :max_eval_tokens].contiguous()
-
-    from datasets import load_dataset
-
-    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-    text = "\n\n".join(ds["text"])
-    tokens = tokenizer(text, return_tensors="pt", truncation=False).input_ids[:, :max_eval_tokens].cpu().contiguous()
-    torch.save(tokens, cache_path)
-    return tokens
+    return shared_load_or_build_wikitext2_tokens(
+        tokenizer,
+        max_eval_tokens=int(max_eval_tokens),
+        seqlen=int(seqlen),
+        seed=int(seed),
+        output_dir=str(output_dir),
+    )
 
 
 def _load_or_build_c4_tokens(tokenizer, *, model_ref: str, max_eval_tokens: int, seqlen: int, seed: int, output_dir: str) -> torch.Tensor:
-    cache_path = _eval_cache_path(output_dir, tokenizer, "c4", max_eval_tokens, seqlen, seed)
-    if os.path.exists(cache_path):
-        tokens = torch.load(cache_path, map_location="cpu")
-        return tokens[:, :max_eval_tokens].contiguous()
-
-    import importlib.util
-    _spec = importlib.util.spec_from_file_location(
-        "gptq_data_utils",
-        REPO_ROOT / "third_party" / "quip-sharp" / "lib" / "utils" / "gptq_data_utils.py",
+    return shared_load_or_build_c4_tokens(
+        tokenizer,
+        repo_root=str(REPO_ROOT),
+        model_ref=str(model_ref),
+        max_eval_tokens=int(max_eval_tokens),
+        seqlen=int(seqlen),
+        seed=int(seed),
+        output_dir=str(output_dir),
     )
-    gptq_data_utils = importlib.util.module_from_spec(_spec)
-    _spec.loader.exec_module(gptq_data_utils)
-
-    tokens = gptq_data_utils.get_test_tokens("c4", seed=int(seed), seqlen=int(seqlen), model=str(model_ref))
-    tokens = tokens[:, :max_eval_tokens].cpu().contiguous()
-    torch.save(tokens, cache_path)
-    return tokens
 
 
 @torch.no_grad()
@@ -285,26 +291,7 @@ def eval_ppl_from_tokens(
     *,
     seqlen: int = 2048,
 ) -> float:
-    runtime_device = next(model.parameters()).device
-    tokens = tokens.to(runtime_device)
-
-    nlls = []
-    nsamples = tokens.shape[1] // int(seqlen)
-    for i in range(nsamples):
-        batch = tokens[:, i * seqlen : (i + 1) * seqlen]
-        # Disable KV cache to keep peak memory bounded during long-run eval.
-        outputs = model(batch, use_cache=False)
-        shift_logits = outputs.logits[:, :-1, :].contiguous()
-        shift_labels = batch[:, 1:].contiguous()
-        loss = torch.nn.functional.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
-        )
-        nlls.append(loss.float() * (int(seqlen) - 1))
-
-    total_nll = torch.stack(nlls).sum()
-    total_tokens = nsamples * (int(seqlen) - 1)
-    return float(torch.exp(total_nll / total_tokens).item())
+    return shared_eval_ppl_from_tokens(model, tokens, seqlen=int(seqlen))
 
 
 def _resolve_combo_and_runtime(args) -> tuple[Optional[QuantCombo], Dict[str, Any]]:
@@ -327,7 +314,7 @@ def _resolve_combo_and_runtime(args) -> tuple[Optional[QuantCombo], Dict[str, An
                 backend="gptqmodel",
                 codebook="grid_g128",
                 preprocess="none",
-                rotation="hadamard",
+                rotation="model_hadamard",
                 solver="gptq",
                 polish_mode="none",
             )
@@ -338,7 +325,7 @@ def _resolve_combo_and_runtime(args) -> tuple[Optional[QuantCombo], Dict[str, An
                 backend="gptqmodel",
                 codebook="grid_g128",
                 preprocess="none",
-                rotation="hadamard",
+                rotation="internal_hadamard",
                 solver="vamp",
                 polish_mode="block_cd" if int(args.mpq_polish_sweeps) > 0 else "none",
             )
@@ -350,7 +337,7 @@ def _resolve_combo_and_runtime(args) -> tuple[Optional[QuantCombo], Dict[str, An
                 backend="gptqmodel",
                 codebook="grid_g128",
                 preprocess="none",
-                rotation="hadamard",
+                rotation="internal_hadamard",
                 solver="vamp",
                 polish_mode="none",
             )
@@ -363,7 +350,7 @@ def _resolve_combo_and_runtime(args) -> tuple[Optional[QuantCombo], Dict[str, An
                 backend="gptqmodel",
                 codebook="grid_g128",
                 preprocess="awq",
-                rotation="hadamard",
+                rotation="model_hadamard",
                 solver="gptq",
                 polish_mode="none",
             )
@@ -377,7 +364,7 @@ def _resolve_combo_and_runtime(args) -> tuple[Optional[QuantCombo], Dict[str, An
                 backend="gptqmodel",
                 codebook="grid_g128",
                 preprocess="awq",
-                rotation="hadamard",
+                rotation="internal_hadamard",
                 solver="vamp",
                 polish_mode="block_cd" if int(args.mpq_polish_sweeps) > 0 else "none",
             )
@@ -388,11 +375,15 @@ def _resolve_combo_and_runtime(args) -> tuple[Optional[QuantCombo], Dict[str, An
             return None, runtime
         raise ValueError(f"unsupported method={requested_method!r} for backend_gptq")
 
+    requested_rotation = str(getattr(args, "quant_rotation", "auto") or "auto").strip().lower()
+    if requested_rotation in {"", "auto"}:
+        requested_rotation = "model_hadamard" if str(getattr(args, "quant_solver", "gptq")) == "gptq" else "internal_hadamard"
+
     combo = make_combo(
         backend=str(getattr(args, "quant_backend", "gptqmodel")),
         codebook=str(getattr(args, "quant_codebook", "grid_g128")),
         preprocess=str(getattr(args, "quant_preprocess", "none")),
-        rotation=str(getattr(args, "quant_rotation", "hadamard")),
+        rotation=requested_rotation,
         solver=str(getattr(args, "quant_solver", "gptq")),
         polish_mode=str(getattr(args, "quant_polish_mode", "none")),
         topk_source=str(getattr(args, "quant_topk_source", "aux_vamp")),
@@ -409,6 +400,16 @@ def _build_quantize_config(combo: Optional[QuantCombo], runtime: Dict[str, Any],
     from gptqmodel.quantization import FORMAT
 
     device = _resolve_device_str(getattr(args, "device", None))
+    rotation_name = combo.rotation if combo is not None else "none"
+    if rotation_name == "model_hadamard":
+        quant_rotation = "hadamard"
+    elif rotation_name == "model_random":
+        quant_rotation = "random"
+    elif rotation_name == "internal_hadamard":
+        quant_rotation = "hadamard"
+    else:
+        quant_rotation = None
+
     qcfg = QuantizeConfig(
         bits=int(args.bits),
         group_size=int(args.group_size),
@@ -419,15 +420,24 @@ def _build_quantize_config(combo: Optional[QuantCombo], runtime: Dict[str, Any],
         format=FORMAT.GPTQ_V2,
         device=device,
         offload_to_disk=bool(args.offload_to_disk),
-        rotation=None if combo is None or combo.rotation in {"none", ""} else str(combo.rotation),
+        rotation=quant_rotation,
         desc_act=bool(runtime["desc_act"]),
     )
 
-    use_repo_managed = combo is not None and (combo.solver == "vamp" or combo.polish_mode != "none")
+    use_repo_managed = combo is not None and (
+        combo.solver == "vamp" or combo.polish_mode != "none" or combo.rotation == "internal_hadamard"
+    )
     if use_repo_managed:
         qcfg.mpq.enabled = True
         qcfg.mpq.solver = str(combo.solver)
         qcfg.mpq.polish_mode = str(combo.polish_mode)
+        qcfg.mpq.rotation_mode = str(combo.rotation)
+        qcfg.mpq.rotation_requested = str(combo.rotation)
+        qcfg.mpq.rotation_effective = (
+            "internal_block_hadamard" if combo.rotation == "internal_hadamard" else str(combo.rotation)
+        )
+        qcfg.mpq.rotation_internal = bool(combo.rotation == "internal_hadamard")
+        qcfg.mpq.rotation_mode_effective = "internal_rotation" if combo.rotation == "internal_hadamard" else ("model_rotation" if combo.rotation in {"model_hadamard", "model_random"} else "none")
         qcfg.mpq.topk_source = str(combo.topk_source)
         qcfg.mpq.topk_k = int(getattr(args, "quant_topk_k", 16))
         qcfg.mpq.iters = 0 if bool(runtime["legacy_rtn"]) else int(args.mpq_iters)
@@ -500,7 +510,7 @@ def run(args) -> Dict[str, Any]:
     awq_time_s = 0.0
 
     model_id = str(args.model_id)
-    model_path = model_id
+    model_path = _resolve_model_path(model_id)
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
 
@@ -560,25 +570,24 @@ def run(args) -> Dict[str, Any]:
     eval_datasets = list(getattr(args, "eval_datasets", ["wikitext2", "c4"]))
     ppls: Dict[str, float] = {}
     eval_times: Dict[str, float] = {}
+    eval_protocol: Dict[str, Any] = {}
+
+    hf_model = getattr(model, "model", model)
+    hf_model.eval()
+    hf_model.to(device)
+    _strip_gptqmodel_hooked_modules(hf_model)
+    hf_model.to(device)
+    _materialize_inference_tensors(hf_model)
+
     if not skip_eval:
-        # Evaluate in-process.
-        hf_model = getattr(model, "model", model)
-        # Drop wrapper refs (may retain large buffers).
-        if hf_model is not model:
-            del model
-        gc.collect()
-        if device.type == "cuda":
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
-        hf_model.eval()
-        hf_model.to(device)
-        _strip_gptqmodel_hooked_modules(hf_model)
-        hf_model.to(device)
-        _materialize_inference_tensors(hf_model)
         for dataset in eval_datasets:
             dataset_norm = str(dataset).strip().lower()
+            eval_protocol[dataset_norm] = eval_protocol_for_dataset(
+                dataset_norm,
+                seqlen=int(args.eval_seqlen),
+                requested_max_eval_tokens=int(args.eval_max_eval_tokens),
+            )
+            eval_json = Path(args.output_dir) / f"eval_{dataset_norm}.json"
             t_eval = time.time()
             if dataset_norm == "wikitext2":
                 tokens = _load_or_build_wikitext2_tokens(
@@ -598,13 +607,19 @@ def run(args) -> Dict[str, Any]:
                     output_dir=str(args.output_dir),
                 )
             else:
-                raise ValueError(f"unsupported eval dataset for backend_gptq: {dataset!r}")
-            ppls[dataset_norm] = eval_ppl_from_tokens(
-                hf_model,
-                tokens,
-                seqlen=int(args.eval_seqlen),
-            )
+                raise ValueError(f"unsupported eval dataset: {dataset_norm!r}")
+            dataset_ppl = float(eval_ppl_from_tokens(hf_model, tokens, seqlen=int(args.eval_seqlen)))
+            ppls[dataset_norm] = dataset_ppl
             eval_times[f"eval_{dataset_norm}_s"] = float(time.time() - t_eval)
+            eval_payload = {
+                "datasets": [dataset_norm],
+                "eval_protocol": {dataset_norm: eval_protocol[dataset_norm]},
+                "max_eval_tokens": int(args.eval_max_eval_tokens),
+                "ppl": {dataset_norm: dataset_ppl},
+                "seed": int(args.seed),
+                "seqlen": int(args.eval_seqlen),
+            }
+            eval_json.write_text(json.dumps(eval_payload, indent=2, sort_keys=True), encoding="utf-8")
     else:
         eval_datasets = []
 
@@ -612,6 +627,12 @@ def run(args) -> Dict[str, Any]:
     lm_eval_result = {}
     lm_eval_time_s = 0.0
     if lm_eval_tasks and not skip_eval:
+        gc.collect()
+        if device.type == "cuda":
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
         t_lm = time.time()
         lm_eval_result = _run_lm_eval(
             hf_model, tokenizer,
@@ -621,20 +642,20 @@ def run(args) -> Dict[str, Any]:
         )
         lm_eval_time_s = float(time.time() - t_lm)
 
-    if "hf_model" in locals():
-        del hf_model
+    t_hfize = time.time()
+    GPTQModel.export(str(quantized_dir), str(hf_dir), format="hf")
+    hfize_s = float(time.time() - t_hfize)
+
     if "model" in locals():
         del model
+    if "hf_model" in locals():
+        del hf_model
     gc.collect()
     if device.type == "cuda":
         try:
             torch.cuda.empty_cache()
         except Exception:
             pass
-
-    t_hfize = time.time()
-    GPTQModel.export(str(quantized_dir), str(hf_dir), format="hf")
-    hfize_s = float(time.time() - t_hfize)
 
     return {
         "backend": "gptqmodel",
@@ -648,6 +669,13 @@ def run(args) -> Dict[str, Any]:
         "codebook": combo.codebook if combo is not None else "grid_g128",
         "preprocess": combo.preprocess if combo is not None else "none",
         "rotation": combo.rotation if combo is not None else "none",
+        "rotation_mode": (
+            "internal_rotation"
+            if bool(getattr(getattr(qcfg, "mpq", None), "rotation_internal", False))
+            else ("model_rotation" if (combo is not None and combo.rotation in {"model_hadamard", "model_random"}) else "none")
+        ),
+        "rotation_requested": str(getattr(getattr(qcfg, "mpq", None), "rotation_requested", combo.rotation if combo is not None else "none")),
+        "rotation_effective": str(getattr(getattr(qcfg, "mpq", None), "rotation_effective", combo.rotation if combo is not None else "none")),
         "solver": combo.solver if combo is not None else "gptq",
         "polish_mode": combo.polish_mode if combo is not None else "none",
         "topk_source": combo.topk_source if combo is not None else "aux_vamp",
@@ -670,6 +698,7 @@ def run(args) -> Dict[str, Any]:
             "datasets": eval_datasets,
             "seqlen": int(args.eval_seqlen),
             "max_eval_tokens": int(args.eval_max_eval_tokens),
+            "eval_protocol": eval_protocol,
             "ppl": ppls,
         },
         "lm_eval": lm_eval_result,
@@ -698,14 +727,12 @@ def run(args) -> Dict[str, Any]:
             "dense": bool(
                 getattr(qcfg, "mpq", None)
                 and bool(getattr(qcfg.mpq, "enabled", False))
-                and str(getattr(qcfg.mpq, "solver", "")) == "vamp"
-                and str(getattr(qcfg, "rotation", None)) == "hadamard"
+                and bool(getattr(qcfg.mpq, "rotation_internal", False))
             ),
             "packed": not bool(
                 getattr(qcfg, "mpq", None)
                 and bool(getattr(qcfg.mpq, "enabled", False))
-                and str(getattr(qcfg.mpq, "solver", "")) == "vamp"
-                and str(getattr(qcfg, "rotation", None)) == "hadamard"
+                and bool(getattr(qcfg.mpq, "rotation_internal", False))
             ),
         },
         "meta": {
@@ -728,6 +755,12 @@ def run(args) -> Dict[str, Any]:
             "em_obs_precision": bool(getattr(qcfg.mpq, "em_obs_precision", False)) if getattr(qcfg, "mpq", None) else False,
             "block_rows": int(getattr(qcfg.mpq, "block_rows", 0)) if getattr(qcfg, "mpq", None) else 0,
             "rotation_seed": int(getattr(qcfg.mpq, "rotation_seed", 0)) if getattr(qcfg, "mpq", None) else 0,
+            "rotation_mode": str(getattr(qcfg.mpq, "rotation_mode", "")) if getattr(qcfg, "mpq", None) else "",
+            "rotation_requested": str(getattr(qcfg.mpq, "rotation_requested", "")) if getattr(qcfg, "mpq", None) else "",
+            "rotation_effective": str(getattr(qcfg.mpq, "rotation_effective", "")) if getattr(qcfg, "mpq", None) else "",
+            "rotation_internal": bool(getattr(qcfg.mpq, "rotation_internal", False)) if getattr(qcfg, "mpq", None) else False,
+            "rotation_fallback_reason": str(getattr(qcfg.mpq, "rotation_fallback_reason", "")) if getattr(qcfg, "mpq", None) else "",
+            "rotation_block_dim": int(getattr(qcfg.mpq, "rotation_block_dim", 0)) if getattr(qcfg, "mpq", None) else 0,
         },
         "ojbkq": {
             "enabled": bool(getattr(qcfg, "ojbkq", None) is not None and bool(getattr(qcfg.ojbkq, "enabled", False))),
@@ -750,7 +783,12 @@ def main() -> None:
     parser.add_argument("--quant-backend", type=str, default="gptqmodel")
     parser.add_argument("--quant-codebook", type=str, default="grid_g128")
     parser.add_argument("--quant-preprocess", type=str, default="none")
-    parser.add_argument("--quant-rotation", type=str, default="hadamard")
+    parser.add_argument(
+        "--quant-rotation",
+        type=str,
+        default="auto",
+        help="GPTQModel rotation mode: auto|none|model_hadamard|model_random|internal_hadamard.",
+    )
     parser.add_argument("--quant-solver", type=str, default="gptq", choices=["gptq", "vamp"])
     parser.add_argument("--quant-polish-mode", type=str, default="none", choices=["none", "block_cd", "topk_block_cd"])
     parser.add_argument("--quant-topk-source", type=str, default="aux_vamp")
@@ -771,7 +809,7 @@ def main() -> None:
 
     # Eval
     parser.add_argument("--eval-seqlen", type=int, default=2048)
-    parser.add_argument("--eval-max-eval-tokens", type=int, default=131072)
+    parser.add_argument("--eval-max-eval-tokens", type=int, default=0, help="0 => paper-style defaults: full Wikitext2, C4 = 256*seqlen")
     parser.add_argument("--eval-datasets", nargs="*", default=["wikitext2", "c4"])
     parser.add_argument("--skip-eval", action=argparse.BooleanOptionalAction, default=False)
 

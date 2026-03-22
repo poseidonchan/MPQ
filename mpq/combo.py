@@ -57,9 +57,18 @@ def normalize_rotation(value: str) -> str:
     v = str(value or "none").strip().lower()
     if v in {"", "none", "off"}:
         return "none"
-    if v in {"had", "hadamard", "kron", "random"}:
+    if v in {"had", "kron"}:
         return v
-    raise ValueError(f"unsupported rotation={value!r}; expected none|hadamard|random|had|kron.")
+    if v == "model_hadamard":
+        return "model_hadamard"
+    if v == "model_random":
+        return "model_random"
+    if v == "internal_hadamard":
+        return "internal_hadamard"
+    raise ValueError(
+        "unsupported rotation="
+        f"{value!r}; expected none|model_hadamard|model_random|internal_hadamard|had|kron."
+    )
 
 
 def normalize_solver(value: str) -> str:
@@ -90,12 +99,17 @@ def make_combo(
     polish_mode: str,
     topk_source: str = "aux_vamp",
 ) -> QuantCombo:
+    backend_norm = normalize_backend(backend)
+    codebook_norm = normalize_codebook(codebook)
+    preprocess_norm = normalize_preprocess(preprocess)
+    solver_norm = normalize_solver(solver)
+    rotation_norm = normalize_rotation(rotation)
     combo = QuantCombo(
-        backend=normalize_backend(backend),
-        codebook=normalize_codebook(codebook),
-        preprocess=normalize_preprocess(preprocess),
-        rotation=normalize_rotation(rotation),
-        solver=normalize_solver(solver),
+        backend=backend_norm,
+        codebook=codebook_norm,
+        preprocess=preprocess_norm,
+        rotation=rotation_norm,
+        solver=solver_norm,
         polish_mode=normalize_polish_mode(polish_mode),
         topk_source=str(topk_source or "aux_vamp").strip().lower(),
     )
@@ -111,8 +125,11 @@ def validate_combo(combo: QuantCombo) -> None:
             raise ValueError("gptqmodel backend only supports solver in {gptq, vamp}.")
         if combo.preprocess not in {"none", "awq"}:
             raise ValueError("gptqmodel backend only supports preprocess in {none, awq}.")
-        if combo.rotation not in {"none", "hadamard", "random"}:
-            raise ValueError("gptqmodel backend only supports rotation in {none, hadamard, random}.")
+        if combo.rotation not in {"none", "model_hadamard", "model_random", "internal_hadamard"}:
+            raise ValueError(
+                "gptqmodel backend only supports rotation in "
+                "{none, model_hadamard, model_random, internal_hadamard}."
+            )
     elif combo.backend == "quip":
         if combo.codebook != "e8p12":
             raise ValueError("quip backend only supports codebook=e8p12.")
@@ -127,4 +144,3 @@ def validate_combo(combo: QuantCombo) -> None:
         raise ValueError("solver=ldlq_tune10 requires polish_mode=none.")
     if combo.polish_mode != "topk_block_cd" and combo.topk_source != "aux_vamp":
         raise ValueError("topk_source is only meaningful for polish_mode=topk_block_cd.")
-

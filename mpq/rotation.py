@@ -12,6 +12,39 @@ import torch
 
 log = logging.getLogger(__name__)
 
+
+def largest_pow2_factor(n: int) -> int:
+    n = int(n)
+    if n <= 0:
+        raise ValueError(f"expected positive n, got {n}.")
+    return int(n & -n)
+
+
+def supports_exact_hadamard(width: int) -> bool:
+    try:
+        get_hadK(int(width))
+    except AssertionError:
+        return False
+    return True
+
+
+def resolve_hadamard_plan(width: int) -> tuple[str, int]:
+    width = int(width)
+    if supports_exact_hadamard(width):
+        return "exact", width
+    had_dim = largest_pow2_factor(width)
+    if had_dim >= 2:
+        return "block", int(had_dim)
+    return "none", 1
+
+
+def resolve_block_hadamard_plan(width: int) -> tuple[str, int]:
+    width = int(width)
+    had_dim = largest_pow2_factor(width)
+    if had_dim >= 2:
+        return "block", int(had_dim)
+    return "none", 1
+
 def get_hadK(n, transpose=False):
     hadK, K = None, None
     if n % 172 == 0:  # llama-2-7b up
@@ -256,6 +289,24 @@ def is_pow2(n):
 
 
 @torch.inference_mode()
+def sample_rademacher_signs(
+    *,
+    width: int,
+    key: str,
+    seed: int = 0,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    from .utils import stable_seed
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(stable_seed(str(key), base_seed=int(seed)))
+    signs = torch.randint(0, 2, (int(width),), generator=generator, dtype=torch.int64)
+    signs = signs.to(dtype=torch.float32).mul_(2.0).sub_(1.0)
+    return signs.to(device=device, dtype=dtype, non_blocking=False)
+
+
+@torch.inference_mode()
 def sample_hadamard_signs(
     *,
     width: int,
@@ -268,14 +319,7 @@ def sample_hadamard_signs(
         get_hadK(int(width))
     except AssertionError as exc:
         raise ValueError(f"hadamard rotation requires supported width; got width={width}.") from exc
-
-    from .utils import stable_seed
-
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(stable_seed(str(key), base_seed=int(seed)))
-    signs = torch.randint(0, 2, (int(width),), generator=generator, dtype=torch.int64)
-    signs = signs.to(dtype=torch.float32).mul_(2.0).sub_(1.0)
-    return signs.to(device=device, dtype=dtype, non_blocking=False)
+    return sample_rademacher_signs(width=int(width), key=key, seed=int(seed), device=device, dtype=dtype)
 
 
 @torch.inference_mode()
@@ -321,6 +365,43 @@ def apply_right_hadamard(matrix: torch.Tensor, *, signs: torch.Tensor) -> torch.
 @torch.inference_mode()
 def apply_right_hadamard_inverse(matrix: torch.Tensor, *, signs: torch.Tensor) -> torch.Tensor:
     return (apply_exact_hadamard(matrix.to(dtype=torch.float32), transpose=True) * signs.view(1, -1)).contiguous()
+
+
+@torch.inference_mode()
+def apply_block_hadamard(matrix: torch.Tensor, *, had_dim: int) -> torch.Tensor:
+    had_dim = int(had_dim)
+    if had_dim <= 1:
+        return matrix.to(dtype=torch.float32).contiguous()
+    if not is_pow2(had_dim):
+        raise ValueError(f"block Hadamard requires power-of-two had_dim, got {had_dim}.")
+    width = int(matrix.shape[-1])
+    if width % had_dim != 0:
+        raise ValueError(f"block Hadamard requires width divisible by had_dim; got width={width}, had_dim={had_dim}.")
+    matrix = matrix.to(dtype=torch.float32).contiguous()
+    shape = matrix.shape
+    blocks = width // had_dim
+    use_fast = bool(matrix.is_cuda) and _load_fast_hadamard_transform(required=False)
+    if use_fast:
+        try:
+            return fast_hadamard_transform.hadamard_transform(  # noqa: F821
+                matrix.reshape(-1, blocks, had_dim),
+                scale=1 / math.sqrt(had_dim),
+            ).reshape(shape).contiguous()
+        except RuntimeError as exc:
+            if not _is_fast_hadamard_unsupported(exc):
+                raise
+            log.debug("fast_hadamard_transform unsupported for block Hadamard; falling back: %s", exc)
+    return _apply_hadamard_last_dim_torch(matrix.reshape(-1, blocks, had_dim), had_dim).reshape(shape).contiguous()
+
+
+@torch.inference_mode()
+def apply_right_block_hadamard(matrix: torch.Tensor, *, signs: torch.Tensor, had_dim: int) -> torch.Tensor:
+    return apply_block_hadamard(matrix.to(dtype=torch.float32) * signs.view(1, -1), had_dim=int(had_dim)).contiguous()
+
+
+@torch.inference_mode()
+def apply_right_block_hadamard_inverse(matrix: torch.Tensor, *, signs: torch.Tensor, had_dim: int) -> torch.Tensor:
+    return (apply_block_hadamard(matrix.to(dtype=torch.float32), had_dim=int(had_dim)) * signs.view(1, -1)).contiguous()
 
 
 # hadamard matrices for had12, had36.pal2, had52,will,

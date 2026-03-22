@@ -21,6 +21,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from mpq.combo import QuantCombo, make_combo
 from mpq.dense_decoder_adapter import resolve_dense_decoder_adapter_for_model_id
+from mpq.eval_utils import eval_protocol_for_dataset
 
 
 def _git_head(path: Path) -> str:
@@ -554,50 +555,34 @@ def run(args) -> Dict[str, Any]:
 
     ppls: Dict[str, float] = {}
     eval_times: Dict[str, float] = {}
+    eval_protocol: Dict[str, Any] = {}
     for dataset in eval_datasets:
         dataset_norm = str(dataset).strip().lower()
-        eval_cmd = (
-            [
-                sys.executable,
-                "-m",
-                "eval.eval_ppl",
-                "--hf_path",
-                str(hf_dir),
-                "--seed",
-                str(int(args.seed)),
-                "--seqlen",
-                str(int(args.eval_seqlen)),
-                "--datasets",
-                dataset_norm,
-                "--max_eval_tokens",
-                str(int(getattr(args, "eval_max_eval_tokens", 0))),
-                "--json_out",
-                str(log_dir / f"eval_{dataset_norm}.json"),
-                "--no_use_cuda_graph",
-                "--no_use_flash_attn",
-            ]
-            if use_legacy_llama_path
-            else [
-                sys.executable,
-                str(REPO_ROOT / "scripts" / "eval_hf_ppl.py"),
-                "--hf_path",
-                str(hf_dir),
-                "--seed",
-                str(int(args.seed)),
-                "--seqlen",
-                str(int(args.eval_seqlen)),
-                "--datasets",
-                dataset_norm,
-                "--max_eval_tokens",
-                str(int(getattr(args, "eval_max_eval_tokens", 0))),
-                "--json_out",
-                str(log_dir / f"eval_{dataset_norm}.json"),
-            ]
+        eval_protocol[dataset_norm] = eval_protocol_for_dataset(
+            dataset_norm,
+            seqlen=int(args.eval_seqlen),
+            requested_max_eval_tokens=int(getattr(args, "eval_max_eval_tokens", 0)),
         )
+        eval_cmd = [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "eval_hf_ppl.py"),
+            "--hf_path",
+            str(hf_dir),
+            "--seed",
+            str(int(args.seed)),
+            "--seqlen",
+            str(int(args.eval_seqlen)),
+            "--datasets",
+            dataset_norm,
+            "--max_eval_tokens",
+            str(int(getattr(args, "eval_max_eval_tokens", 0))),
+            "--json_out",
+            str(log_dir / f"eval_{dataset_norm}.json"),
+        ]
         t_eval = time.time()
         rc = _run_logged(
             eval_cmd,
-            cwd=QUIP_ROOT if use_legacy_llama_path else REPO_ROOT,
+            cwd=REPO_ROOT,
             env=env,
             log_path=log_dir / f"eval_{dataset_norm}.log",
         )
@@ -616,6 +601,7 @@ def run(args) -> Dict[str, Any]:
                 "seqlen": int(args.eval_seqlen),
                 "datasets": eval_datasets,
                 "max_eval_tokens": int(getattr(args, "eval_max_eval_tokens", 0)),
+                "eval_protocol": eval_protocol,
                 "ppl": ppls,
             },
             indent=2,
@@ -633,7 +619,7 @@ def run(args) -> Dict[str, Any]:
             sys.executable,
             str(REPO_ROOT / "scripts" / "eval_lm_eval.py"),
             "--model-path", str(hf_dir),
-            "--quip",
+            *(["--quip"] if use_legacy_llama_path else []),
             "--tasks", ",".join(lm_eval_tasks),
             "--batch-size", str(getattr(args, "lm_eval_batch_size", "1")),
             "--num-fewshot", str(int(getattr(args, "lm_eval_num_fewshot", 0))),
@@ -692,6 +678,7 @@ def run(args) -> Dict[str, Any]:
             "datasets": eval_datasets,
             "seqlen": int(args.eval_seqlen),
             "max_eval_tokens": int(getattr(args, "eval_max_eval_tokens", 0)),
+            "eval_protocol": eval_protocol,
             "ppl": ppls,
         },
         "lm_eval": lm_eval_result,
@@ -784,7 +771,7 @@ def main() -> None:
     # Eval
     parser.add_argument("--eval-seqlen", type=int, default=2048)
     parser.add_argument("--eval-datasets", nargs="*", default=["wikitext2", "c4"])
-    parser.add_argument("--eval-max-eval-tokens", type=int, default=131072)
+    parser.add_argument("--eval-max-eval-tokens", type=int, default=0, help="0 => paper-style defaults: full Wikitext2, C4 = 256*seqlen")
     parser.add_argument("--skip-eval", action=argparse.BooleanOptionalAction, default=False)
 
     # lm-evaluation-harness

@@ -100,6 +100,19 @@ The backend result JSON also includes normalized paths:
 - `paths.native_dir`
 - `paths.hf_dir`
 
+## Unified PPL Eval Protocol
+
+Public benchmark defaults now follow one shared protocol on both backends:
+- `Wikitext2`: full `test` split
+- `C4`: fixed `256 * seqlen` validation tokens, matching the common GPTQ/QUIP repo style
+
+CLI behavior:
+- `--eval-max-eval-tokens 0` means use the dataset default above
+- `--eval-max-eval-tokens N` forces a token cap for both datasets
+
+The resolved per-dataset eval policy is written into `backend_results.json` under:
+- `eval.eval_protocol`
+
 ### fast-hadamard-transform
 
 On newer GPUs it is usually safest to build from the vendored submodule:
@@ -130,21 +143,27 @@ Shared polish modes:
 
 Top-k polish always uses `topk_source=aux_vamp`.
 
+For `backend=gptqmodel`, `rotation` names are explicit:
+- `model_hadamard`
+- `model_random`
+- `internal_hadamard`
+
 ## Single-backend examples
 
 ### GPTQModel normal grid
 
-`GPTQ + topk block CD`:
+Current scalar-grid PPL replication config uses `internal_hadamard` for both `gptq` and `vamp`.
+
+`GPTQ + block CD`:
 
 ```bash
 python scripts/backend_gptq.py \
   --quant-backend gptqmodel \
   --quant-codebook grid_g128 \
   --quant-preprocess none \
-  --quant-rotation hadamard \
+  --quant-rotation internal_hadamard \
   --quant-solver gptq \
-  --quant-polish-mode topk_block_cd \
-  --quant-topk-k 16 \
+  --quant-polish-mode block_cd \
   --model-id Qwen/Qwen3-0.6B \
   --bits 4 \
   --group-size 128 \
@@ -160,7 +179,7 @@ python scripts/backend_gptq.py \
   --quant-backend gptqmodel \
   --quant-codebook grid_g128 \
   --quant-preprocess none \
-  --quant-rotation hadamard \
+  --quant-rotation internal_hadamard \
   --quant-solver vamp \
   --quant-polish-mode block_cd \
   --model-id Qwen/Qwen3-0.6B \
@@ -181,7 +200,7 @@ python scripts/backend_gptq.py \
   --quant-backend gptqmodel \
   --quant-codebook grid_g128 \
   --quant-preprocess awq \
-  --quant-rotation hadamard \
+  --quant-rotation internal_hadamard \
   --quant-solver gptq \
   --quant-polish-mode block_cd \
   --model-id Qwen/Qwen3-0.6B \
@@ -306,7 +325,7 @@ python scripts/benchmark.py \
   --quant-solvers gptq vamp \
   --quant-polish-modes none block_cd \
   --quant-preprocesses none awq \
-  --quant-rotations hadamard \
+  --quant-rotations model_hadamard internal_hadamard \
   --seeds 0
 ```
 
@@ -324,7 +343,7 @@ python scripts/ablation.py \
   --bits 4 \
   --model-id Qwen/Qwen3-0.6B \
   --quant-preprocess none \
-  --quant-rotation hadamard \
+  --quant-rotation internal_hadamard \
   --quant-solver vamp \
   --quant-polish-mode topk_block_cd \
   --quant-topk-k 16

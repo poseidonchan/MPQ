@@ -151,7 +151,7 @@ def main() -> None:
     parser.add_argument("--codebook", type=str, default="E8P12")
 
     parser.add_argument("--eval-seqlen", type=int, default=2048)
-    parser.add_argument("--eval-max-eval-tokens", type=int, default=131072)
+    parser.add_argument("--eval-max-eval-tokens", type=int, default=0, help="0 => paper-style defaults: full Wikitext2, C4 = 256*seqlen")
 
     parser.add_argument("--mpq-iters", type=int, default=10)
     parser.add_argument("--mpq-block-rows", type=int, default=128)
@@ -185,10 +185,13 @@ def main() -> None:
     if bits == 2 and not args.base_model:
         raise ValueError("--base-model is required for bits=2")
 
-    if args.quant_rotation is None:
-        args.quant_rotation = "had" if bits == 2 else "hadamard"
     if args.quant_solver is None:
         args.quant_solver = "vamp"
+    if args.quant_rotation is None:
+        if bits == 2:
+            args.quant_rotation = "had"
+        else:
+            args.quant_rotation = "model_hadamard" if str(args.quant_solver) == "gptq" else "internal_hadamard"
     if args.quant_polish_mode is None:
         args.quant_polish_mode = "block_cd"
 

@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
+import inspect
 import os
 import weakref
 from operator import attrgetter
 from pathlib import Path
-from typing import Any, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
 
 from .dense_decoder_adapter import DenseDecoderAdapter, resolve_dense_decoder_adapter_for_model
 
@@ -137,6 +140,200 @@ class DenseDecoderMixedLayer(nn.Module):
         return (hidden_states,)
 
 
+class FusedUpGateMLP(nn.Module):
+    def __init__(
+        self,
+        *,
+        source_mlp: nn.Module,
+        upgate_proj: nn.Module,
+        up_bias: Optional[torch.Tensor] = None,
+        gate_bias: Optional[torch.Tensor] = None,
+    ) -> None:
+        super().__init__()
+        self.upgate_proj = upgate_proj
+        self.down_proj = copy.deepcopy(source_mlp.down_proj).float().cpu()
+        self.act_fn = source_mlp.act_fn
+        if up_bias is not None:
+            self.register_buffer("up_bias", up_bias.detach().clone().to(torch.float32))
+        else:
+            self.up_bias = None
+        if gate_bias is not None:
+            self.register_buffer("gate_bias", gate_bias.detach().clone().to(torch.float32))
+        else:
+            self.gate_bias = None
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        up_states, gate_states = self.upgate_proj(hidden_states)
+        if self.up_bias is not None:
+            up_states = up_states + self.up_bias.to(device=up_states.device, dtype=up_states.dtype)
+        if self.gate_bias is not None:
+            gate_states = gate_states + self.gate_bias.to(device=gate_states.device, dtype=gate_states.dtype)
+        return self.down_proj(self.act_fn(gate_states) * up_states)
+
+
+class QwenLikeMixedAttention(nn.Module):
+    def __init__(
+        self,
+        *,
+        source_attn: nn.Module,
+        qkv_proj: nn.Module,
+        q_bias: Optional[torch.Tensor] = None,
+        k_bias: Optional[torch.Tensor] = None,
+        v_bias: Optional[torch.Tensor] = None,
+    ) -> None:
+        super().__init__()
+        self.config = source_attn.config
+        self.layer_idx = source_attn.layer_idx
+        self.head_dim = source_attn.head_dim
+        self.num_key_value_groups = source_attn.num_key_value_groups
+        self.scaling = source_attn.scaling
+        self.attention_dropout = source_attn.attention_dropout
+        self.is_causal = source_attn.is_causal
+        self.sliding_window = getattr(source_attn, "sliding_window", None)
+        self.qkv_proj = qkv_proj
+        self.o_proj = copy.deepcopy(source_attn.o_proj).float().cpu()
+        self.q_norm = copy.deepcopy(getattr(source_attn, "q_norm", None)).float().cpu() if getattr(source_attn, "q_norm", None) is not None else None
+        self.k_norm = copy.deepcopy(getattr(source_attn, "k_norm", None)).float().cpu() if getattr(source_attn, "k_norm", None) is not None else None
+        module = inspect.getmodule(type(source_attn))
+        if module is None:
+            raise RuntimeError("could not resolve Qwen attention module")
+        self._apply_rotary_pos_emb: Callable[..., Any] = getattr(module, "apply_rotary_pos_emb")
+        self._eager_attention_forward: Callable[..., Any] = getattr(module, "eager_attention_forward")
+        self._all_attention_functions = getattr(module, "ALL_ATTENTION_FUNCTIONS")
+        if q_bias is not None:
+            self.register_buffer("q_bias", q_bias.detach().clone().to(torch.float32))
+        else:
+            self.q_bias = None
+        if k_bias is not None:
+            self.register_buffer("k_bias", k_bias.detach().clone().to(torch.float32))
+        else:
+            self.k_bias = None
+        if v_bias is not None:
+            self.register_buffer("v_bias", v_bias.detach().clone().to(torch.float32))
+        else:
+            self.v_bias = None
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[Any] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        query_states, key_states, value_states = self.qkv_proj(hidden_states)
+        if self.q_bias is not None:
+            query_states = query_states + self.q_bias.to(device=query_states.device, dtype=query_states.dtype)
+        if self.k_bias is not None:
+            key_states = key_states + self.k_bias.to(device=key_states.device, dtype=key_states.dtype)
+        if self.v_bias is not None:
+            value_states = value_states + self.v_bias.to(device=value_states.device, dtype=value_states.dtype)
+
+        query_states = query_states.view(hidden_shape)
+        key_states = key_states.view(hidden_shape)
+        value_states = value_states.view(hidden_shape).transpose(1, 2)
+        if self.q_norm is not None:
+            query_states = self.q_norm(query_states)
+        if self.k_norm is not None:
+            key_states = self.k_norm(key_states)
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = self._apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        if past_key_values is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_values.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
+
+        attention_interface: Callable[..., Any] = self._eager_attention_forward
+        if self.config._attn_implementation != "eager":
+            attention_interface = self._all_attention_functions[self.config._attn_implementation]
+
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=self.sliding_window,
+            **kwargs,
+        )
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        return self.o_proj(attn_output), attn_weights
+
+
+class QwenLikeMixedLayer(nn.Module):
+    def __init__(
+        self,
+        *,
+        self_attn: nn.Module,
+        mlp: nn.Module,
+        input_layernorm: nn.Module,
+        post_attention_layernorm: nn.Module,
+        rotary_emb: Optional[nn.Module],
+    ) -> None:
+        super().__init__()
+        self.self_attn = self_attn
+        self.mlp = mlp
+        self.input_layernorm = input_layernorm
+        self.post_attention_layernorm = post_attention_layernorm
+        self.rotary_emb = rotary_emb
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        position_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        use_cache: bool = False,
+        output_attentions: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor]:
+        if position_ids is None:
+            position_ids = torch.arange(hidden_states.shape[1], device=hidden_states.device).unsqueeze(0)
+        if attention_mask is None:
+            attention_mask = _prepare_4d_causal_attention_mask(
+                None,
+                (int(hidden_states.shape[0]), int(hidden_states.shape[1])),
+                hidden_states,
+                0,
+                sliding_window=getattr(self.self_attn, "sliding_window", None),
+            )
+        position_embeddings = None
+        if self.rotary_emb is not None:
+            position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        attn_out, _ = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_embeddings=position_embeddings,
+            use_cache=bool(use_cache),
+            output_attentions=bool(output_attentions),
+            cache_position=cache_position,
+            **kwargs,
+        )
+        hidden_states = residual + attn_out
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return (hidden_states,)
+
+
 def _check_exist(idx: int, save_path: str) -> bool:
     suffixes = ("qkv", "o", "up", "down", "layernorm")
     return all(Path(save_path, f"{int(idx)}_{suffix}.pt").exists() for suffix in suffixes)
@@ -154,12 +351,145 @@ def _split_optional_bias(bias: Optional[torch.Tensor], sizes: Sequence[int]) -> 
     return out
 
 
+def _quantize_weights_to_attr(
+    *,
+    weights: List[torch.Tensor],
+    save_name: str,
+    hessian_path: str,
+    cb: Any,
+    args: Any,
+    device: Any,
+) -> Tuple[Dict[str, Any], float, float]:
+    from lib import utils as quip_utils
+    from lib.algo import quip
+
+    dtype_ = torch.float64 if bool(args.use_fp64) else torch.float32
+    shapes = [w.shape for w in weights]
+    scales = [w.to(dtype_).square().mean().sqrt() for w in weights]
+
+    H_data = torch.load(hessian_path, map_location=torch.device("cpu"))
+    H = quip_utils.flat_to_sym(H_data["flatH"], H_data["n"])
+    mu = H_data["mu"]
+    H.add_(mu[None, :] * mu[:, None])
+    n = int(H_data["n"])
+    W = torch.vstack([weights[i].to(dtype_) / scales[i] for i in range(len(weights))]).to(dtype_)
+    H = quip_utils.regularize_H(H, n, float(args.sigma_reg))
+    base_seed = int(getattr(args, "seed", 0) or 0)
+    digest = hashlib.sha256(str(save_name).encode("utf-8")).digest()
+    local_seed = int((base_seed + int.from_bytes(digest[:8], byteorder="little", signed=False)) % (2**31 - 1))
+    cpu_state = torch.random.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        torch.manual_seed(local_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(local_seed)
+        hatW, attr = quip.quantize(H, W, int(args.lora_rank), cb, args, device, module_name=str(save_name))
+    finally:
+        torch.random.set_rng_state(cpu_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+
+    if len(scales) == 1:
+        attr["SV"] *= scales[0]
+        scales = [1.0]
+    attr.update(
+        {
+            "fused": len(shapes) > 1,
+            "shapes": shapes,
+            "scales": scales,
+        }
+    )
+
+    diff = hatW.to(dtype_) - W
+    denom_frob = float(W.square().sum().clamp_min_(1e-12).item())
+    denom_proxy = float(((W @ H) * W).sum().abs().clamp_min_(1e-12).item())
+    err_frob = float(diff.square().sum().item() / denom_frob)
+    err_proxy = float((((diff @ H) * diff).sum().item()) / denom_proxy)
+    return attr, err_frob, err_proxy
+
+
+def _save_quantized_attr(attr: Dict[str, Any], save_path: str) -> None:
+    torch.save(attr, save_path)
+
+
+def _quantize_linear_generic_fail_closed(
+    *,
+    weights: List[torch.Tensor],
+    save_path: str,
+    hessian_path: str,
+    cb: Any,
+    args: Any,
+    device: Any,
+    enable_safe_tune: bool,
+) -> Dict[str, Any]:
+    tune_iters = int(getattr(args, "quip_tune_iters", 0) or 0)
+    if not enable_safe_tune or tune_iters <= 0:
+        attr, err_frob, err_proxy = _quantize_weights_to_attr(
+            weights=weights,
+            save_name=os.path.basename(save_path),
+            hessian_path=hessian_path,
+            cb=cb,
+            args=args,
+            device=device,
+        )
+        attr["selected_quip_tune_iters"] = int(tune_iters)
+        attr["selected_frob_error"] = float(err_frob)
+        attr["selected_proxy_error"] = float(err_proxy)
+        _save_quantized_attr(attr, save_path)
+        return attr
+
+    base_args = copy.deepcopy(args)
+    base_args.quip_tune_iters = 0
+    base_attr, base_frob, base_proxy = _quantize_weights_to_attr(
+        weights=weights,
+        save_name=os.path.basename(save_path),
+        hessian_path=hessian_path,
+        cb=cb,
+        args=base_args,
+        device=device,
+    )
+    tuned_attr, tuned_frob, tuned_proxy = _quantize_weights_to_attr(
+        weights=weights,
+        save_name=os.path.basename(save_path),
+        hessian_path=hessian_path,
+        cb=cb,
+        args=args,
+        device=device,
+    )
+
+    if tuned_frob <= base_frob:
+        chosen_attr = tuned_attr
+        chosen_iters = int(tune_iters)
+        alt_iters = 0
+        alt_frob = float(base_frob)
+        alt_proxy = float(base_proxy)
+        chosen_frob = float(tuned_frob)
+        chosen_proxy = float(tuned_proxy)
+    else:
+        chosen_attr = base_attr
+        chosen_iters = 0
+        alt_iters = int(tune_iters)
+        alt_frob = float(tuned_frob)
+        alt_proxy = float(tuned_proxy)
+        chosen_frob = float(base_frob)
+        chosen_proxy = float(base_proxy)
+
+    chosen_attr["selected_quip_tune_iters"] = int(chosen_iters)
+    chosen_attr["selected_frob_error"] = float(chosen_frob)
+    chosen_attr["selected_proxy_error"] = float(chosen_proxy)
+    chosen_attr["alternate_quip_tune_iters"] = int(alt_iters)
+    chosen_attr["alternate_frob_error"] = float(alt_frob)
+    chosen_attr["alternate_proxy_error"] = float(alt_proxy)
+    _save_quantized_attr(chosen_attr, save_path)
+    return chosen_attr
+
+
 def build_mixed_layer(
     *,
     layer: nn.Module,
     model: Any,
     adapter: DenseDecoderAdapter,
-) -> DenseDecoderMixedLayer:
+) -> nn.Module:
     handles = adapter.get_layer_handles(layer)
     layer_copy = copy.deepcopy(layer).float().cpu()
     copy_handles = adapter.get_layer_handles(layer_copy)
@@ -185,6 +515,9 @@ def build_mixed_layer(
             cur += int(w.shape[0])
     copy_handles = adapter.get_layer_handles(layer_copy)
     layer_copy.self_attn.qkv_proj = qkv_proj
+    layer_copy.self_attn.q_bias = attn_biases[0]
+    layer_copy.self_attn.k_bias = attn_biases[1]
+    layer_copy.self_attn.v_bias = attn_biases[2]
     layer_copy.self_attn.q_proj = SharedFusedSliceLinear(layer_copy.self_attn, "qkv_proj", 0, qkv_sizes, slice_bias=attn_biases[0])
     layer_copy.self_attn.k_proj = SharedFusedSliceLinear(layer_copy.self_attn, "qkv_proj", 1, qkv_sizes, slice_bias=attn_biases[1])
     layer_copy.self_attn.v_proj = SharedFusedSliceLinear(layer_copy.self_attn, "qkv_proj", 2, qkv_sizes, slice_bias=attn_biases[2])
@@ -205,12 +538,33 @@ def build_mixed_layer(
             upgate_proj.weight[cur : cur + w.shape[0]].copy_(w)
             cur += int(w.shape[0])
     layer_copy.mlp.upgate_proj = upgate_proj
+    layer_copy.mlp.up_bias = mlp_biases[0]
+    layer_copy.mlp.gate_bias = mlp_biases[1]
     layer_copy.mlp.up_proj = SharedFusedSliceLinear(layer_copy.mlp, "upgate_proj", 0, up_sizes, slice_bias=mlp_biases[0])
     layer_copy.mlp.gate_proj = SharedFusedSliceLinear(layer_copy.mlp, "upgate_proj", 1, up_sizes, slice_bias=mlp_biases[1])
 
     rotary = copy.deepcopy(getattr(adapter.get_model_root(model), "rotary_emb", None))
     if rotary is not None:
         rotary = rotary.cpu()
+    if adapter.name == "qwen_like_dense_decoder":
+        return QwenLikeMixedLayer(
+            self_attn=QwenLikeMixedAttention(
+                source_attn=layer_copy.self_attn,
+                qkv_proj=qkv_proj,
+                q_bias=attn_biases[0],
+                k_bias=attn_biases[1],
+                v_bias=attn_biases[2],
+            ),
+            mlp=FusedUpGateMLP(
+                source_mlp=layer_copy.mlp,
+                upgate_proj=upgate_proj,
+                up_bias=mlp_biases[0],
+                gate_bias=mlp_biases[1],
+            ),
+            input_layernorm=copy.deepcopy(layer_copy.input_layernorm).float().cpu(),
+            post_attention_layernorm=copy.deepcopy(layer_copy.post_attention_layernorm).float().cpu(),
+            rotary_emb=rotary,
+        )
     return DenseDecoderMixedLayer(
         self_attn=layer_copy.self_attn,
         mlp=layer_copy.mlp,
@@ -229,9 +583,11 @@ def quantize_finetune_dense_decoder_layer(
     device: Any,
     pre_orig_emb: torch.Tensor,
     orig_emb: torch.Tensor,
+    *,
+    adapter: DenseDecoderAdapter,
 ) -> None:
     from lib import codebook, utils
-    from lib.algo import finetune, quip
+    from lib.algo import finetune
     from lib.linear.fused_linear import FusedLinear
     from lib.linear.fused_quantized_linear import FusedQuantizedLinear
     from lib.linear.quantized_linear import QuantizedLinear
@@ -265,22 +621,29 @@ def quantize_finetune_dense_decoder_layer(
                 weights = torch.split(orig_linear.weight, orig_linear.fuse_sizes, 0)
                 if name == "qkv":
                     split_biases = [
-                        getattr(mixed_layer.self_attn.q_proj, "slice_bias", None),
-                        getattr(mixed_layer.self_attn.k_proj, "slice_bias", None),
-                        getattr(mixed_layer.self_attn.v_proj, "slice_bias", None),
+                        getattr(mixed_layer.self_attn, "q_bias", None),
+                        getattr(mixed_layer.self_attn, "k_bias", None),
+                        getattr(mixed_layer.self_attn, "v_bias", None),
                     ]
                 elif name == "up":
                     split_biases = [
-                        getattr(mixed_layer.mlp.up_proj, "slice_bias", None),
-                        getattr(mixed_layer.mlp.gate_proj, "slice_bias", None),
+                        getattr(mixed_layer.mlp, "up_bias", None),
+                        getattr(mixed_layer.mlp, "gate_bias", None),
                     ]
             else:
                 weights = [orig_linear.weight]
                 if getattr(orig_linear, "bias", None) is not None:
                     single_bias = orig_linear.bias.detach().cpu().float()
 
-            quip.quantize_linear(weights, save_path, hessian_path, cb, args, device)
-            saved_linear = torch.load(save_path, map_location=torch.device("cpu"), weights_only=False)
+            saved_linear = _quantize_linear_generic_fail_closed(
+                weights=[w.detach().cpu() for w in weights],
+                save_path=save_path,
+                hessian_path=hessian_path,
+                cb=cb,
+                args=args,
+                device=device,
+                enable_safe_tune=(adapter.name == "qwen_like_dense_decoder"),
+            )
             dirty = False
             if split_biases is not None and any(b is not None for b in split_biases):
                 saved_linear["split_biases"] = [
@@ -338,7 +701,13 @@ def quantize_finetune_dense_decoder_layer(
     torch.set_grad_enabled(False)
 
 
-def save_layernorm_state(mixed_layer: nn.Module, *, save_path: str, idx: int) -> None:
+def save_layernorm_state(
+    mixed_layer: nn.Module,
+    *,
+    save_path: str,
+    idx: int,
+    adapter: DenseDecoderAdapter,
+) -> None:
     payload = {
         "input_layernorm": mixed_layer.input_layernorm.weight.detach().cpu(),
         "post_attention_layernorm": mixed_layer.post_attention_layernorm.weight.detach().cpu(),
@@ -347,6 +716,7 @@ def save_layernorm_state(mixed_layer: nn.Module, *, save_path: str, idx: int) ->
         payload["input_layernorm_bias"] = mixed_layer.input_layernorm.bias.detach().cpu()
     if getattr(mixed_layer.post_attention_layernorm, "bias", None) is not None:
         payload["post_attention_layernorm_bias"] = mixed_layer.post_attention_layernorm.bias.detach().cpu()
+    payload.update(adapter.extra_state_dict(mixed_layer))
     torch.save(payload, f"{save_path}/{idx}_layernorm.pt")
 
 
@@ -404,6 +774,7 @@ def apply_quantized_ckpt_to_model(
                     handles.input_layernorm.bias.copy_(ln_data["input_layernorm_bias"])
                 if getattr(handles.post_attention_layernorm, "bias", None) is not None and "post_attention_layernorm_bias" in ln_data:
                     handles.post_attention_layernorm.bias.copy_(ln_data["post_attention_layernorm_bias"])
+                adapter.load_extra_state_dict(layer, ln_data)
 
             qkv_w, qkv_b = _load_split_weights(str(Path(ckpt_dir) / f"{idx}_qkv.pt"), cb, args)
             handles.q_proj.weight.copy_(qkv_w[0])
@@ -455,13 +826,6 @@ def collect_hessians_generic(args: Any) -> None:
     dev_emb = root.embed_tokens(devset).cpu()
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     position_ids = torch.arange(args.ctx_size, dtype=torch.int64)[None, :].expand(args.batch_size, -1)
-    attention_mask = adapter.build_attention_mask(
-        model,
-        batch_size=args.batch_size,
-        ctx_size=args.ctx_size,
-        hidden_states=dev_emb[: args.batch_size],
-    )
-
     save_path = Path(args.save_path)
     save_path.mkdir(parents=True, exist_ok=True)
 
@@ -472,6 +836,13 @@ def collect_hessians_generic(args: Any) -> None:
 
         layer = layer.to(device)
         handles = adapter.get_layer_handles(layer)
+        attention_mask = adapter.build_attention_mask(
+            model,
+            batch_size=args.batch_size,
+            ctx_size=args.ctx_size,
+            hidden_states=dev_emb[: args.batch_size],
+            layer=layer,
+        )
         done_qkv = quip_utils.register_H_hook(handles.q_proj, device)
         done_o = quip_utils.register_H_hook(handles.o_proj, device)
         done_up = quip_utils.register_H_hook(handles.up_proj, device)
@@ -558,16 +929,16 @@ def quantize_model_generic(args: Any) -> None:
     current_emb = root.embed_tokens(devset).cpu()
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     position_ids = torch.arange(args.ctx_size, dtype=torch.int64)[None, :].expand(args.batch_size, -1)
-    attention_mask = adapter.build_attention_mask(
-        model,
-        batch_size=args.batch_size,
-        ctx_size=args.ctx_size,
-        hidden_states=current_emb[: args.batch_size],
-    )
-
     layers = adapter.get_layers(model)
     for idx, layer in enumerate(layers):
         layer = layer.to(device)
+        attention_mask = adapter.build_attention_mask(
+            model,
+            batch_size=args.batch_size,
+            ctx_size=args.ctx_size,
+            hidden_states=current_emb[: args.batch_size],
+            layer=layer,
+        )
         next_emb = torch.zeros_like(current_emb)
         for start in range(0, len(current_emb), args.batch_size):
             end = min(start + args.batch_size, len(current_emb))
@@ -600,8 +971,9 @@ def quantize_model_generic(args: Any) -> None:
                 device,
                 current_emb.to(dtype_),
                 next_emb.to(dtype_),
+                adapter=adapter,
             )
-            save_layernorm_state(mixed_layer, save_path=args.save_path, idx=idx)
+            save_layernorm_state(mixed_layer, save_path=args.save_path, idx=idx, adapter=adapter)
 
         layer.cpu()
         current_emb = next_emb

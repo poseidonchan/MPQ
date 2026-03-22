@@ -53,17 +53,17 @@ def main() -> None:
     if not tasks:
         raise ValueError("no tasks specified")
 
+    import os
+    os.environ["HF_ALLOW_CODE_EVAL"] = "1"
+
+    from lm_eval.evaluator import simple_evaluate
+    from lm_eval.models.huggingface import HFLM
+
     if args.quip:
         model, tokenizer = _load_quip_model(args.model_path)
     else:
         model, tokenizer = _load_hf_model(args.model_path, device=args.device)
-
-    from lm_eval import simple_evaluate
-    from lm_eval.models.huggingface import HFLM
-
     lm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=args.batch_size)
-    import os
-    os.environ["HF_ALLOW_CODE_EVAL"] = "1"
     eval_results = simple_evaluate(
         model=lm, tasks=tasks, batch_size=args.batch_size, num_fewshot=args.num_fewshot,
         confirm_run_unsafe_code=True,
