@@ -211,6 +211,22 @@ index 02d1395..ebdfe30 100644
      valid_dl = DataLoader(valid_ds,
                            batch_size=args.ft_bs,
                            pin_memory=True,
+diff --git a/lib/utils/__init__.py b/lib/utils/__init__.py
+index 1801f6c..c2c8952 100644
+--- a/lib/utils/__init__.py
++++ b/lib/utils/__init__.py
+@@ -1,7 +1,10 @@
+ from .data_utils import *
+ from .finetune import *
+ from .graph_wrapper import *
+-from .lm_eval_adaptor import *
++try:
++    from .lm_eval_adaptor import *
++except (ImportError, ModuleNotFoundError):
++    pass
+ from .math_utils import *
+ from .matmul_had import *
+ from .matmul_kron import *
 diff --git a/lib/utils/gptq_data_utils.py b/lib/utils/gptq_data_utils.py
 index 3e5b5ef..063a353 100644
 --- a/lib/utils/gptq_data_utils.py

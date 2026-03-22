@@ -463,9 +463,12 @@ def run(args) -> Dict[str, Any]:
         str(float(args.scale_override)),
         "--sample_proc",
         str(int(args.sample_proc)),
-        "--model-arch",
-        str(getattr(args, "model_arch", "auto")),
     ]
+    if not use_legacy_llama_path:
+        quant_cmd += [
+            "--model-arch",
+            str(getattr(args, "model_arch", "auto")),
+        ]
     if solver_mode == "mpq":
         quant_cmd += [
             "--quant-backend",
