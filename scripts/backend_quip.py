@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from huggingface_hub import snapshot_download
 import torch
 
 
@@ -35,6 +36,24 @@ def _git_head(path: Path) -> str:
     if proc.returncode != 0:
         raise RuntimeError(proc.stdout)
     return proc.stdout.strip()
+
+
+def _resolve_model_path(model_ref: str) -> str:
+    """Resolve a HF model id to a local snapshot path with config.json.
+
+    This avoids accidental shadowing when a repo-relative directory exists with
+    the same name as the HF id (e.g. `Qwen/Qwen3-0.6B/` used for eval cache).
+    """
+
+    path = Path(model_ref)
+    if path.exists() and (path / "config.json").exists():
+        return str(path)
+    return str(
+        snapshot_download(
+            model_ref,
+            allow_patterns=["*.json", "*.safetensors", "tokenizer*", "merges.txt", "vocab.json", "*.model"],
+        )
+    )
 
 
 def _apply_patches() -> None:
@@ -397,6 +416,8 @@ def run(args) -> Dict[str, Any]:
     _apply_patches()
     combo, request_source = _resolve_quip_combo(args)
     solver_mode, native_tune_iters = _route_native_quip(combo)
+    base_model_ref = str(args.base_model)
+    args.base_model = _resolve_model_path(base_model_ref)
     runtime_arch = _resolve_quip_model_runtime(args)
     use_legacy_llama_path = bool(runtime_arch["use_legacy_llama_path"])
 
@@ -524,6 +545,7 @@ def run(args) -> Dict[str, Any]:
         ]
         quant_cmd.append("--mpq_em_obs_precision" if bool(args.mpq_em_obs_precision) else "--no-mpq_em_obs_precision")
         quant_cmd.append("--mpq_compile_prior" if bool(getattr(args, "mpq_compile_prior", True)) else "--no-mpq_compile_prior")
+        quant_cmd.append("--mpq_best_iterate" if bool(getattr(args, "mpq_best_iterate", False)) else "--no-mpq_best_iterate")
 
     t0 = time.time()
     rc = _run_logged(
@@ -571,6 +593,9 @@ def run(args) -> Dict[str, Any]:
             str(REPO_ROOT / "scripts" / "eval_hf_ppl.py"),
             "--hf_path",
             str(hf_dir),
+            *(["--quip"] if use_legacy_llama_path else []),
+            "--tokenizer-ref",
+            str(base_model_ref),
             "--seed",
             str(int(args.seed)),
             "--seqlen",
@@ -665,7 +690,8 @@ def run(args) -> Dict[str, Any]:
         },
         "bits": 2,
         "seed": int(args.seed),
-        "base_model": str(args.base_model),
+        "base_model": base_model_ref,
+        "base_model_resolved": str(args.base_model),
         "codebook_impl": str(args.codebook),
         "calibration": {
             "dataset": str(args.calibration_dataset),
@@ -802,6 +828,7 @@ def main() -> None:
     parser.add_argument("--mpq-polish-max-blocks", type=int, default=0)
     parser.add_argument("--mpq-metric-rows-per-chunk", type=int, default=0)
     parser.add_argument("--mpq-topk-k", type=int, default=16)
+    parser.add_argument("--mpq-best-iterate", dest="mpq_best_iterate", action=argparse.BooleanOptionalAction, default=False)
 
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--json-out", type=str, required=True)

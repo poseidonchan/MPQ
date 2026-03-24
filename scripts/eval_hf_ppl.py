@@ -52,15 +52,47 @@ def _load_tokenizer(model_ref: str):
 
 
 def _load_model(model_ref: str):
+    """Load a standard HuggingFace causal LM and fail fast if weights are missing."""
     try:
-        return AutoModelForCausalLM.from_pretrained(model_ref, torch_dtype="auto", low_cpu_mem_usage=True)
+        return _load_model_checked(model_ref, trust_remote_code=False)
     except Exception:
+        return _load_model_checked(model_ref, trust_remote_code=True)
+
+
+def _load_model_checked(model_ref: str, *, trust_remote_code: bool):
+    # `output_loading_info=True` helps prevent silent random init which produces
+    # meaningless PPL numbers (we want the run to fail instead).
+    try:
+        out = AutoModelForCausalLM.from_pretrained(
+            model_ref,
+            torch_dtype="auto",
+            low_cpu_mem_usage=True,
+            trust_remote_code=bool(trust_remote_code),
+            output_loading_info=True,
+        )
+    except TypeError:
+        # Older transformers: no loading info available.
         return AutoModelForCausalLM.from_pretrained(
             model_ref,
             torch_dtype="auto",
             low_cpu_mem_usage=True,
-            trust_remote_code=True,
+            trust_remote_code=bool(trust_remote_code),
         )
+
+    if isinstance(out, tuple) and len(out) == 2 and isinstance(out[1], dict):
+        model, loading_info = out
+    else:
+        model, loading_info = out, {}
+
+    missing = list(loading_info.get("missing_keys", []) or [])
+    mismatched = list(loading_info.get("mismatched_keys", []) or [])
+    errors = list(loading_info.get("error_msgs", []) or [])
+    if missing or mismatched or errors:
+        raise RuntimeError(
+            "from_pretrained did not load a complete checkpoint; refusing to eval.\n"
+            f"missing_keys={len(missing)} mismatched_keys={len(mismatched)} error_msgs={len(errors)}"
+        )
+    return model
 
 
 def _resolve_model_path(model_ref: str) -> str:
@@ -78,6 +110,17 @@ def _resolve_model_path(model_ref: str) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--hf_path", required=True, type=str)
+    parser.add_argument(
+        "--quip",
+        action="store_true",
+        help="Load QUIP# hfized checkpoints via third_party/quip-sharp model loader (legacy Llama path).",
+    )
+    parser.add_argument(
+        "--tokenizer-ref",
+        type=str,
+        default=None,
+        help="Optional HF repo/path to load the tokenizer from (recommended for QUIP# hfized Llama checkpoints).",
+    )
     parser.add_argument("--seed", default=0, type=int)
     parser.add_argument("--seqlen", default=2048, type=int)
     parser.add_argument("--datasets", nargs="*", default=["wikitext2", "c4"])
@@ -89,11 +132,30 @@ def main() -> None:
     torch.random.manual_seed(int(args.seed))
 
     model_path = _resolve_model_path(str(args.hf_path))
-    tokenizer = _load_tokenizer(model_path)
-    model = _load_model(model_path)
+    if bool(args.quip):
+        quip_root = str(REPO_ROOT / "third_party" / "quip-sharp")
+        if quip_root not in sys.path:
+            sys.path.insert(0, quip_root)
+        from lib.utils.unsafe_import import model_from_hf_path
+
+        device_map = "cuda:0" if torch.cuda.is_available() else None
+        model, model_ref = model_from_hf_path(
+            model_path,
+            use_cuda_graph=False,
+            use_flash_attn=False,
+            device_map=device_map,
+        )
+        tokenizer_source = str(args.tokenizer_ref) if args.tokenizer_ref else str(model_ref)
+        tokenizer = _load_tokenizer(tokenizer_source)
+    else:
+        tokenizer_source = str(args.tokenizer_ref) if args.tokenizer_ref else str(model_path)
+        tokenizer = _load_tokenizer(tokenizer_source)
+        model = _load_model(model_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model.eval().to("cuda:0" if torch.cuda.is_available() else "cpu")
+    model.eval()
+    if not bool(args.quip):
+        model.to("cuda:0" if torch.cuda.is_available() else "cpu")
 
     ppls = {}
     requested_max_eval_tokens = int(args.max_eval_tokens)
