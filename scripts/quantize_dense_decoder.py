@@ -85,6 +85,7 @@ def main() -> None:
     parser.add_argument("--mpq_metric_rows_per_chunk", default=0, type=int)
     parser.add_argument("--mpq-method", dest="mpq_method", default="vamp", type=str, choices=["vamp", "vamp-topk-polish"])
     parser.add_argument("--mpq-topk-k", dest="mpq_topk_k", default=16, type=int)
+    parser.add_argument("--mpq_best_iterate", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--model-arch", default="auto", type=str)
     args = parser.parse_args()
 

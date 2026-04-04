@@ -310,6 +310,7 @@ def _build_vamp_cfg(args: Any, *, polish_mode: str) -> E8P12VampConfig:
         polish_metric_rows_per_chunk=int(getattr(args, "mpq_metric_rows_per_chunk", 0)),
         polish_max_blocks=int(getattr(args, "mpq_polish_max_blocks", 0)),
         topk_k=int(getattr(args, "mpq_topk_k", getattr(args, "quant_topk_k", 16)) or 16),
+        best_iterate=bool(getattr(args, "mpq_best_iterate", False)),
     )
 
 

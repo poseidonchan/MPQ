@@ -76,6 +76,7 @@ class E8P12VampConfig:
     polish_metric_rows_per_chunk: int = 0
     polish_max_blocks: int = 0
     topk_k: int = 16
+    best_iterate: bool = False
 
 
 @torch.inference_mode()
@@ -92,7 +93,7 @@ def _global_quant_mse(W: torch.Tensor, x_quant: torch.Tensor) -> float:
 def _e8p12_block_debug_stats(
     *,
     r1: torch.Tensor,  # (B, n)
-    gamma1: torch.Tensor,  # (B, 1) or (B, n_blocks, 1|8)
+    gamma1: torch.Tensor,  # (B, 1)
     cb: object,
     blocks_per_chunk: int,
     prior_center_blocks: Optional[torch.Tensor],
@@ -117,7 +118,6 @@ def _e8p12_block_debug_stats(
         cb=cb,
         blocks_per_chunk=int(blocks_per_chunk),
         need_stats=False,
-        need_var_diag=False,
         prior_center_blocks=prior_center_blocks,
         prior_scale_blocks=prior_scale_blocks,
         prior_tau=float(prior_tau),
@@ -792,6 +792,41 @@ def solve_e8p12_rankspace_vamp(
     alpha_eps = 1e-7
     gamma_retry_factor = max(float(cfg.gamma_retry_factor), 1.000001)
     gamma_retry_steps = max(int(cfg.gamma_retry_steps), 0)
+    best_iterate_enabled = bool(getattr(cfg, "best_iterate", False))
+    best_iter_abs_tol = 1e-10
+    best_iter_rel_tol = 1e-8
+
+    best_hatWr: Optional[torch.Tensor] = None
+    best_Qidxs: Optional[torch.Tensor] = None
+    best_err: Optional[torch.Tensor] = None
+    best_err_mean = float("inf")
+    best_r1: Optional[torch.Tensor] = None
+    best_gamma1: Optional[torch.Tensor] = None
+    best_r2_prev: Optional[torch.Tensor] = None
+    best_gamma2_prev: Optional[torch.Tensor] = None
+    best_obs_precision = float(obs_precision_local)
+    best_iter_idx = -1
+    stop_iter_idx = -1
+
+    if best_iterate_enabled:
+        init_post = vamp_vector_map_e8p12(
+            r1_blocks=r1.reshape(B, nblocks, codesz),
+            gamma1=gamma1,
+            cb=cb,
+            blocks_per_chunk=blocks_per_chunk,
+            need_stats=False,
+            prior_center_blocks=W_blocks if prior_tau > 0.0 else None,
+            prior_scale_blocks=prior_scale_blocks,
+            prior_tau=prior_tau,
+            prior_tau_scale_mode=prior_tau_scale_mode,
+        )
+        best_hatWr = init_post["map_vals"].reshape_as(r1)
+        best_Qidxs = init_post["map_idxs"].to(dtype=getattr(cb, "idx_dtype", torch.int64))
+        best_err = vamp_rankspace_error(Y_u=Y_u, x=best_hatWr, Vs=Vs)
+        best_err_mean = float(best_err.mean().item()) if best_err.numel() else 0.0
+        best_r1 = r1.clone()
+        best_gamma1 = gamma1.clone()
+        best_obs_precision = float(obs_precision_local)
 
     for it in range(iters):
         gamma1_work = gamma1
@@ -806,7 +841,6 @@ def solve_e8p12_rankspace_vamp(
                 cb=cb,
                 blocks_per_chunk=blocks_per_chunk,
                 need_stats=bool(log_stats),
-                need_var_diag=False,
                 prior_center_blocks=W_blocks if prior_tau > 0.0 else None,
                 prior_scale_blocks=prior_scale_blocks,
                 prior_tau=prior_tau,
@@ -915,6 +949,46 @@ def solve_e8p12_rankspace_vamp(
                     "gap": float(gap),
                 }
             )
+
+        if best_iterate_enabled:
+            state_post = vamp_vector_map_e8p12(
+                r1_blocks=r1.reshape(B, nblocks, codesz),
+                gamma1=gamma1,
+                cb=cb,
+                blocks_per_chunk=blocks_per_chunk,
+                need_stats=False,
+                prior_center_blocks=W_blocks if prior_tau > 0.0 else None,
+                prior_scale_blocks=prior_scale_blocks,
+                prior_tau=prior_tau,
+                prior_tau_scale_mode=prior_tau_scale_mode,
+            )
+            state_hatWr = state_post["map_vals"].reshape_as(r1)
+            state_Qidxs = state_post["map_idxs"].to(dtype=getattr(cb, "idx_dtype", torch.int64))
+            state_err = vamp_rankspace_error(Y_u=Y_u, x=state_hatWr, Vs=Vs)
+            state_err_mean = float(state_err.mean().item()) if state_err.numel() else 0.0
+
+            improve_tol = max(best_iter_abs_tol, abs(best_err_mean) * best_iter_rel_tol)
+            if state_err_mean + improve_tol < best_err_mean:
+                best_hatWr = state_hatWr
+                best_Qidxs = state_Qidxs
+                best_err = state_err
+                best_err_mean = state_err_mean
+                best_r1 = r1.clone()
+                best_gamma1 = gamma1.clone()
+                best_r2_prev = None if r2_prev is None else r2_prev.clone()
+                best_gamma2_prev = None if gamma2_prev is None else gamma2_prev.clone()
+                best_obs_precision = float(obs_precision_local)
+                best_iter_idx = int(it)
+            else:
+                assert best_r1 is not None and best_gamma1 is not None
+                r1 = best_r1.clone()
+                gamma1 = best_gamma1.clone()
+                r2_prev = None if best_r2_prev is None else best_r2_prev.clone()
+                gamma2_prev = None if best_gamma2_prev is None else best_gamma2_prev.clone()
+                obs_precision_local = float(best_obs_precision)
+                stop_iter_idx = int(it)
+                reported_iters = int(it + 1)
+                break
 
     final_post = vamp_vector_map_e8p12(
         r1_blocks=r1.reshape(B, nblocks, codesz),
@@ -1027,6 +1101,10 @@ def solve_e8p12_rankspace_vamp(
         "topk_k": int(topk_k),
         "polish_gain": float(polish_gain),
         "polish_updates": float(polish_updates),
+        "best_iterate_enabled": bool(best_iterate_enabled),
+        "best_iter": int(best_iter_idx),
+        "stop_iter": int(stop_iter_idx),
+        "best_rankspace_error_mean": float(best_err_mean) if best_iterate_enabled else 0.0,
         "rankspace_error_mean": float(final_err.mean().item()) if final_err.numel() else 0.0,
     }
     return final_hatWr, final_Qidxs, final_err, stats

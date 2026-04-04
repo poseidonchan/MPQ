@@ -105,8 +105,6 @@ def get_e8p12_factor_cache(cb: object, *, device: Optional[torch.device] = None)
     base_parity = (base_sign_mask.sum(dim=-1) & 1).to(dtype=torch.long).contiguous()
     base_abs = base_template.abs().contiguous()
     base_sqnorm = base_abs.square().sum(dim=-1).contiguous()
-    base_abs_sq = base_abs.square().contiguous()
-
     full_idxs = torch.arange(grid.shape[0], device=target_device, dtype=torch.long)
     abs_idx = (full_idxs >> 8).contiguous()
     raw_sign = (full_idxs & 255).contiguous()
@@ -141,8 +139,6 @@ def get_e8p12_factor_cache(cb: object, *, device: Optional[torch.device] = None)
         "base_parity_even": (base_parity == 0).view(1, abs_count),
         "base_abs": base_abs,
         "base_abs_view": base_abs.view(1, abs_count, codesz),
-        "base_abs_sq": base_abs_sq,
-        "base_abs_sq_t": base_abs_sq.T.contiguous(),
         "base_sqnorm": base_sqnorm,
         "base_sqnorm_view": base_sqnorm.view(1, abs_count),
         "idx_lut": idx_lut,
@@ -155,10 +151,25 @@ def get_e8p12_factor_cache(cb: object, *, device: Optional[torch.device] = None)
     return cache
 
 
+@torch.inference_mode()
+def _expand_scalar_gamma_blocks(
+    gamma1: torch.Tensor,
+    *,
+    batch: int,
+    n_blocks: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if gamma1.ndim != 2 or int(gamma1.shape[-1]) != 1:
+        raise ValueError(f"expected scalar gamma1 with shape (B,1), got {tuple(gamma1.shape)}")
+    if int(gamma1.shape[0]) != int(batch):
+        raise ValueError(f"expected gamma1 batch={batch}, got {tuple(gamma1.shape)}")
+    return gamma1.to(dtype=torch.float32, device=device).unsqueeze(1).expand(batch, n_blocks, 1)
+
+
 def _branch_factorized_stats_impl(
     *,
     y_branch: torch.Tensor,  # (N, 8)
-    gamma_flat: torch.Tensor,  # (N, 1) or (N, 8)
+    gamma_flat: torch.Tensor,  # (N, 1)
     offset: float,
     branch_idx: int,
     cache: Dict[str, torch.Tensor],
@@ -167,7 +178,6 @@ def _branch_factorized_stats_impl(
 ) -> Dict[str, torch.Tensor]:
     base_abs = cache["base_abs"]
     base_abs_view = cache["base_abs_view"]
-    base_abs_sq_t = cache["base_abs_sq_t"]
     base_sqnorm_view = cache["base_sqnorm_view"]
     base_parity = cache["base_parity"]
     parity_mask = cache["base_parity_even"]
@@ -182,23 +192,13 @@ def _branch_factorized_stats_impl(
     device = y_branch.device
     dtype = y_branch.dtype
 
-    if gamma_flat.ndim != 2:
-        raise ValueError(f"expected gamma_flat with shape (N,1) or (N,8), got {tuple(gamma_flat.shape)}")
+    if gamma_flat.ndim != 2 or int(gamma_flat.shape[1]) != 1:
+        raise ValueError(f"expected gamma_flat with shape (N,1), got {tuple(gamma_flat.shape)}")
 
-    if gamma_flat.shape[1] == 1:
-        gamma_eff = gamma_flat.view(n_items, 1, 1)
-    else:
-        gamma_eff = gamma_flat.view(n_items, 1, codesz)
-
+    gamma_eff = gamma_flat.view(n_items, 1, 1)
     a = gamma_eff * y_branch.view(n_items, 1, codesz) * base_abs_view
-    if gamma_flat.shape[1] == 1:
-        y_norm = y_branch.square().sum(dim=-1, keepdim=True)
-        const = -0.5 * gamma_flat[:, :1] * (y_norm + base_sqnorm_view)
-    else:
-        gamma_vec = gamma_flat
-        y_norm = (gamma_vec * y_branch.square()).sum(dim=-1, keepdim=True)
-        base_norm = gamma_vec.matmul(base_abs_sq_t)
-        const = -0.5 * (y_norm + base_norm)
+    y_norm = y_branch.square().sum(dim=-1, keepdim=True)
+    const = -0.5 * gamma_flat[:, :1] * (y_norm + base_sqnorm_view)
 
     logC = torch.logaddexp(a, -a).sum(dim=-1)
     t = torch.tanh(a)
@@ -311,7 +311,7 @@ def _branch_factorized_stats_impl(
 def _branch_factorized_stats_compilable(
     *,
     y_branch: torch.Tensor,  # (N, 8)
-    gamma_flat: torch.Tensor,  # (N, 1) or (N, 8)
+    gamma_flat: torch.Tensor,  # (N, 1)
     offset: float,
     branch_idx: int,
     cache: Dict[str, torch.Tensor],
@@ -332,7 +332,7 @@ def _branch_factorized_stats_compilable(
 def _branch_factorized_stats(
     *,
     y_branch: torch.Tensor,  # (N, 8)
-    gamma_flat: torch.Tensor,  # (N, 1) or (N, 8)
+    gamma_flat: torch.Tensor,  # (N, 1)
     offset: float,
     branch_idx: int,
     cache: Dict[str, torch.Tensor],
@@ -368,14 +368,13 @@ def _branch_factorized_stats(
 def _branch_factorized_map(
     *,
     y_branch: torch.Tensor,  # (N, 8)
-    gamma_flat: torch.Tensor,  # (N, 1) or (N, 8)
+    gamma_flat: torch.Tensor,  # (N, 1)
     branch_idx: int,
     cache: Dict[str, torch.Tensor],
     need_stats: bool,
 ) -> Dict[str, torch.Tensor]:
     base_abs = cache["base_abs"]
     base_abs_view = cache["base_abs_view"]
-    base_abs_sq_t = cache["base_abs_sq_t"]
     base_sqnorm_view = cache["base_sqnorm_view"]
     base_parity = cache["base_parity"]
     bit_values = cache["bit_values"]
@@ -389,23 +388,13 @@ def _branch_factorized_map(
     device = y_branch.device
     dtype = y_branch.dtype
 
-    if gamma_flat.ndim != 2:
-        raise ValueError(f"expected gamma_flat with shape (N,1) or (N,8), got {tuple(gamma_flat.shape)}")
+    if gamma_flat.ndim != 2 or int(gamma_flat.shape[1]) != 1:
+        raise ValueError(f"expected gamma_flat with shape (N,1), got {tuple(gamma_flat.shape)}")
 
-    if gamma_flat.shape[1] == 1:
-        gamma_eff = gamma_flat.view(n_items, 1, 1)
-    else:
-        gamma_eff = gamma_flat.view(n_items, 1, codesz)
-
+    gamma_eff = gamma_flat.view(n_items, 1, 1)
     a = gamma_eff * y_branch.view(n_items, 1, codesz) * base_abs_view
-    if gamma_flat.shape[1] == 1:
-        y_norm = y_branch.square().sum(dim=-1, keepdim=True)
-        const = -0.5 * gamma_flat[:, :1] * (y_norm + base_sqnorm_view)
-    else:
-        gamma_vec = gamma_flat
-        y_norm = (gamma_vec * y_branch.square()).sum(dim=-1, keepdim=True)
-        base_norm = gamma_vec.matmul(base_abs_sq_t)
-        const = -0.5 * (y_norm + base_norm)
+    y_norm = y_branch.square().sum(dim=-1, keepdim=True)
+    const = -0.5 * gamma_flat[:, :1] * (y_norm + base_sqnorm_view)
 
     abs_a = a.abs()
     sum_abs = abs_a.sum(dim=-1)
@@ -464,7 +453,7 @@ def _branch_factorized_map(
 def vamp_vector_map_topk_e8p12(
     *,
     r1_blocks: torch.Tensor,  # (B, n_blocks, 8)
-    gamma1: torch.Tensor,  # (B, 1) or (B, n_blocks, 1) or (B, n_blocks, 8)
+    gamma1: torch.Tensor,  # (B, 1)
     cb: object,
     k: int,
     blocks_per_chunk: int = 64,
@@ -485,8 +474,9 @@ def vamp_vector_map_topk_e8p12(
     if k <= 0:
         raise ValueError(f"expected k>0, got k={k}")
 
+    gamma_base = _expand_scalar_gamma_blocks(gamma1, batch=batch, n_blocks=n_blocks, device=r1_blocks.device)
     r1_work = r1_blocks
-    gamma_blocks = None
+    gamma_work = gamma_base
     if float(prior_tau) > 0.0 and prior_center_blocks is not None:
         scale_blocks = prior_scale_blocks
         if scale_blocks is None:
@@ -495,19 +485,11 @@ def vamp_vector_map_topk_e8p12(
         scale_blocks = scale_blocks.to(dtype=torch.float32, device=r1_blocks.device).clamp_min_(1e-12)
         tau2 = (max(float(prior_tau), 1e-12) * scale_blocks).square()
         prior_prec = 1.0 / tau2
-        if gamma1.ndim == 2:
-            gamma_base = gamma1.unsqueeze(1).expand(batch, n_blocks, 1).to(dtype=torch.float32)
-        elif gamma1.ndim == 3:
-            gamma_base = gamma1.to(dtype=torch.float32)
-            if gamma_base.shape[-1] not in (1, codesz):
-                raise ValueError(f"expected gamma1 last dim in {{1,{codesz}}}, got {tuple(gamma1.shape)}")
-        else:
-            raise ValueError(f"expected gamma1 with ndim in {{2,3}}, got {tuple(gamma1.shape)}")
-        gamma_blocks = gamma_base + prior_prec
+        gamma_work = gamma_base + prior_prec
         r1_work = (
             gamma_base * r1_blocks.to(dtype=torch.float32)
             + prior_prec * prior_center_blocks.to(dtype=torch.float32)
-        ) / gamma_blocks
+        ) / gamma_work
         r1_work = r1_work.to(dtype=r1_blocks.dtype)
 
     blocks_per_chunk = resolve_factorized_blocks_per_chunk(batch, n_blocks, blocks_per_chunk, r1_blocks.device)
@@ -526,23 +508,7 @@ def vamp_vector_map_topk_e8p12(
         chunk_size = bend - bstart
         r1_chunk = r1_work[:, bstart:bend, :]
         r1_flat = r1_chunk.reshape(batch * chunk_size, codesz).to(dtype=torch.float32)
-
-        if gamma_blocks is None:
-            if gamma1.ndim == 2:
-                gamma_flat = (
-                    gamma1.unsqueeze(1)
-                    .expand(batch, chunk_size, 1)
-                    .reshape(batch * chunk_size, 1)
-                    .to(dtype=torch.float32)
-                )
-            else:
-                gamma_src = gamma1[:, bstart:bend, :]
-                if gamma_src.shape[-1] not in (1, codesz):
-                    raise ValueError(f"expected gamma1 last dim in {{1,{codesz}}}, got {tuple(gamma1.shape)}")
-                gamma_flat = gamma_src.reshape(batch * chunk_size, gamma_src.shape[-1]).to(dtype=torch.float32)
-        else:
-            gamma_src = gamma_blocks[:, bstart:bend, :]
-            gamma_flat = gamma_src.reshape(batch * chunk_size, gamma_src.shape[-1]).to(dtype=torch.float32)
+        gamma_flat = gamma_work[:, bstart:bend, :].reshape(batch * chunk_size, 1).to(dtype=torch.float32)
 
         branch_outputs = []
         for branch_idx, offset in enumerate(branch_offsets.tolist()):
@@ -576,7 +542,7 @@ def vamp_vector_map_topk_e8p12(
 def vamp_vector_map_e8p12(
     *,
     r1_blocks: torch.Tensor,  # (B, n_blocks, 8)
-    gamma1: torch.Tensor,  # (B, 1) or (B, n_blocks, 1) or (B, n_blocks, 8)
+    gamma1: torch.Tensor,  # (B, 1)
     cb: object,
     blocks_per_chunk: int = 64,
     need_stats: bool = False,
@@ -589,8 +555,9 @@ def vamp_vector_map_e8p12(
     if int(codesz) != 8:
         raise ValueError(f"E8P12 MAP expects codesz=8, got {codesz}.")
 
+    gamma_base = _expand_scalar_gamma_blocks(gamma1, batch=batch, n_blocks=n_blocks, device=r1_blocks.device)
     r1_work = r1_blocks
-    gamma_blocks = None
+    gamma_work = gamma_base
     if float(prior_tau) > 0.0 and prior_center_blocks is not None:
         scale_blocks = prior_scale_blocks
         if scale_blocks is None:
@@ -599,19 +566,11 @@ def vamp_vector_map_e8p12(
         scale_blocks = scale_blocks.to(dtype=torch.float32, device=r1_blocks.device).clamp_min_(1e-12)
         tau2 = (max(float(prior_tau), 1e-12) * scale_blocks).square()
         prior_prec = 1.0 / tau2
-        if gamma1.ndim == 2:
-            gamma_base = gamma1.unsqueeze(1).expand(batch, n_blocks, 1).to(dtype=torch.float32)
-        elif gamma1.ndim == 3:
-            gamma_base = gamma1.to(dtype=torch.float32)
-            if gamma_base.shape[-1] not in (1, codesz):
-                raise ValueError(f"expected gamma1 last dim in {{1,{codesz}}}, got {tuple(gamma1.shape)}")
-        else:
-            raise ValueError(f"expected gamma1 with ndim in {{2,3}}, got {tuple(gamma1.shape)}")
-        gamma_blocks = gamma_base + prior_prec
+        gamma_work = gamma_base + prior_prec
         r1_work = (
             gamma_base * r1_blocks.to(dtype=torch.float32)
             + prior_prec * prior_center_blocks.to(dtype=torch.float32)
-        ) / gamma_blocks
+        ) / gamma_work
         r1_work = r1_work.to(dtype=r1_blocks.dtype)
 
     blocks_per_chunk = resolve_factorized_blocks_per_chunk(batch, n_blocks, blocks_per_chunk, r1_blocks.device)
@@ -627,23 +586,7 @@ def vamp_vector_map_e8p12(
         chunk_size = bend - bstart
         r1_chunk = r1_work[:, bstart:bend, :]
         r1_flat = r1_chunk.reshape(batch * chunk_size, codesz).to(dtype=torch.float32)
-
-        if gamma_blocks is None:
-            if gamma1.ndim == 2:
-                gamma_flat = (
-                    gamma1.unsqueeze(1)
-                    .expand(batch, chunk_size, 1)
-                    .reshape(batch * chunk_size, 1)
-                    .to(dtype=torch.float32)
-                )
-            else:
-                gamma_src = gamma1[:, bstart:bend, :]
-                if gamma_src.shape[-1] not in (1, codesz):
-                    raise ValueError(f"expected gamma1 last dim in {{1,{codesz}}}, got {tuple(gamma1.shape)}")
-                gamma_flat = gamma_src.reshape(batch * chunk_size, gamma_src.shape[-1]).to(dtype=torch.float32)
-        else:
-            gamma_src = gamma_blocks[:, bstart:bend, :]
-            gamma_flat = gamma_src.reshape(batch * chunk_size, gamma_src.shape[-1]).to(dtype=torch.float32)
+        gamma_flat = gamma_work[:, bstart:bend, :].reshape(batch * chunk_size, 1).to(dtype=torch.float32)
 
         branch_outputs = []
         for branch_idx, offset in enumerate(branch_offsets.tolist()):
@@ -856,7 +799,6 @@ def gram_metric_denoiser_blocks(
     out: Dict[str, torch.Tensor | float] = {
         "x1_blocks": x1_blocks,
         "var1": var1,
-        "var1_diag": None,
         "map_idxs": map_idxs,
         "map_vals": map_vals,
         "alpha1": alpha1,
@@ -874,11 +816,10 @@ def gram_metric_denoiser_blocks(
 def vamp_vector_discrete_mmse_e8p12(
     *,
     r1_blocks: torch.Tensor,  # (B, n_blocks, 8)
-    gamma1: torch.Tensor,  # (B, 1) or (B, n_blocks, 1) or (B, n_blocks, 8)
+    gamma1: torch.Tensor,  # (B, 1)
     cb: object,
     blocks_per_chunk: int = 64,
     need_stats: bool = False,
-    need_var_diag: bool = False,
     prior_center_blocks: Optional[torch.Tensor] = None,
     prior_scale_blocks: Optional[torch.Tensor] = None,
     prior_tau: float = 0.0,
@@ -897,8 +838,9 @@ def vamp_vector_discrete_mmse_e8p12(
     if int(codesz) != 8:
         raise ValueError(f"E8P12 posterior expects codesz=8, got {codesz}.")
 
+    gamma_base = _expand_scalar_gamma_blocks(gamma1, batch=batch, n_blocks=n_blocks, device=r1_blocks.device)
     r1_work = r1_blocks
-    gamma_blocks = None
+    gamma_work = gamma_base
     if float(prior_tau) > 0.0 and prior_center_blocks is not None:
         scale_blocks = prior_scale_blocks
         if scale_blocks is None:
@@ -907,34 +849,20 @@ def vamp_vector_discrete_mmse_e8p12(
         scale_blocks = scale_blocks.to(dtype=torch.float32, device=r1_blocks.device).clamp_min_(1e-12)
         tau2 = (max(float(prior_tau), 1e-12) * scale_blocks).square()
         prior_prec = 1.0 / tau2
-        if gamma1.ndim == 2:
-            gamma_base = gamma1.unsqueeze(1).expand(batch, n_blocks, 1).to(dtype=torch.float32)
-        elif gamma1.ndim == 3:
-            gamma_base = gamma1.to(dtype=torch.float32)
-            if gamma_base.shape[-1] not in (1, codesz):
-                raise ValueError(f"expected gamma1 last dim in {{1,{codesz}}}, got {tuple(gamma1.shape)}")
-        else:
-            raise ValueError(f"expected gamma1 with ndim in {{2,3}}, got {tuple(gamma1.shape)}")
-        gamma_blocks = gamma_base + prior_prec
+        gamma_work = gamma_base + prior_prec
         r1_work = (
             gamma_base * r1_blocks.to(dtype=torch.float32)
             + prior_prec * prior_center_blocks.to(dtype=torch.float32)
-        ) / gamma_blocks
+        ) / gamma_work
         r1_work = r1_work.to(dtype=r1_blocks.dtype)
 
     blocks_per_chunk = resolve_factorized_blocks_per_chunk(batch, n_blocks, blocks_per_chunk, r1_blocks.device)
     cache = get_e8p12_factor_cache(cb, device=r1_blocks.device)
     branch_offsets = cache["branch_offsets"]
-    base_abs_sq = cache["base_abs_sq"]
     use_compiled_prior = bool(compile_prior) and r1_blocks.is_cuda
 
     x1_blocks = torch.empty_like(r1_blocks)
     var1 = torch.empty(batch, n_blocks, dtype=torch.float32, device=r1_blocks.device)
-    var1_diag = (
-        torch.empty(batch, n_blocks, codesz, dtype=torch.float32, device=r1_blocks.device)
-        if bool(need_var_diag)
-        else None
-    )
     map_idxs = torch.empty(batch, n_blocks, dtype=torch.long, device=r1_blocks.device)
     map_vals = torch.empty_like(r1_blocks)
     entropy_values = []
@@ -950,23 +878,7 @@ def vamp_vector_discrete_mmse_e8p12(
         chunk_size = bend - bstart
         r1_chunk = r1_work[:, bstart:bend, :]
         r1_flat = r1_chunk.reshape(batch * chunk_size, codesz).to(dtype=torch.float32)
-
-        if gamma_blocks is None:
-            if gamma1.ndim == 2:
-                gamma_flat = (
-                    gamma1.unsqueeze(1)
-                    .expand(batch, chunk_size, 1)
-                    .reshape(batch * chunk_size, 1)
-                    .to(dtype=torch.float32)
-                )
-            else:
-                gamma_src = gamma1[:, bstart:bend, :]
-                if gamma_src.shape[-1] not in (1, codesz):
-                    raise ValueError(f"expected gamma1 last dim in {{1,{codesz}}}, got {tuple(gamma1.shape)}")
-                gamma_flat = gamma_src.reshape(batch * chunk_size, gamma_src.shape[-1]).to(dtype=torch.float32)
-        else:
-            gamma_src = gamma_blocks[:, bstart:bend, :]
-            gamma_flat = gamma_src.reshape(batch * chunk_size, gamma_src.shape[-1]).to(dtype=torch.float32)
+        gamma_flat = gamma_work[:, bstart:bend, :].reshape(batch * chunk_size, 1).to(dtype=torch.float32)
 
         branch_outputs = []
         for branch_idx, offset in enumerate(branch_offsets.tolist()):
@@ -992,28 +904,12 @@ def vamp_vector_discrete_mmse_e8p12(
 
         mu = torch.zeros((batch * chunk_size, codesz), dtype=torch.float32, device=r1_blocks.device)
         second_moment = torch.zeros((batch * chunk_size,), dtype=torch.float32, device=r1_blocks.device)
-        var_diag = None
-
-        if bool(need_var_diag):
-            second_moment_diag = torch.zeros((batch * chunk_size, codesz), dtype=torch.float32, device=r1_blocks.device)
-            for branch_idx, offset in enumerate(branch_offsets.tolist()):
-                w_branch = weights[:, branch_idx, :]
-                mu_comp = branch_outputs[branch_idx]["mu_component"]
-                mu_branch = (w_branch.unsqueeze(-1) * mu_comp).sum(dim=1)
-                mu += mu_branch
-                second_moment += (w_branch * branch_outputs[branch_idx]["second_component"]).sum(dim=1)
-                base_abs_sq_weighted = w_branch.matmul(base_abs_sq)
-                w_sum = w_branch.sum(dim=1, keepdim=True)
-                second_moment_diag += base_abs_sq_weighted - float(offset) ** 2 * w_sum + 2.0 * float(offset) * mu_branch
-            var_diag = (second_moment_diag - mu.square()).clamp_min_(0.0)
-            block_var = var_diag.mean(dim=-1)
-        else:
-            for branch_idx, _offset in enumerate(branch_offsets.tolist()):
-                w_branch = weights[:, branch_idx, :]
-                mu_comp = branch_outputs[branch_idx]["mu_component"]
-                mu += (w_branch.unsqueeze(-1) * mu_comp).sum(dim=1)
-                second_moment += (w_branch * branch_outputs[branch_idx]["second_component"]).sum(dim=1)
-            block_var = ((second_moment - mu.square().sum(dim=-1)) / float(codesz)).clamp_min_(0.0)
+        for branch_idx, _offset in enumerate(branch_offsets.tolist()):
+            w_branch = weights[:, branch_idx, :]
+            mu_comp = branch_outputs[branch_idx]["mu_component"]
+            mu += (w_branch.unsqueeze(-1) * mu_comp).sum(dim=1)
+            second_moment += (w_branch * branch_outputs[branch_idx]["second_component"]).sum(dim=1)
+        block_var = ((second_moment - mu.square().sum(dim=-1)) / float(codesz)).clamp_min_(0.0)
 
         best_logscore = torch.stack([out["best_logscore"] for out in branch_outputs], dim=1)
         best_flat = best_logscore.reshape(batch * chunk_size, -1)
@@ -1024,21 +920,14 @@ def vamp_vector_discrete_mmse_e8p12(
         map_idx = map_idx_per_branch[torch.arange(batch * chunk_size, device=r1_blocks.device), best_branch, best_abs]
         map_val_flat = cb.grid.index_select(0, map_idx).to(dtype=torch.float32)
 
-        if gamma_flat.shape[1] == 1:
-            high_gamma_mask = gamma_flat.squeeze(-1) >= high_gamma_snap
-        else:
-            high_gamma_mask = gamma_flat.min(dim=-1).values >= high_gamma_snap
+        high_gamma_mask = gamma_flat.squeeze(-1) >= high_gamma_snap
         if bool(high_gamma_mask.any().item()):
             mu[high_gamma_mask] = map_val_flat[high_gamma_mask]
             block_var[high_gamma_mask] = 0.0
-            if var_diag is not None:
-                var_diag[high_gamma_mask] = 0.0
 
         map_val = map_val_flat.view(batch, chunk_size, codesz).to(dtype=r1_blocks.dtype)
         x1_blocks[:, bstart:bend, :] = mu.view(batch, chunk_size, codesz).to(dtype=r1_blocks.dtype)
         var1[:, bstart:bend] = block_var.view(batch, chunk_size)
-        if var1_diag is not None and var_diag is not None:
-            var1_diag[:, bstart:bend, :] = var_diag.view(batch, chunk_size, codesz)
         map_idxs[:, bstart:bend] = map_idx.view(batch, chunk_size)
         map_vals[:, bstart:bend, :] = map_val
 
@@ -1063,20 +952,11 @@ def vamp_vector_discrete_mmse_e8p12(
                 margin_blocks[:, bstart:bend] = margin_flat.view(batch, chunk_size)
             margin_values.append(float(margin_flat.mean().item()))
 
-    if gamma1.ndim == 2:
-        alpha1 = gamma1.to(dtype=torch.float32) * var1.mean(dim=1, keepdim=True)
-    else:
-        if gamma1.shape[-1] == 1:
-            alpha1 = (gamma1.squeeze(-1).to(dtype=torch.float32) * var1).mean(dim=1, keepdim=True)
-        elif var1_diag is not None:
-            alpha1 = (gamma1.to(dtype=torch.float32) * var1_diag).mean(dim=(1, 2)).unsqueeze(-1)
-        else:
-            alpha1 = (gamma1.to(dtype=torch.float32).mean(dim=-1) * var1).mean(dim=1, keepdim=True)
+    alpha1 = gamma1.to(dtype=torch.float32) * var1.mean(dim=1, keepdim=True)
 
     return {
         "x1_blocks": x1_blocks,
         "var1": var1,
-        "var1_diag": var1_diag,
         "map_idxs": map_idxs,
         "map_vals": map_vals,
         "alpha1": alpha1,
