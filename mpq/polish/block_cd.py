@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Dict, Optional, Protocol, Tuple
 
@@ -47,6 +48,15 @@ _COMPILED_TOPK_METRIC_SELECT = None
 _COMPILED_TOPK_METRIC_SELECT_FAILED = False
 
 
+def _warn_compile_fallback(name: str, exc: Exception) -> None:
+    warnings.warn(
+        f"block_cd: disabling torch.compile path for {name} after runtime failure; "
+        f"falling back to eager execution ({exc.__class__.__name__}: {exc})",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
+
 def _get_cd_accept_step(*, device: torch.device):
     global _COMPILED_CD_ACCEPT, _COMPILED_CD_ACCEPT_FAILED
     if device.type != "cuda" or not hasattr(torch, "compile"):
@@ -63,7 +73,21 @@ def _get_cd_accept_step(*, device: torch.device):
         except Exception:
             _COMPILED_CD_ACCEPT_FAILED = True
             return _cd_accept_step_impl
-    return _COMPILED_CD_ACCEPT
+
+    def _compiled_or_eager(*args, **kwargs):
+        global _COMPILED_CD_ACCEPT, _COMPILED_CD_ACCEPT_FAILED
+        fn = _COMPILED_CD_ACCEPT
+        if fn is None or _COMPILED_CD_ACCEPT_FAILED:
+            return _cd_accept_step_impl(*args, **kwargs)
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            _warn_compile_fallback("accept_step", exc)
+            _COMPILED_CD_ACCEPT = None
+            _COMPILED_CD_ACCEPT_FAILED = True
+            return _cd_accept_step_impl(*args, **kwargs)
+
+    return _compiled_or_eager
 
 
 def _topk_metric_select_impl(
@@ -93,7 +117,21 @@ def _get_topk_metric_select(*, device: torch.device):
         except Exception:
             _COMPILED_TOPK_METRIC_SELECT_FAILED = True
             return _topk_metric_select_impl
-    return _COMPILED_TOPK_METRIC_SELECT
+
+    def _compiled_or_eager(*args, **kwargs):
+        global _COMPILED_TOPK_METRIC_SELECT, _COMPILED_TOPK_METRIC_SELECT_FAILED
+        fn = _COMPILED_TOPK_METRIC_SELECT
+        if fn is None or _COMPILED_TOPK_METRIC_SELECT_FAILED:
+            return _topk_metric_select_impl(*args, **kwargs)
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            _warn_compile_fallback("topk_metric_select", exc)
+            _COMPILED_TOPK_METRIC_SELECT = None
+            _COMPILED_TOPK_METRIC_SELECT_FAILED = True
+            return _topk_metric_select_impl(*args, **kwargs)
+
+    return _compiled_or_eager
 
 
 def _topk_gram_step_impl(
@@ -154,7 +192,21 @@ def _get_topk_gram_step(*, device: torch.device):
         except Exception:
             _COMPILED_TOPK_GRAM_STEP_FAILED = True
             return _topk_gram_step_impl
-    return _COMPILED_TOPK_GRAM_STEP
+
+    def _compiled_or_eager(*args, **kwargs):
+        global _COMPILED_TOPK_GRAM_STEP, _COMPILED_TOPK_GRAM_STEP_FAILED
+        fn = _COMPILED_TOPK_GRAM_STEP
+        if fn is None or _COMPILED_TOPK_GRAM_STEP_FAILED:
+            return _topk_gram_step_impl(*args, **kwargs)
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            _warn_compile_fallback("topk_gram_step", exc)
+            _COMPILED_TOPK_GRAM_STEP = None
+            _COMPILED_TOPK_GRAM_STEP_FAILED = True
+            return _topk_gram_step_impl(*args, **kwargs)
+
+    return _compiled_or_eager
 
 
 def _cd_gram_step_impl(
@@ -214,7 +266,21 @@ def _get_cd_gram_step(*, device: torch.device):
         except Exception:
             _COMPILED_CD_GRAM_STEP_FAILED = True
             return _cd_gram_step_impl
-    return _COMPILED_CD_GRAM_STEP
+
+    def _compiled_or_eager(*args, **kwargs):
+        global _COMPILED_CD_GRAM_STEP, _COMPILED_CD_GRAM_STEP_FAILED
+        fn = _COMPILED_CD_GRAM_STEP
+        if fn is None or _COMPILED_CD_GRAM_STEP_FAILED:
+            return _cd_gram_step_impl(*args, **kwargs)
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            _warn_compile_fallback("cd_gram_step", exc)
+            _COMPILED_CD_GRAM_STEP = None
+            _COMPILED_CD_GRAM_STEP_FAILED = True
+            return _cd_gram_step_impl(*args, **kwargs)
+
+    return _compiled_or_eager
 
 
 @torch.inference_mode()
