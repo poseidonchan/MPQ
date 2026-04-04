@@ -262,15 +262,23 @@ index 3e5b5ef..063a353 100644
          inp = trainenc.input_ids[:, i:j]
          tar = inp.clone()
 diff --git a/lib/utils/matmul_had.py b/lib/utils/matmul_had.py
-index 9915d0f..56125e1 100644
+index 9915d0f..4697873 100644
 --- a/lib/utils/matmul_had.py
 +++ b/lib/utils/matmul_had.py
-@@ -1,8 +1,12 @@
+@@ -1,8 +1,20 @@
 -import fast_hadamard_transform
++import os
++import sys
++
  import torch
  
  from lib import utils
  
++REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..")
++if REPO_ROOT not in sys.path:
++    sys.path.insert(0, REPO_ROOT)
++from mpq.rotation import get_had76
++
 +try:
 +    import fast_hadamard_transform
 +except (ImportError, OSError):  # optional; torch fallback supported
@@ -279,7 +287,17 @@ index 9915d0f..56125e1 100644
  
  def get_hadK(n, transpose=False):
      hadK, K = None, None
-@@ -95,7 +99,62 @@ def hadamard_abstract(x: torch.Tensor, scale: float) -> torch.Tensor:
+@@ -30,6 +42,9 @@ def get_hadK(n, transpose=False):
+         assert (is_pow2(n // 108))
+         K = 108
+         hadK = get_had108().T if transpose else get_had108()
++    elif n % 76 == 0 and is_pow2(n // 76):  # qwen3-4b intermediate / fused up
++        K = 76
++        hadK = get_had76().T if transpose else get_had76()
+     elif n % 60 == 0:  # llama-1-13b 3x hidden
+         assert (is_pow2(n // 60))
+         K = 60
+@@ -95,7 +110,62 @@ def hadamard_abstract(x: torch.Tensor, scale: float) -> torch.Tensor:
  
  @torch.library.impl("quip_lib::hadamard", "default")
  def hadamard(x: torch.Tensor, scale: float) -> torch.Tensor:

@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
+import functools
 import math
 import logging
 
@@ -45,6 +46,35 @@ def resolve_block_hadamard_plan(width: int) -> tuple[str, int]:
         return "block", int(had_dim)
     return "none", 1
 
+
+@functools.lru_cache(maxsize=1)
+def _build_had76() -> torch.Tensor:
+    """Construct a deterministic order-76 Hadamard matrix via Paley type II (q=37)."""
+    q = 37
+    residues = sorted({(x * x) % q for x in range(1, q)})
+    legendre = torch.full((q,), -1.0, dtype=torch.float32)
+    legendre[0] = 0.0
+    legendre[torch.tensor(residues, dtype=torch.long)] = 1.0
+
+    field = torch.arange(q, dtype=torch.long)
+    diff = (field[:, None] - field[None, :]) % q
+    conference = torch.empty((q + 1, q + 1), dtype=torch.float32)
+    conference[0, 0] = 0.0
+    conference[0, 1:] = 1.0
+    conference[1:, 0] = 1.0
+    conference[1:, 1:] = legendre[diff]
+
+    eye = torch.eye(q + 1, dtype=torch.float32)
+    top = torch.cat((conference + eye, conference - eye), dim=1)
+    bottom = torch.cat((conference - eye, -(conference + eye)), dim=1)
+    return torch.cat((top, bottom), dim=0).contiguous()
+
+
+def get_had76() -> torch.Tensor:
+    # Qwen3-4B FFN widths 9728 and 19456 require exact had76 support.
+    return _build_had76().clone()
+
+
 def get_hadK(n, transpose=False):
     hadK, K = None, None
     if n % 172 == 0:  # llama-2-7b up
@@ -63,6 +93,10 @@ def get_hadK(n, transpose=False):
         assert is_pow2(n // 108)
         K = 108
         hadK = get_had108().T if transpose else get_had108()
+    elif n % 76 == 0:  # qwen3-4b intermediate / fused up
+        assert is_pow2(n // 76)
+        K = 76
+        hadK = get_had76().T if transpose else get_had76()
     elif n % 60 == 0:  # llama-1-13b 3x hidden
         assert is_pow2(n // 60)
         K = 60
