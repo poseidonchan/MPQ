@@ -28,6 +28,51 @@ def _conda_run_prefix(env_name: str) -> List[str]:
     return ["conda", "run", "-n", str(env_name)]
 
 
+def _infer_conda_env_bin(env_name: str) -> Optional[Path]:
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if not conda_prefix:
+        return None
+    prefix = Path(conda_prefix).resolve()
+    root = prefix.parent.parent if prefix.parent.name == "envs" else prefix.parent
+    env_bin = root / "envs" / str(env_name) / "bin"
+    return env_bin if env_bin.is_dir() else None
+
+
+def _gptq_run_prefix(env_name: str) -> List[str]:
+    prefix = _conda_run_prefix(env_name)
+    env_items: List[str] = []
+    env_bin = _infer_conda_env_bin(env_name)
+
+    compiler_defaults = {
+        "CC": "x86_64-conda-linux-gnu-cc",
+        "CXX": "x86_64-conda-linux-gnu-c++",
+        "CUDAHOSTCXX": "x86_64-conda-linux-gnu-c++",
+    }
+    for key, binary in compiler_defaults.items():
+        value = None
+        if env_bin is not None:
+            candidate = env_bin / binary
+            if candidate.exists():
+                value = str(candidate)
+        if not value:
+            value = os.environ.get(key)
+        if value:
+            env_items.append(f"{key}={value}")
+
+    runtime_defaults = {
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "TORCHDYNAMO_DISABLE": "1",
+    }
+    for key, default in runtime_defaults.items():
+        value = os.environ.get(key, default)
+        if value:
+            env_items.append(f"{key}={value}")
+
+    if env_items:
+        return [*prefix, "env", *env_items]
+    return prefix
+
+
 def _tail_text(path: Path, *, max_bytes: int = 16384) -> str:
     try:
         with path.open("rb") as fh:
@@ -458,7 +503,7 @@ def _combo_quip_cmd(combo: QuantCombo, *, seed: int, seed_dir: Path, method_dir:
 
 def _legacy_gptq_cmd(method: str, *, seed: int, method_dir: Path, json_out: Path, bits: int, args) -> List[str]:
     return [
-        *_conda_run_prefix(str(args.gptq_env)),
+        *_gptq_run_prefix(str(args.gptq_env)),
         "python",
         str(REPO_ROOT / "scripts" / "backend_gptq.py"),
         "--method",
@@ -530,7 +575,7 @@ def _legacy_gptq_cmd(method: str, *, seed: int, method_dir: Path, json_out: Path
 
 def _combo_gptq_cmd(combo: QuantCombo, *, seed: int, method_dir: Path, json_out: Path, bits: int, args) -> List[str]:
     return [
-        *_conda_run_prefix(str(args.gptq_env)),
+        *_gptq_run_prefix(str(args.gptq_env)),
         "python",
         str(REPO_ROOT / "scripts" / "backend_gptq.py"),
         "--quant-backend",
