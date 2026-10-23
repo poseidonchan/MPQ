@@ -59,7 +59,7 @@ conda run -n "${ENV_NAME}" python -m pip install --no-cache-dir "lm_eval>=0.4.7"
 conda run -n "${ENV_NAME}" python -m pip install --no-cache-dir -U "transformers>=4.45,<5" "huggingface_hub>=0.34"
 
 # Build fast_hadamard_transform from source against the already-installed torch.
-# We pin and patch the upstream repo as a submodule for reproducibility.
+# We pin and patch the upstream checkout for reproducibility.
 conda_run_cuda_build "FAST_HADAMARD_TRANSFORM_FORCE_BUILD=TRUE python -m pip install --no-cache-dir --no-build-isolation -v third_party/fast-hadamard-transform"
 
 # Build quiptools_cuda; force a PTX-only arch to avoid requiring a brand-new nvcc.

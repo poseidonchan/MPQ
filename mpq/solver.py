@@ -15,6 +15,7 @@ from .polish.block_cd import (
     UniformTopKProvider,
     block_coordinate_descent_rankspace,
 )
+from .polish.triton_scalar_cd import has_triton_scalar_cd, uniform_scalar_diag_greedy_cd
 from .priors.e8p12 import (
     prior_scale_from_center,
     vamp_vector_discrete_mmse_e8p12,
@@ -49,7 +50,9 @@ class UniformVampConfig:
     polish_sweeps: int = 3
     polish_mode: str = "block_cd"  # "none" | "block_cd" | "topk_block_cd"
     topk_k: int = 16
+    vamp_backend: str = "auto"  # "eager" | "compile" | "triton" | "auto"
     compile_block_cd: bool = True
+    block_cd_backend: str = "eager"  # "eager" | "compile" | "triton" | "auto"
 
 
 @dataclass(frozen=True)
@@ -183,6 +186,18 @@ def _resolve_e8p12_polish_metric(metric: str) -> str:
 
 
 @torch.inference_mode()
+def _resolve_block_cd_backend(*, block_cd_backend: Optional[str], compile_block_cd: bool) -> str:
+    backend = str(block_cd_backend or "").strip().lower()
+    if not backend:
+        return "compile" if bool(compile_block_cd) else "eager"
+    if backend not in {"eager", "compile", "triton", "auto"}:
+        raise ValueError(
+            f"unsupported block_cd_backend={block_cd_backend!r}; expected eager|compile|triton|auto."
+        )
+    return backend
+
+
+@torch.inference_mode()
 def build_uniform_vamp_topk_candidates(
     *,
     r1: torch.Tensor,
@@ -256,9 +271,18 @@ def polish_uniform_rankspace(
     topk_values: Optional[torch.Tensor] = None,
     topk_q: Optional[torch.Tensor] = None,
     compile_block_cd: bool = True,
+    block_cd_backend: Optional[str] = None,
+    gram_full: Optional[torch.Tensor] = None,
+    order_mode: str = "greedy_gain",
+    raw_target: Optional[torch.Tensor] = None,
+    raw_gram: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
     mode = _resolve_polish_mode(sweeps=int(sweeps), mode=str(polish_mode))
     x_work = x_init.to(dtype=torch.float32)
+    backend = _resolve_block_cd_backend(
+        block_cd_backend=block_cd_backend,
+        compile_block_cd=bool(compile_block_cd),
+    )
     if mode == "none" or Vs.numel() == 0:
         q_int = nearest_atom_idx(x=x_work, scale_full=scale_full, zero_full=zero_full, maxq=maxq).to(dtype=torch.int32)
         x_out = dequant_from_q(q_int=q_int, scale_full=scale_full, zero_full=zero_full)
@@ -272,6 +296,48 @@ def polish_uniform_rankspace(
     else:
         provider = UniformScalarProvider(scale=scale_full, zero=zero_full, maxq=maxq)
 
+    use_triton_scalar = (
+        mode == "block_cd"
+        and str(order_mode or "greedy_gain").strip().lower() == "greedy_gain"
+        and backend in {"triton", "auto"}
+        and gram_full is not None
+        and x_work.device.type == "cuda"
+        and bool(has_triton_scalar_cd())
+    )
+
+    if use_triton_scalar:
+        x_polished, polish_stats = uniform_scalar_diag_greedy_cd(
+            x=x_work,
+            Y_u=Y_u,
+            Vs=Vs,
+            gram_full=gram_full,
+            scale=scale_full,
+            zero=zero_full,
+            maxq=maxq,
+            sweeps=int(sweeps),
+            accept_tol=0.0,
+            update_backend="triton",
+            raw_target=raw_target,
+            raw_gram=raw_gram,
+        )
+        q_polished = nearest_atom_idx(
+            x=x_polished,
+            scale_full=scale_full,
+            zero_full=zero_full,
+            maxq=maxq,
+        ).to(dtype=torch.int32)
+        x_out = dequant_from_q(q_int=q_polished, scale_full=scale_full, zero_full=zero_full)
+        err = vamp_rankspace_error(Y_u=Y_u, x=x_out, Vs=Vs)
+        polish_stats = dict(polish_stats)
+        polish_stats["block_cd_backend"] = "triton"
+        return q_polished, x_out, err, polish_stats
+
+    q_initial = nearest_atom_idx(
+        x=x_work,
+        scale_full=scale_full,
+        zero_full=zero_full,
+        maxq=maxq,
+    ).to(dtype=torch.int32)
     x_polished, q_topk, polish_stats = block_coordinate_descent_rankspace(
         x=x_work,
         Y_u=Y_u,
@@ -282,9 +348,12 @@ def polish_uniform_rankspace(
             sweeps=int(sweeps),
             metric="diag",
             accept_tol=0.0,
-            order_mode="greedy_gain",
-            compile_steps=bool(compile_block_cd),
+            order_mode=str(order_mode or "greedy_gain"),
+            compile_steps=bool(backend in {"compile", "auto"}),
         ),
+        idxs_init=q_initial,
+        raw_target=raw_target,
+        raw_gram=raw_gram,
     )
     if q_topk is not None:
         q_polished = q_topk.to(dtype=torch.int32)
@@ -292,6 +361,8 @@ def polish_uniform_rankspace(
         q_polished = nearest_atom_idx(x=x_polished, scale_full=scale_full, zero_full=zero_full, maxq=maxq).to(dtype=torch.int32)
     x_out = dequant_from_q(q_int=q_polished, scale_full=scale_full, zero_full=zero_full)
     err = vamp_rankspace_error(Y_u=Y_u, x=x_out, Vs=Vs)
+    polish_stats = dict(polish_stats)
+    polish_stats["block_cd_backend"] = "compile" if backend in {"compile", "auto"} else "eager"
     return q_polished, x_out, err, polish_stats
 
 
@@ -309,7 +380,10 @@ def polish_e8p12_rankspace(
     metric_rows_per_chunk: int = 0,
     polish_max_blocks: int = 0,
     topk_idxs: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
+    order_mode: str = "greedy_gain",
+    snapshot_budgets: Optional[set[int]] = None,
+    snapshots_out: Optional[Dict[int, torch.Tensor]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
     mode = _resolve_polish_mode(sweeps=int(sweeps), mode=str(polish_mode))
     metric_norm = _resolve_e8p12_polish_metric(str(polish_metric))
     x_work = x_init.to(dtype=torch.float32)
@@ -337,9 +411,11 @@ def polish_e8p12_rankspace(
             accept_tol=0.0,
             metric_rows_per_chunk=int(metric_rows_per_chunk),
             max_blocks_per_sweep=int(polish_max_blocks),
-            order_mode="greedy_gain",
+            order_mode=str(order_mode or "greedy_gain"),
         ),
         idxs_init=idxs_init,
+        snapshot_budgets=snapshot_budgets,
+        snapshots_out=snapshots_out,
     )
     if idxs_out is None:
         raise RuntimeError("E8P12 polish must return block indices.")
@@ -360,6 +436,7 @@ def solve_uniform_rankspace_vamp(
     S: torch.Tensor,  # (R,)
     Vs: torch.Tensor,  # (n, R)
     cfg: UniformVampConfig,
+    gram_full: Optional[torch.Tensor] = None,
     obs_precision_init: Optional[float] = None,
     log_stats: bool = True,
     debug_out: Optional[Dict[str, Any]] = None,
@@ -382,6 +459,7 @@ def solve_uniform_rankspace_vamp(
     iters = max(int(cfg.iters), 0)
     damping = float(cfg.damping)
     prior_tau = float(cfg.prior_tau)
+    vamp_backend = str(getattr(cfg, "vamp_backend", "auto") or "auto").strip().lower()
     final_decision = str(cfg.final_decision or "map").strip().lower()
     init_from = str(cfg.init_from or "rtn").strip().lower()
 
@@ -424,6 +502,7 @@ def solve_uniform_rankspace_vamp(
     alpha1_retry_count = 0
     alpha2_clip_count = 0
     gamma2_invalid_count = 0
+    vamp_backend_used_values: list[str] = []
 
     alpha_eps = 1e-7
     gamma_retry_factor = max(float(cfg.gamma_retry_factor), 1.000001)
@@ -445,7 +524,11 @@ def solve_uniform_rankspace_vamp(
             prior_tau=prior_tau,
             need_stats=False,
             atoms=atoms,
+            vamp_backend=vamp_backend,
         )
+        backend_used = post_state.get("vamp_backend")
+        if isinstance(backend_used, str):
+            vamp_backend_used_values.append(backend_used)
         q_state, x_state = _uniform_hard_decision(
             x_mean=post_state["mean"],  # type: ignore[arg-type]
             x_map=post_state["map_value"],  # type: ignore[arg-type]
@@ -484,7 +567,11 @@ def solve_uniform_rankspace_vamp(
                 prior_tau=prior_tau,
                 need_stats=bool(log_stats),
                 atoms=atoms,
+                vamp_backend=vamp_backend,
             )
+            backend_used = post_candidate.get("vamp_backend")
+            if isinstance(backend_used, str):
+                vamp_backend_used_values.append(backend_used)
             alpha1_candidate = post_candidate["alpha1"]  # type: ignore[assignment]
             valid_alpha1 = alpha_valid_mask(alpha1_candidate, eps=alpha_eps)
             if bool(valid_alpha1.all().item()):
@@ -620,6 +707,13 @@ def solve_uniform_rankspace_vamp(
     topk_k = max(int(getattr(cfg, "topk_k", 16) or 16), 1)
     polish_gain = 0.0
     polish_updates = 0.0
+    polish_stats: Dict[str, Any] = {}
+    summary_only = bool(debug_out.get("summary_only", False)) if debug_out is not None else False
+    q_stage1 = q_final
+    q_stage1_cpu = None
+    if debug_out is not None and not summary_only:
+        q_stage1_cpu = q_final.detach().to(device="cpu")
+
     if polish_mode != "none" and Vs.numel() > 0:
         err_before = vamp_rankspace_error(Y_u=Y_u, x=x_final, Vs=Vs)
         topk = None
@@ -647,6 +741,10 @@ def solve_uniform_rankspace_vamp(
             topk_values=None if topk is None else topk["topk_values"],
             topk_q=None if topk is None else topk["topk_q"],
             compile_block_cd=bool(getattr(cfg, "compile_block_cd", True)),
+            block_cd_backend=str(getattr(cfg, "block_cd_backend", "") or ""),
+            gram_full=gram_full,
+            raw_target=W if gram_full is not None else None,
+            raw_gram=gram_full,
         )
         improve = err_after + 1e-12 < err_before
         if bool(improve.any().item()):
@@ -657,11 +755,28 @@ def solve_uniform_rankspace_vamp(
         polish_updates = float(polish_stats.get("accepted_updates", 0.0))
 
     if debug_out is not None:
+        capture_r1 = bool(debug_out.get("capture_r1", False))
         debug_out["solver"] = "uniform_exact_vamp"
-        debug_out["q_pre_polish"] = q_final.detach().to(device="cpu")
-        debug_out["r1"] = r1.detach().to(device="cpu")
-        debug_out["gamma1"] = gamma1.detach().to(device="cpu")
-        debug_out["W"] = W.detach().to(device="cpu")
+        gamma1_f64 = gamma1.to(dtype=torch.float64)
+        debug_out["gamma1_sum"] = float(gamma1_f64.sum().item()) if gamma1_f64.numel() else 0.0
+        debug_out["gamma1_count"] = int(gamma1_f64.numel())
+        debug_out["gamma1_min"] = float(gamma1_f64.min().item()) if gamma1_f64.numel() else 0.0
+        debug_out["gamma1_max"] = float(gamma1_f64.max().item()) if gamma1_f64.numel() else 0.0
+        if summary_only:
+            debug_out["changed_count"] = int((q_stage1 != q_final).to(dtype=torch.int64).sum().item())
+            debug_out["changed_total"] = int(q_final.numel())
+        else:
+            debug_out["q_pre_polish"] = q_stage1_cpu
+            q_post_cpu = q_final.detach().to(device="cpu")
+            debug_out["q_post_polish"] = q_post_cpu
+            if isinstance(q_stage1_cpu, torch.Tensor) and q_stage1_cpu.shape == q_post_cpu.shape:
+                debug_out["changed_mask"] = (q_stage1_cpu != q_post_cpu)
+        if capture_r1:
+            debug_out["r1"] = r1.detach().to(device="cpu")
+        if not summary_only:
+            debug_out["gamma1"] = gamma1.detach().to(device="cpu")
+        if bool(debug_out.get("capture_weights", False)):
+            debug_out["W"] = W.detach().to(device="cpu")
 
     rtn_err = vamp_rankspace_error(Y_u=Y_u, x=x_rtn, Vs=Vs)
 
@@ -672,6 +787,10 @@ def solve_uniform_rankspace_vamp(
         "init_from": str(init_from),
         "damping": float(damping),
         "prior_tau": float(prior_tau),
+        "vamp_backend": str(vamp_backend),
+        "vamp_backend_used": str(
+            vamp_backend_used_values[-1] if vamp_backend_used_values else "eager"
+        ),
         "gamma_start": float(cfg.gamma_start),
         "gamma_retry_factor": float(gamma_retry_factor),
         "gamma_retry_steps": int(gamma_retry_steps),
@@ -695,6 +814,16 @@ def solve_uniform_rankspace_vamp(
         "topk_k": int(topk_k),
         "polish_gain": float(polish_gain),
         "polish_updates": float(polish_updates),
+        "polish_trace": polish_stats,
+        "block_cd_backend": str(
+            polish_stats.get(
+                "block_cd_backend",
+                _resolve_block_cd_backend(
+                    block_cd_backend=str(getattr(cfg, "block_cd_backend", "") or ""),
+                    compile_block_cd=bool(getattr(cfg, "compile_block_cd", True)),
+                ),
+            )
+        ),
         "rankspace_error_mean": float(err_final.mean().item()) if err_final.numel() else 0.0,
         "rtn_rankspace_error_mean": float(rtn_err.mean().item()) if rtn_err.numel() else 0.0,
     }
@@ -809,7 +938,7 @@ def solve_e8p12_rankspace_vamp(
     stop_iter_idx = -1
 
     if best_iterate_enabled:
-        init_post = vamp_vector_map_e8p12(
+        init_post = vamp_vector_discrete_mmse_e8p12(
             r1_blocks=r1.reshape(B, nblocks, codesz),
             gamma1=gamma1,
             cb=cb,
@@ -819,6 +948,7 @@ def solve_e8p12_rankspace_vamp(
             prior_scale_blocks=prior_scale_blocks,
             prior_tau=prior_tau,
             prior_tau_scale_mode=prior_tau_scale_mode,
+            compile_prior=compile_prior,
         )
         best_hatWr = init_post["map_vals"].reshape_as(r1)
         best_Qidxs = init_post["map_idxs"].to(dtype=getattr(cb, "idx_dtype", torch.int64))
@@ -951,7 +1081,7 @@ def solve_e8p12_rankspace_vamp(
             )
 
         if best_iterate_enabled:
-            state_post = vamp_vector_map_e8p12(
+            state_post = vamp_vector_discrete_mmse_e8p12(
                 r1_blocks=r1.reshape(B, nblocks, codesz),
                 gamma1=gamma1,
                 cb=cb,
@@ -961,6 +1091,7 @@ def solve_e8p12_rankspace_vamp(
                 prior_scale_blocks=prior_scale_blocks,
                 prior_tau=prior_tau,
                 prior_tau_scale_mode=prior_tau_scale_mode,
+                compile_prior=compile_prior,
             )
             state_hatWr = state_post["map_vals"].reshape_as(r1)
             state_Qidxs = state_post["map_idxs"].to(dtype=getattr(cb, "idx_dtype", torch.int64))
@@ -1003,26 +1134,42 @@ def solve_e8p12_rankspace_vamp(
     )
     final_hatWr = final_post["map_vals"].reshape_as(r1)
     final_Qidxs = final_post["map_idxs"].to(dtype=getattr(cb, "idx_dtype", torch.int64))
+    idxs_stage1 = final_Qidxs
     final_err = vamp_rankspace_error(Y_u=Y_u, x=final_hatWr, Vs=Vs)
 
     if debug_out is not None:
-        dbg_stats = _e8p12_block_debug_stats(
-            r1=r1,
-            gamma1=gamma1,
-            cb=cb,
-            blocks_per_chunk=blocks_per_chunk,
-            prior_center_blocks=W_blocks if prior_tau > 0.0 else None,
-            prior_scale_blocks=prior_scale_blocks,
-            prior_tau=prior_tau,
-            prior_tau_scale_mode=prior_tau_scale_mode,
-        )
+        summary_only = bool(debug_out.get("summary_only", False))
+        capture_r1 = bool(debug_out.get("capture_r1", False))
+        capture_block_stats = bool(debug_out.get("capture_block_stats", False))
+        capture_iter_logs = bool(debug_out.get("capture_iter_logs", False))
         debug_out["solver"] = "e8p12_exact_vamp"
-        debug_out["idxs_pre_polish"] = final_Qidxs.detach().to(device="cpu")
-        debug_out["r1"] = r1.detach().to(device="cpu")
-        debug_out["gamma1"] = gamma1.detach().to(device="cpu")
-        debug_out["W"] = Wr.detach().to(device="cpu")
-        debug_out["block_stats"] = {k: v.detach().to(device="cpu") for k, v in dbg_stats.items()}
-        debug_out["iter_logs"] = iter_logs if iter_logs is not None else []
+        gamma1_f64 = gamma1.to(dtype=torch.float64)
+        debug_out["gamma1_sum"] = float(gamma1_f64.sum().item()) if gamma1_f64.numel() else 0.0
+        debug_out["gamma1_count"] = int(gamma1_f64.numel())
+        debug_out["gamma1_min"] = float(gamma1_f64.min().item()) if gamma1_f64.numel() else 0.0
+        debug_out["gamma1_max"] = float(gamma1_f64.max().item()) if gamma1_f64.numel() else 0.0
+        if not summary_only:
+            debug_out["idxs_pre_polish"] = final_Qidxs.detach().to(device="cpu")
+        if capture_r1:
+            debug_out["r1"] = r1.detach().to(device="cpu")
+        if not summary_only:
+            debug_out["gamma1"] = gamma1.detach().to(device="cpu")
+        if bool(debug_out.get("capture_weights", False)):
+            debug_out["W"] = Wr.detach().to(device="cpu")
+        if capture_block_stats:
+            dbg_stats = _e8p12_block_debug_stats(
+                r1=r1,
+                gamma1=gamma1,
+                cb=cb,
+                blocks_per_chunk=blocks_per_chunk,
+                prior_center_blocks=W_blocks if prior_tau > 0.0 else None,
+                prior_scale_blocks=prior_scale_blocks,
+                prior_tau=prior_tau,
+                prior_tau_scale_mode=prior_tau_scale_mode,
+            )
+            debug_out["block_stats"] = {k: v.detach().to(device="cpu") for k, v in dbg_stats.items()}
+        if capture_iter_logs:
+            debug_out["iter_logs"] = iter_logs if iter_logs is not None else []
 
     polish_sweeps = max(int(cfg.polish_sweeps), 0)
     polish_mode = _resolve_polish_mode(sweeps=polish_sweeps, mode=str(getattr(cfg, "polish_mode", "block_cd")))
@@ -1031,6 +1178,16 @@ def solve_e8p12_rankspace_vamp(
 
     polish_gain = 0.0
     polish_updates = 0.0
+    polish_stats: Dict[str, Any] = {}
+    cd_snapshots: Dict[int, torch.Tensor] = {}
+    requested_snapshot_budgets = (
+        {
+            int(budget)
+            for budget in debug_out.get("cd_snapshot_budgets", [])
+        }
+        if debug_out is not None
+        else set()
+    )
     if polish_mode != "none" and Vs.numel() > 0:
         err_before = vamp_rankspace_error(Y_u=Y_u, x=final_hatWr, Vs=Vs)
         topk = None
@@ -1057,19 +1214,27 @@ def solve_e8p12_rankspace_vamp(
             metric_rows_per_chunk=int(cfg.polish_metric_rows_per_chunk),
             polish_max_blocks=int(getattr(cfg, "polish_max_blocks", 0) or 0),
             topk_idxs=None if topk is None else topk["topk_idxs"].to(device=final_hatWr.device, dtype=torch.long),
+            snapshot_budgets=requested_snapshot_budgets,
+            snapshots_out=cd_snapshots,
         )
         polish_gain = float((err_before - err_after).mean().item())
         polish_updates = float(polish_stats.get("accepted_updates", 0.0))
         final_err = err_after
         if debug_out is not None and topk is not None:
             debug_out["topk_idxs"] = topk["topk_idxs"].detach().to(device="cpu")
+        if debug_out is not None and cd_snapshots:
+            debug_out["cd_snapshots"] = cd_snapshots
 
     if debug_out is not None:
-        idxs_pre = debug_out.get("idxs_pre_polish")
-        idxs_post = final_Qidxs.detach().to(device="cpu")
-        debug_out["idxs_post_polish"] = idxs_post
-        if isinstance(idxs_pre, torch.Tensor) and idxs_pre.shape == idxs_post.shape:
-            debug_out["changed_mask"] = (idxs_pre != idxs_post)
+        if bool(debug_out.get("summary_only", False)):
+            debug_out["changed_count"] = int((idxs_stage1 != final_Qidxs).to(dtype=torch.int64).sum().item())
+            debug_out["changed_total"] = int(final_Qidxs.numel())
+        else:
+            idxs_pre = debug_out.get("idxs_pre_polish")
+            idxs_post = final_Qidxs.detach().to(device="cpu")
+            debug_out["idxs_post_polish"] = idxs_post
+            if isinstance(idxs_pre, torch.Tensor) and idxs_pre.shape == idxs_post.shape:
+                debug_out["changed_mask"] = (idxs_pre != idxs_post)
 
     stats: Dict[str, Any] = {
         "solver": "e8p12_exact_vamp",
@@ -1101,6 +1266,7 @@ def solve_e8p12_rankspace_vamp(
         "topk_k": int(topk_k),
         "polish_gain": float(polish_gain),
         "polish_updates": float(polish_updates),
+        "polish_trace": polish_stats,
         "best_iterate_enabled": bool(best_iterate_enabled),
         "best_iter": int(best_iter_idx),
         "stop_iter": int(stop_iter_idx),

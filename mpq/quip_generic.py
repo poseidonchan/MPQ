@@ -4,6 +4,7 @@ import argparse
 import copy
 import hashlib
 import inspect
+import json
 import os
 import weakref
 from operator import attrgetter
@@ -15,6 +16,7 @@ import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
 
+from .data import _iter_text_rows, tensor_sha256
 from .dense_decoder_adapter import DenseDecoderAdapter, resolve_dense_decoder_adapter_for_model
 
 
@@ -374,20 +376,24 @@ def _quantize_weights_to_attr(
     n = int(H_data["n"])
     W = torch.vstack([weights[i].to(dtype_) / scales[i] for i in range(len(weights))]).to(dtype_)
     H = quip_utils.regularize_H(H, n, float(args.sigma_reg))
-    base_seed = int(getattr(args, "seed", 0) or 0)
-    digest = hashlib.sha256(str(save_name).encode("utf-8")).digest()
-    local_seed = int((base_seed + int.from_bytes(digest[:8], byteorder="little", signed=False)) % (2**31 - 1))
-    cpu_state = torch.random.get_rng_state()
-    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-    try:
-        torch.manual_seed(local_seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(local_seed)
+    # MPQ_LEGACY_SEED=1 -> behave like legacy quip-sharp: no per-projection hash seed, use cascaded RNG from layer-level manual_seed(idx).
+    if os.environ.get("MPQ_LEGACY_SEED") == "1":
         hatW, attr = quip.quantize(H, W, int(args.lora_rank), cb, args, device, module_name=str(save_name))
-    finally:
-        torch.random.set_rng_state(cpu_state)
-        if cuda_states is not None:
-            torch.cuda.set_rng_state_all(cuda_states)
+    else:
+        base_seed = int(getattr(args, "seed", 0) or 0)
+        digest = hashlib.sha256(str(save_name).encode("utf-8")).digest()
+        local_seed = int((base_seed + int.from_bytes(digest[:8], byteorder="little", signed=False)) % (2**31 - 1))
+        cpu_state = torch.random.get_rng_state()
+        cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        try:
+            torch.manual_seed(local_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(local_seed)
+            hatW, attr = quip.quantize(H, W, int(args.lora_rank), cb, args, device, module_name=str(save_name))
+        finally:
+            torch.random.set_rng_state(cpu_state)
+            if cuda_states is not None:
+                torch.cuda.set_rng_state_all(cuda_states)
 
     if len(scales) == 1:
         attr["SV"] *= scales[0]
@@ -397,6 +403,14 @@ def _quantize_weights_to_attr(
             "fused": len(shapes) > 1,
             "shapes": shapes,
             "scales": scales,
+            "input_fingerprint": {
+                "protocol": "paired_w_h_sha256_v1",
+                "w_sha256": tensor_sha256(W),
+                "h_sha256": tensor_sha256(H),
+                "w_shape": [int(dim) for dim in W.shape],
+                "h_shape": [int(dim) for dim in H.shape],
+                "basis": "pre_incoherence",
+            },
         }
     )
 
@@ -809,6 +823,9 @@ def apply_quantized_ckpt_to_model(
 def collect_hessians_generic(args: Any) -> None:
     from lib import utils as quip_utils
 
+    calibration_value = getattr(args, "calibration_seed", None)
+    calibration_seed = int(args.seed if calibration_value is None else calibration_value)
+    quip_utils._iter_text_rows = _iter_text_rows
     model = AutoModelForCausalLM.from_pretrained(args.base_model, torch_dtype="auto", low_cpu_mem_usage=True)
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=True)
     tokenizer.pad_token = tokenizer.eos_token
@@ -821,13 +838,28 @@ def collect_hessians_generic(args: Any) -> None:
         size=args.devset_size,
         ctx_size=args.ctx_size,
         nproc=args.sample_proc,
-        seed=args.seed,
+        seed=calibration_seed,
     )
     dev_emb = root.embed_tokens(devset).cpu()
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     position_ids = torch.arange(args.ctx_size, dtype=torch.int64)[None, :].expand(args.batch_size, -1)
     save_path = Path(args.save_path)
     save_path.mkdir(parents=True, exist_ok=True)
+    calibration_manifest = {
+        "protocol": "token_ids_sha256_v1",
+        "sha256": tensor_sha256(devset.to(dtype=torch.int64)),
+        "shape": [int(dim) for dim in devset.shape],
+        "tokens": int(devset.numel()),
+        "dataset": str(args.calibration_dataset),
+        "split": str(args.calibration_split),
+        "seed": calibration_seed,
+        "size": int(args.devset_size),
+        "seqlen": int(args.ctx_size),
+    }
+    (save_path / "calibration_manifest.json").write_text(
+        json.dumps(calibration_manifest, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
 
     for layer_idx, layer in enumerate(adapter.get_layers(model)):
         expected = [save_path / f"{layer_idx}_{suffix}.pt" for suffix in ("qkv", "o", "up", "down")]
@@ -894,6 +926,9 @@ def quantize_model_generic(args: Any) -> None:
     from lib import codebook as quip_codebook
     from lib import utils as quip_utils
 
+    calibration_value = getattr(args, "calibration_seed", None)
+    calibration_seed = int(args.seed if calibration_value is None else calibration_value)
+    quip_utils._iter_text_rows = _iter_text_rows
     dtype_ = torch.float64 if bool(args.use_fp64) else torch.float32
     cb = quip_codebook.get_codebook(args.codebook)
     model = AutoModelForCausalLM.from_pretrained(args.base_model, torch_dtype="auto", low_cpu_mem_usage=True)
@@ -924,13 +959,42 @@ def quantize_model_generic(args: Any) -> None:
         size=args.devset_size,
         ctx_size=args.ctx_size,
         nproc=args.sample_proc,
-        seed=args.seed,
+        seed=calibration_seed,
     )
+    calibration_manifest = {
+        "protocol": "token_ids_sha256_v1",
+        "sha256": tensor_sha256(devset.to(dtype=torch.int64)),
+        "shape": [int(dim) for dim in devset.shape],
+        "tokens": int(devset.numel()),
+        "dataset": str(args.calibration_dataset),
+        "split": str(args.calibration_split),
+        "seed": calibration_seed,
+        "size": int(args.devset_size),
+        "seqlen": int(args.ctx_size),
+    }
+    quant_manifest_path = Path(args.save_path) / "calibration_manifest_quant.json"
+    quant_manifest_path.write_text(
+        json.dumps(calibration_manifest, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    hessian_manifest_path = Path(args.hessian_path) / "calibration_manifest.json"
+    if not hessian_manifest_path.exists():
+        raise RuntimeError(f"missing Hessian calibration manifest: {hessian_manifest_path}")
+    hessian_manifest = json.loads(hessian_manifest_path.read_text(encoding="utf-8"))
+    if str(hessian_manifest.get("sha256")) != str(calibration_manifest["sha256"]):
+        raise RuntimeError(
+            "quantization calibration hash does not match Hessian calibration hash: "
+            f"{calibration_manifest['sha256']} != {hessian_manifest.get('sha256')}"
+        )
     current_emb = root.embed_tokens(devset).cpu()
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     position_ids = torch.arange(args.ctx_size, dtype=torch.int64)[None, :].expand(args.batch_size, -1)
     layers = adapter.get_layers(model)
+    start_layer = 0 if getattr(args, "start_layer", None) is None else int(args.start_layer)
+    stop_after_layer = None if getattr(args, "stop_after_layer", None) is None else int(args.stop_after_layer)
     for idx, layer in enumerate(layers):
+        if stop_after_layer is not None and idx > stop_after_layer:
+            break
         layer = layer.to(device)
         attention_mask = adapter.build_attention_mask(
             model,
@@ -955,7 +1019,7 @@ def quantize_model_generic(args: Any) -> None:
                 output_attentions=False,
             ).cpu()
 
-        if not _check_exist(idx, args.save_path):
+        if idx >= start_layer and not _check_exist(idx, args.save_path):
             mixed_layer = build_mixed_layer(layer=layer.cpu(), model=model, adapter=adapter)
             quantize_finetune_dense_decoder_layer(
                 mixed_layer,

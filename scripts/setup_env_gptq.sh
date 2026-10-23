@@ -34,7 +34,7 @@ conda run -n "${ENV_NAME}" python -m pip install --no-cache-dir -U "torch>=2.8.0
 # Install a CUDA toolkit inside the env for building CUDA extensions (fast_hadamard_transform).
 conda install -y -n "${ENV_NAME}" -c nvidia "cuda-toolkit=${CUDA_TOOLKIT_VERSION}"
 
-# Build fast_hadamard_transform from the pinned submodule against the installed torch.
+# Build fast_hadamard_transform from the pinned checkout against the installed torch.
 conda_run_cuda_build "FAST_HADAMARD_TRANSFORM_FORCE_BUILD=TRUE python -m pip install --no-cache-dir --no-build-isolation -v third_party/fast-hadamard-transform"
 
 # Avoid compiling GPTQModel CUDA extensions in this research repo by default.

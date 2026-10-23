@@ -3,9 +3,11 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
+
+from ..linear import stabilize_cholesky
 
 
 _ALPHA_EPS = 1e-8
@@ -20,7 +22,7 @@ class OJBKQConfig:
     """
 
     enabled: bool = field(default=True)
-    random_trials: int = field(default=5)
+    random_trials: int = field(default=4)
     alpha_mode: str = field(default="paper")  # "paper" | "fixed"
     alpha_override: Optional[float] = field(default=None)
     alpha_scale: float = field(default=1.0)
@@ -96,6 +98,42 @@ def _quantize_with_params(*, weights: torch.Tensor, scale: torch.Tensor, zero: t
     return q_int, dequant
 
 
+@torch.inference_mode()
+def _e8p12_metric_sample(
+    *,
+    grid: torch.Tensor,
+    target: torch.Tensor,
+    chol: torch.Tensor,
+    sample_topk: int,
+    alpha: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    target_metric = target.to(dtype=torch.float32).matmul(chol.to(dtype=torch.float32))
+    grid_metric = grid.to(device=target.device, dtype=torch.float32).matmul(chol.to(dtype=torch.float32))
+    target_norm = target_metric.square().sum(dim=1, keepdim=True)
+    grid_norm = grid_metric.square().sum(dim=1).unsqueeze(0)
+    scores = (target_norm + grid_norm - 2.0 * target_metric.matmul(grid_metric.T)).clamp_min_(0.0)
+    k = max(1, min(int(sample_topk), int(grid.shape[0])))
+    top_scores, top_idxs = torch.topk(scores, k=k, dim=1, largest=False)
+    logits = -float(alpha) * top_scores
+    logits = torch.nan_to_num(
+        logits - logits.amax(dim=1, keepdim=True),
+        nan=0.0,
+        posinf=0.0,
+        neginf=-1e9,
+    )
+    sampled = torch.distributions.Categorical(logits=logits).sample()
+    row_idx = torch.arange(int(target.shape[0]), device=target.device)
+    idxs = top_idxs[row_idx, sampled]
+    vals = grid.index_select(0, idxs)
+    return vals.to(dtype=target.dtype), idxs
+
+
+@torch.inference_mode()
+def _e8p12_surrogate_rows(Wr: torch.Tensor, hatWr: torch.Tensor, Hr: torch.Tensor) -> torch.Tensor:
+    delta = (Wr - hatWr).to(dtype=torch.float32)
+    return (delta.matmul(Hr.to(dtype=torch.float32)) * delta).sum(dim=1)
+
+
 def _refresh_group_params_for_paths(
     *,
     work_paths: torch.Tensor,
@@ -159,8 +197,6 @@ def run_ojbkq_gptq_quantization(
         raise ValueError("OJBKQ/GPTQ: `W` must be a 2D tensor.")
     if Hinv.ndim != 2 or Hinv.shape[0] != Hinv.shape[1] or Hinv.shape[0] != W.shape[1]:
         raise ValueError("OJBKQ/GPTQ: `Hinv` must be square with size equal to `W.shape[1]`.")
-    if bool(getattr(qcfg, "desc_act", False)):
-        raise ValueError("OJBKQ/GPTQ: solver-swap path currently requires `desc_act=False`.")
     if bool(getattr(qcfg, "act_group_aware", False)):
         raise ValueError("OJBKQ/GPTQ: solver-swap path currently requires `act_group_aware=False`.")
 
@@ -181,7 +217,7 @@ def run_ojbkq_gptq_quantization(
 
     inv_diag = torch.diagonal(Hinv).clamp_min(_ALPHA_EPS)
     r_diag = inv_diag.reciprocal()
-    alpha = _resolve_alpha(r_diag=r_diag, total_trials=max(random_trials, 1), config=config)
+    alpha = _resolve_alpha(r_diag=r_diag, total_trials=max(total_paths, 1), config=config)
 
     work_paths = W.unsqueeze(0).repeat(total_paths, 1, 1)
     qint_paths = torch.empty((total_paths, rows, cols), dtype=torch.float32, device=device)
@@ -192,70 +228,100 @@ def run_ojbkq_gptq_quantization(
 
     current_scale = None
     current_zero = None
-    for col_idx in range(cols):
-        if col_idx % group_size == 0:
-            group_idx = col_idx // group_size
-            group_end = min(col_idx + group_size, cols)
-            current_scale, current_zero = _refresh_group_params_for_paths(
-                work_paths=work_paths,
-                group_start=col_idx,
-                group_end=group_end,
-                quantizer=quantizer,
-                scale_paths=scale_paths,
-                zero_paths=zero_paths,
-                group_idx=group_idx,
-                share_reference_params=True,
-            )
-
-        if current_scale is None or current_zero is None:
-            raise RuntimeError("OJBKQ/GPTQ: group parameters were not initialized.")
-
-        d = float(Hinv[col_idx, col_idx].item())
-        w_current = work_paths[:, :, col_idx]
-
-        greedy_qint, greedy_dequant = _quantize_with_params(
-            weights=w_current[0],
-            scale=current_scale[0],
-            zero=current_zero[0],
-            maxq=maxq,
+    blocksize = 128
+    for block_start in range(0, cols, blocksize):
+        block_end = min(block_start + blocksize, cols)
+        block_count = block_end - block_start
+        work_block = work_paths[:, :, block_start:block_end].clone()
+        errors_block = torch.zeros(
+            (total_paths, rows, block_count),
+            dtype=torch.float32,
+            device=device,
         )
-        qint_paths[0, :, col_idx] = greedy_qint
-        dequant_paths[0, :, col_idx] = greedy_dequant
+        hinv_block = Hinv[block_start:block_end, block_start:block_end]
 
-        if total_paths > 1:
-            current_random = w_current[1:]
-            scale_random = current_scale[1:]
-            zero_random = current_zero[1:]
-            centers = current_random / scale_random + zero_random
-            distances = (centers.unsqueeze(-1) - levels.view(1, 1, -1)).abs()
-            _, support_idx = torch.topk(distances, k=sample_support, dim=-1, largest=False)
-            support_levels = torch.gather(
-                levels.view(1, 1, -1).expand(total_paths - 1, rows, -1),
-                dim=-1,
-                index=support_idx,
+        for block_col in range(block_count):
+            col_idx = block_start + block_col
+            if col_idx % group_size == 0:
+                group_idx = col_idx // group_size
+                group_end = min(col_idx + group_size, cols)
+                current_scale, current_zero = _refresh_group_params_for_paths(
+                    work_paths=work_paths,
+                    group_start=col_idx,
+                    group_end=group_end,
+                    quantizer=quantizer,
+                    scale_paths=scale_paths,
+                    zero_paths=zero_paths,
+                    group_idx=group_idx,
+                    share_reference_params=True,
+                )
+
+            if current_scale is None or current_zero is None:
+                raise RuntimeError("OJBKQ/GPTQ: group parameters were not initialized.")
+
+            d = float(hinv_block[block_col, block_col].item())
+            w_current = work_block[:, :, block_col]
+
+            # Keep path zero on the deterministic blocked Babai/GPTQ-style
+            # loop. It is OJBKQ's greedy reference path, not a separately
+            # computed native GPTQ solution.
+            greedy_dequant = quantizer.quantize(w_current[0].unsqueeze(1)).flatten()
+            greedy_qint = _clamp_codes(
+                torch.round(greedy_dequant / current_scale[0]) + current_zero[0],
+                maxq,
             )
+            qint_paths[0, :, col_idx] = greedy_qint
+            dequant_paths[0, :, col_idx] = greedy_dequant
 
-            # Paper Eq. (13) uses the transformed diagonal entry \bar{R}_{ii},
-            # not its square, in the randomized rounding logits.
-            local_rbar_diag = (scale_random / d).clamp_min(_ALPHA_EPS).unsqueeze(-1)
-            logits = -alpha * local_rbar_diag * (centers.unsqueeze(-1) - support_levels).square()
-            logits = torch.nan_to_num(
-                logits - logits.amax(dim=-1, keepdim=True),
-                nan=0.0,
-                posinf=0.0,
-                neginf=-1e9,
+            if total_paths > 1:
+                current_random = w_current[1:]
+                scale_random = current_scale[1:]
+                zero_random = current_zero[1:]
+                centers = current_random / scale_random + zero_random
+                distances = (centers.unsqueeze(-1) - levels.view(1, 1, -1)).abs()
+                _, support_idx = torch.topk(distances, k=sample_support, dim=-1, largest=False)
+                support_levels = torch.gather(
+                    levels.view(1, 1, -1).expand(total_paths - 1, rows, -1),
+                    dim=-1,
+                    index=support_idx,
+                )
+
+                # Paper Eq. (13) uses the transformed diagonal entry \bar{R}_{ii},
+                # not its square, in the randomized rounding logits.
+                local_rbar_diag = (scale_random / d).clamp_min(_ALPHA_EPS).unsqueeze(-1)
+                logits = -alpha * local_rbar_diag * (centers.unsqueeze(-1) - support_levels).square()
+                logits = torch.nan_to_num(
+                    logits - logits.amax(dim=-1, keepdim=True),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=-1e9,
+                )
+                sampled_idx = torch.distributions.Categorical(logits=logits.reshape(-1, sample_support)).sample()
+                sampled_idx = sampled_idx.reshape(total_paths - 1, rows, 1)
+                sampled_levels = torch.gather(support_levels, dim=-1, index=sampled_idx).squeeze(-1)
+                random_dequant = scale_random * (sampled_levels - zero_random)
+                qint_paths[1:, :, col_idx] = sampled_levels
+                dequant_paths[1:, :, col_idx] = random_dequant
+
+            err = (w_current - dequant_paths[:, :, col_idx]) / d
+            loss_paths += 0.5 * err.square()
+            errors_block[:, :, block_col] = err
+
+            # Match GPTQ's accumulation order for the greedy candidate.
+            work_block[0, :, block_col:] -= err[0].unsqueeze(1).matmul(
+                hinv_block[block_col, block_col:].unsqueeze(0)
             )
-            sampled_idx = torch.distributions.Categorical(logits=logits.reshape(-1, sample_support)).sample()
-            sampled_idx = sampled_idx.reshape(total_paths - 1, rows, 1)
-            sampled_levels = torch.gather(support_levels, dim=-1, index=sampled_idx).squeeze(-1)
-            random_dequant = scale_random * (sampled_levels - zero_random)
-            qint_paths[1:, :, col_idx] = sampled_levels
-            dequant_paths[1:, :, col_idx] = random_dequant
+            if total_paths > 1:
+                work_block[1:, :, block_col:] -= (
+                    err[1:].unsqueeze(-1)
+                    * hinv_block[block_col, block_col:].view(1, 1, -1)
+                )
 
-        err = (w_current - dequant_paths[:, :, col_idx]) / d
-        loss_paths += 0.5 * err.square()
-        if col_idx < cols - 1:
-            work_paths[:, :, col_idx:] -= err.unsqueeze(-1) * Hinv[col_idx, col_idx:].view(1, 1, -1)
+        if block_end < cols:
+            trailing_hinv = Hinv[block_start:block_end, block_end:]
+            work_paths[0, :, block_end:] -= errors_block[0].matmul(trailing_hinv)
+            if total_paths > 1:
+                work_paths[1:, :, block_end:] -= errors_block[1:].matmul(trailing_hinv)
 
     best_idx = torch.argmin(loss_paths, dim=0)
     row_ids = torch.arange(rows, device=device)
@@ -280,11 +346,13 @@ def run_ojbkq_gptq_quantization(
 
     stats: Dict[str, object] = {
         "solver": "ojbkq",
-        "solver_scope": "gptq_solver_swap",
+        "solver_scope": "gptq_random_k_solver",
         "module": module_name,
         "solver_time": float(solver_time),
         "random_trials": int(config.random_trials),
+        "random_paths": int(random_trials),
         "total_candidates": int(total_paths),
+        "greedy_candidates": 1,
         "alpha_mode": str(config.alpha_mode),
         "alpha": float(alpha),
         "sample_topk": int(sample_support),
@@ -296,5 +364,98 @@ def run_ojbkq_gptq_quantization(
     return best_dequant, best_qint, best_scale, best_zero, g_idx, avg_loss, stats
 
 
-__all__ = ["OJBKQConfig", "run_ojbkq_gptq_quantization"]
+@torch.inference_mode()
+def run_ojbkq_e8p12_hessian(
+    *,
+    Wr: torch.Tensor,
+    Hr: torch.Tensor,
+    hatWr0: torch.Tensor,
+    Qidxs0: torch.Tensor,
+    cb: Any,
+    config: OJBKQConfig,
+    module_name: str = "",
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
+    start_time = time.perf_counter()
+    Wr_f32 = Wr.to(dtype=torch.float32)
+    Hr_f32 = Hr.to(device=Wr_f32.device, dtype=torch.float32)
+    Hr_f32 = 0.5 * (Hr_f32 + Hr_f32.T)
+    hat0 = hatWr0.to(device=Wr_f32.device, dtype=torch.float32)
+    rows, cols = Wr_f32.shape
+    codesz = int(getattr(cb, "codesz", 8))
+    if codesz <= 0 or cols % codesz != 0:
+        raise ValueError(f"OJBKQ/E8P12 expects cols divisible by code size; got cols={cols}, codesz={codesz}.")
 
+    nblocks = cols // codesz
+    random_trials = max(int(config.random_trials), 0)
+    total_paths = 1 + random_trials
+    grid = cb.grid.to(device=Wr_f32.device, dtype=torch.float32)
+    sample_support = int(config.sample_topk) if config.sample_topk is not None else min(16, int(grid.shape[0]))
+    sample_support = max(1, min(sample_support, int(grid.shape[0])))
+    diag = torch.diagonal(Hr_f32).abs().clamp_min(_ALPHA_EPS)
+    alpha = _resolve_alpha(r_diag=diag, total_trials=max(total_paths, 1), config=config)
+
+    path_hats = torch.empty((total_paths, rows, cols), dtype=torch.float32, device=Wr_f32.device)
+    path_idxs = torch.empty((total_paths, rows, nblocks), dtype=getattr(cb, "idx_dtype", torch.int64), device=Wr_f32.device)
+    path_hats[0] = hat0
+    path_idxs[0] = Qidxs0.to(device=Wr_f32.device, dtype=path_idxs.dtype)
+
+    if random_trials > 0:
+        block_meta = []
+        for block_idx in range(nblocks):
+            start = block_idx * codesz
+            end = start + codesz
+            gram = Hr_f32[start:end, start:end].contiguous()
+            chol = stabilize_cholesky(gram)
+            gram_inv = torch.cholesky_inverse(chol).contiguous()
+            block_meta.append((start, end, Hr_f32[:, start:end].contiguous(), chol, gram_inv))
+
+        for path_idx in range(1, total_paths):
+            hat = Wr_f32.clone()
+            delta = Wr_f32 - hat
+            idxs = torch.empty((rows, nblocks), dtype=path_idxs.dtype, device=Wr_f32.device)
+            for block_idx, (start, end, H_cols, chol, gram_inv) in enumerate(block_meta):
+                target = hat[:, start:end] + delta.matmul(H_cols).matmul(gram_inv)
+                vals, sampled_idxs = _e8p12_metric_sample(
+                    grid=grid,
+                    target=target,
+                    chol=chol,
+                    sample_topk=sample_support,
+                    alpha=alpha,
+                )
+                vals = vals.to(dtype=torch.float32)
+                hat[:, start:end] = vals
+                idxs[:, block_idx] = sampled_idxs.to(dtype=idxs.dtype)
+                delta[:, start:end] = Wr_f32[:, start:end] - vals
+            path_hats[path_idx] = hat
+            path_idxs[path_idx] = idxs
+
+    losses = torch.empty((total_paths, rows), dtype=torch.float32, device=Wr_f32.device)
+    for path_idx in range(total_paths):
+        losses[path_idx] = _e8p12_surrogate_rows(Wr_f32, path_hats[path_idx], Hr_f32)
+
+    best_idx = torch.argmin(losses, dim=0)
+    row_idx = torch.arange(rows, device=Wr_f32.device)
+    best_hat = path_hats.permute(1, 0, 2)[row_idx, best_idx]
+    best_Qidxs = path_idxs.permute(1, 0, 2)[row_idx, best_idx]
+    non_greedy_ratio = float((best_idx > 0).to(dtype=torch.float32).mean().item()) if best_idx.numel() else 0.0
+
+    stats: Dict[str, object] = {
+        "solver": "ojbkq",
+        "solver_scope": "e8p12_random_k_solver",
+        "module": str(module_name),
+        "solver_time": float(time.perf_counter() - start_time),
+        "random_trials": int(config.random_trials),
+        "random_paths": int(random_trials),
+        "total_candidates": int(total_paths),
+        "greedy_candidates": 1,
+        "alpha_mode": str(config.alpha_mode),
+        "alpha": float(alpha),
+        "sample_topk": int(sample_support),
+        "non_greedy_row_ratio": non_greedy_ratio,
+        "selected_path_mean": float(best_idx.to(dtype=torch.float32).mean().item()) if best_idx.numel() else 0.0,
+        "selected_path_max": int(best_idx.max().item()) if best_idx.numel() else 0,
+    }
+    return best_hat, best_Qidxs, stats
+
+
+__all__ = ["OJBKQConfig", "run_ojbkq_e8p12_hessian", "run_ojbkq_gptq_quantization"]

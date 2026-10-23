@@ -14,14 +14,20 @@ SUBMODULES = {
     "GPTQModel": {
         "path": pathlib.Path("third_party") / "GPTQModel",
         "patch": REPO_ROOT / "patches" / "gptqmodel.patch",
+        "url": "https://github.com/ModelCloud/GPTQModel.git",
+        "sha": "ed96f2e04ec868b04f969733a242ce3b5bb7cb1e",
     },
     "fast-hadamard-transform": {
         "path": pathlib.Path("third_party") / "fast-hadamard-transform",
         "patch": REPO_ROOT / "patches" / "fast_hadamard_transform.patch",
+        "url": "https://github.com/Dao-AILab/fast-hadamard-transform.git",
+        "sha": "e7706faf8d1c3b9f241e36860640ad1dac644ede",
     },
     "quip-sharp": {
         "path": pathlib.Path("third_party") / "quip-sharp",
         "patch": REPO_ROOT / "patches" / "quip_sharp.patch",
+        "url": "https://github.com/Cornell-RelaxML/quip-sharp.git",
+        "sha": "1d8f873e9a2a8b86b12bb1064c312c5689b77d98",
     },
 }
 
@@ -42,7 +48,7 @@ def _require_clean_worktree(path: pathlib.Path, *, name: str) -> None:
     if proc.returncode != 0:
         raise RuntimeError(f"{name}: failed to run git status:\n{proc.stdout}")
     if proc.stdout.strip():
-        raise RuntimeError(f"{name}: submodule has local modifications; please clean it first.\n{proc.stdout}")
+        raise RuntimeError(f"{name}: checkout has local modifications; please clean it first.\n{proc.stdout}")
 
 
 def _rev_parse_head(path: pathlib.Path, *, name: str) -> str:
@@ -52,17 +58,30 @@ def _rev_parse_head(path: pathlib.Path, *, name: str) -> str:
     return proc.stdout.strip()
 
 
-def _gitlink_sha(path: pathlib.Path, *, name: str) -> str:
-    proc = _run(["git", "ls-tree", "HEAD", "--", str(path)], cwd=REPO_ROOT)
-    if proc.returncode != 0:
-        raise RuntimeError(f"{name}: failed to query pinned gitlink:\n{proc.stdout}")
-    line = proc.stdout.strip()
-    if not line:
-        raise RuntimeError(f"{name}: no gitlink found for {path}")
-    fields = line.split()
-    if len(fields) < 3 or fields[1] != "commit":
-        raise RuntimeError(f"{name}: expected submodule gitlink entry, got:\n{line}")
-    return fields[2]
+def _bootstrap_checkout(*, name: str, path: pathlib.Path, url: str, expected_sha: str) -> None:
+    if path.exists():
+        probe = _run(["git", "rev-parse", "--is-inside-work-tree"], cwd=path)
+        if probe.returncode == 0:
+            return
+        if any(path.iterdir()):
+            raise RuntimeError(
+                f"{name}: {path} exists but is not a git checkout; remove it and retry"
+            )
+        path.rmdir()
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    clone = _run(
+        ["git", "clone", "--filter=blob:none", "--no-checkout", url, str(path)],
+        cwd=REPO_ROOT,
+    )
+    if clone.returncode != 0:
+        raise RuntimeError(f"{name}: failed to clone {url}:\n{clone.stdout}")
+    checkout = _run(["git", "checkout", "--detach", expected_sha], cwd=path)
+    if checkout.returncode != 0:
+        raise RuntimeError(
+            f"{name}: failed to checkout pinned revision {expected_sha}:\n{checkout.stdout}"
+        )
+    print(f"{name}: cloned pinned revision {expected_sha}")
 
 
 def _git_apply(path: pathlib.Path, patch: pathlib.Path, *, reverse: bool = False, check: bool = False) -> subprocess.CompletedProcess[str]:
@@ -97,16 +116,16 @@ def _check_patch_state(*, name: str, path: pathlib.Path, expected_sha: str, patc
     if not patch.exists():
         raise FileNotFoundError(f"{name}: patch file not found: {patch}")
     if not path.exists():
-        raise FileNotFoundError(f"{name}: submodule path not found: {path}")
+        raise FileNotFoundError(f"{name}: checkout path not found: {path}")
 
     head = _rev_parse_head(path, name=name)
     if head != expected_sha and not allow_sha_mismatch:
         raise RuntimeError(
-            f"{name}: submodule SHA mismatch.\n"
+            f"{name}: checkout SHA mismatch.\n"
             f"  expected: {expected_sha}\n"
             f"  actual:   {head}\n"
             f"Refuse to apply patch to an unknown revision.\n"
-            f"Re-checkout submodules or run with --allow-sha-mismatch."
+            f"Restore the pinned checkout or run with --allow-sha-mismatch."
         )
 
     reverse_check = _git_apply(path, patch, reverse=True, check=True)
@@ -139,13 +158,43 @@ def apply_patch(*, name: str, path: pathlib.Path, expected_sha: str, patch: path
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--allow-sha-mismatch", action="store_true", help="Apply patches even if submodule SHA differs.")
-    parser.add_argument("--check", action="store_true", help="Validate pinned submodules and patch health without applying.")
+    parser.add_argument("--allow-sha-mismatch", action="store_true", help="Apply patches even if a checkout SHA differs.")
+    parser.add_argument("--check", action="store_true", help="Validate pinned checkouts and patch health without applying.")
+    parser.add_argument(
+        "--bootstrap",
+        action="store_true",
+        help="Clone missing third-party checkouts before validating and applying patches.",
+    )
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument(
+        "--gptq-only",
+        action="store_true",
+        help="Prepare GPTQModel and fast-hadamard-transform only.",
+    )
+    selection.add_argument(
+        "--quip-only",
+        action="store_true",
+        help="Prepare QUIP# and fast-hadamard-transform only.",
+    )
     args = parser.parse_args()
 
-    for name, meta in SUBMODULES.items():
+    selected = tuple(SUBMODULES)
+    if args.gptq_only:
+        selected = ("GPTQModel", "fast-hadamard-transform")
+    elif args.quip_only:
+        selected = ("fast-hadamard-transform", "quip-sharp")
+
+    for name in selected:
+        meta = SUBMODULES[name]
         path = REPO_ROOT / meta["path"]
-        expected_sha = _gitlink_sha(meta["path"], name=name)
+        expected_sha = str(meta["sha"])
+        if args.bootstrap:
+            _bootstrap_checkout(
+                name=name,
+                path=path,
+                url=str(meta["url"]),
+                expected_sha=expected_sha,
+            )
         if args.check:
             _check_patch_state(
                 name=name,

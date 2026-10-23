@@ -21,6 +21,7 @@ from mpq.quip_generic import quantize_model_generic
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", default=0, type=int)
+    parser.add_argument("--calibration_seed", default=None, type=int)
     parser.add_argument("--num_cpu_threads", default=8, type=int)
     parser.add_argument("--batch_size", default=16, type=int)
     parser.add_argument("--devset_size", default=384, type=int)
@@ -86,7 +87,14 @@ def main() -> None:
     parser.add_argument("--mpq-method", dest="mpq_method", default="vamp", type=str, choices=["vamp", "vamp-topk-polish"])
     parser.add_argument("--mpq-topk-k", dest="mpq_topk_k", default=16, type=int)
     parser.add_argument("--mpq_best_iterate", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--ojbkq-random-trials", dest="ojbkq_random_trials", default=5, type=int)
+    parser.add_argument("--ojbkq-alpha-mode", dest="ojbkq_alpha_mode", default="paper", type=str, choices=["paper", "fixed"])
+    parser.add_argument("--ojbkq-alpha-override", dest="ojbkq_alpha_override", default=None, type=float)
+    parser.add_argument("--ojbkq-alpha-scale", dest="ojbkq_alpha_scale", default=1.0, type=float)
+    parser.add_argument("--ojbkq-sample-topk", dest="ojbkq_sample_topk", default=None, type=int)
     parser.add_argument("--model-arch", default="auto", type=str)
+    parser.add_argument("--start-layer", default=None, type=int)
+    parser.add_argument("--stop-after-layer", default=None, type=int)
     args = parser.parse_args()
 
     torch.set_grad_enabled(False)

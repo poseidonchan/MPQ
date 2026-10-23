@@ -73,9 +73,9 @@ def normalize_rotation(value: str) -> str:
 
 def normalize_solver(value: str) -> str:
     v = str(value or "").strip().lower()
-    if v in {"gptq", "ldlq", "vamp", "ldlq_tune10"}:
+    if v in {"gptq", "ldlq", "vamp", "ldlq_tune10", "cdquant", "quantease", "ojbkq"}:
         return v
-    raise ValueError(f"unsupported solver={value!r}; expected gptq|ldlq|vamp|ldlq_tune10.")
+    raise ValueError(f"unsupported solver={value!r}; expected gptq|ldlq|vamp|ldlq_tune10|cdquant|quantease|ojbkq.")
 
 
 def normalize_polish_mode(value: str) -> str:
@@ -121,8 +121,8 @@ def validate_combo(combo: QuantCombo) -> None:
     if combo.backend == "gptqmodel":
         if combo.codebook != "grid_g128":
             raise ValueError("gptqmodel backend only supports codebook=grid_g128.")
-        if combo.solver not in {"gptq", "vamp"}:
-            raise ValueError("gptqmodel backend only supports solver in {gptq, vamp}.")
+        if combo.solver not in {"gptq", "vamp", "cdquant", "quantease", "ojbkq"}:
+            raise ValueError("gptqmodel backend only supports solver in {gptq, vamp, cdquant, quantease, ojbkq}.")
         if combo.preprocess not in {"none", "awq"}:
             raise ValueError("gptqmodel backend only supports preprocess in {none, awq}.")
         if combo.rotation not in {"none", "model_hadamard", "model_random", "internal_hadamard"}:
@@ -133,14 +133,16 @@ def validate_combo(combo: QuantCombo) -> None:
     elif combo.backend == "quip":
         if combo.codebook != "e8p12":
             raise ValueError("quip backend only supports codebook=e8p12.")
-        if combo.preprocess != "none":
-            raise ValueError("quip backend does not support preprocess != none.")
-        if combo.solver not in {"ldlq", "vamp", "ldlq_tune10"}:
-            raise ValueError("quip backend only supports solver in {ldlq, vamp, ldlq_tune10}.")
+        if combo.preprocess not in {"none", "awq"}:
+            raise ValueError("quip backend only supports preprocess in {none, awq}.")
+        if combo.solver not in {"ldlq", "vamp", "ldlq_tune10", "cdquant", "quantease", "ojbkq"}:
+            raise ValueError("quip backend only supports solver in {ldlq, vamp, ldlq_tune10, cdquant, quantease, ojbkq}.")
         if combo.rotation not in {"had", "kron"}:
             raise ValueError("quip backend only supports rotation in {had, kron}.")
 
     if combo.solver == "ldlq_tune10" and combo.polish_mode != "none":
         raise ValueError("solver=ldlq_tune10 requires polish_mode=none.")
+    if combo.solver == "ojbkq" and combo.polish_mode not in {"none", "block_cd"}:
+        raise ValueError("solver=ojbkq supports polish_mode in {none, block_cd}.")
     if combo.polish_mode != "topk_block_cd" and combo.topk_source != "aux_vamp":
         raise ValueError("topk_source is only meaningful for polish_mode=topk_block_cd.")

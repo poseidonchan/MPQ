@@ -1,5 +1,5 @@
 diff --git a/eval/eval_ppl.py b/eval/eval_ppl.py
-index 71687c9..842fbea 100644
+index 71687c99099282f33602946be6aa447dbbabbe62..842fbea0be9e8df5fc1f4a89e0af6aeeb3d9a302 100644
 --- a/eval/eval_ppl.py
 +++ b/eval/eval_ppl.py
 @@ -18,22 +18,37 @@ parser = argparse.ArgumentParser()
@@ -61,11 +61,313 @@ index 71687c9..842fbea 100644
  
  
  if __name__ == '__main__':
+diff --git a/lib/algo/finetune.py b/lib/algo/finetune.py
+index 0d12d3133d019b6217a3b71f4a5028a73613937e..15c754e1333831937cd234de3434555f8f83ea7d 100644
+--- a/lib/algo/finetune.py
++++ b/lib/algo/finetune.py
+@@ -77,12 +77,14 @@ def quantize_finetune_decoder_layer(mixed_layer, quant_order, idx, cb, args,
+     mixed_layer = mixed_layer.float()
+ 
+     train_dl, valid_dl = utils.split_data(pre_orig_emb, orig_emb, args)
++    use_equil = bool(args.rescale_WH) or str(getattr(args, 'quant_preprocess', 'none') or 'none').strip().lower() == 'equil'
++    summary_only = bool(getattr(args, 'summary_only', False))
+ 
+     shared_args = (cb.codesz, cb.packsz, cb.pack_out, str(cb.idx_dtype),
+                    cb.version)
+     shared_kwargs = {
+         'rank': args.lora_rank,
+-        'rescale_WH': args.rescale_WH,
++        'rescale_WH': use_equil,
+         'resid_scale_override': args.resid_scale_override,
+         'bias': False,
+         'train_mode': args.ft_train_mode,
+@@ -104,6 +106,8 @@ def quantize_finetune_decoder_layer(mixed_layer, quant_order, idx, cb, args,
+                 weights = [orig_linear.weight]
+             quip.quantize_linear(weights, save_path, hessian_path, cb, args,
+                                  device)
++            if summary_only:
++                continue
+             saved_linear = torch.load(save_path,
+                                       map_location=torch.device('cpu'))
+             if saved_linear['fused']:
+@@ -133,6 +137,12 @@ def quantize_finetune_decoder_layer(mixed_layer, quant_order, idx, cb, args,
+             finetune_decoder_layer(mixed_layer, f'{idx}_{name}', device,
+                                    train_dl, valid_dl, args)
+ 
++    if summary_only:
++        mixed_layer = mixed_layer.to(torch.float16).cpu()
++        utils.clean()
++        torch.set_grad_enabled(False)
++        return
++
+     with torch.no_grad():
+         utils.clean()
+         for i, (linear_attr, name) in enumerate(quant_order):
 diff --git a/lib/algo/quip.py b/lib/algo/quip.py
-index 7ceb211..166bc14 100644
+index 7ceb211596741e42c46b5afc3386f58339b912f3..00fa6905781d4116985accbe284a7ac4396ba569 100644
 --- a/lib/algo/quip.py
 +++ b/lib/algo/quip.py
-@@ -354,7 +354,7 @@ def LDLQ_buffered_lowmem(Wr, Hr, L, D, cb, args, buf_cols=128):
+@@ -1,5 +1,7 @@
+ import copy
++import hashlib
+ import os
++import sys
+ 
+ import glog
+ import torch
+@@ -7,19 +9,104 @@ from tqdm import tqdm
+ 
+ from lib import utils
+ 
+-
+-def RHT_H(H, SU):
+-    return utils.matmul_hadUt(utils.matmul_hadUt(H * SU).T * SU)
+-
+-
+-def RHT_W(W, SU, SV):
+-    return utils.matmul_hadUt(utils.matmul_hadUt(W.T * SV).T * SU)
++# Block Hadamard fallback for dimensions unsupported by get_hadK (e.g. 9728)
++sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '..'))
++from mpq.rotation import apply_block_hadamard, largest_pow2_factor
++try:
++    from mpq.structured_ortho import (
++        StructuredOrthoState,
++        apply_left_structured_ortho,
++        apply_left_structured_ortho_t,
++        apply_right_structured_ortho,
++        apply_right_structured_ortho_t,
++        build_structured_ortho_state,
++        is_structured_rotation,
++        serialize_structured_state,
++        symmetric_equilibrate_wh,
++    )
++except ImportError:
++    StructuredOrthoState = None
++    def _not_available(*a, **kw):
++        raise ImportError("mpq.structured_ortho required for structured rotation mode")
++    apply_left_structured_ortho = _not_available
++    apply_left_structured_ortho_t = _not_available
++    apply_right_structured_ortho = _not_available
++    apply_right_structured_ortho_t = _not_available
++    build_structured_ortho_state = _not_available
++    def serialize_structured_state(state, width, device):
++        if state is None:
++            return {
++                'rotation_code': torch.tensor(0, device=device),
++                'block_size': torch.tensor(0, device=device),
++                'depth': torch.tensor(0, device=device),
++                'householder_count': torch.tensor(0, device=device),
++                'stage_signs': torch.zeros(4, width, device=device),
++                'stage_perms': torch.zeros(3, width, dtype=torch.int64, device=device),
++                'stage_inv_perms': torch.zeros(3, width, dtype=torch.int64, device=device),
++                'householder': torch.zeros(1, width, device=device),
++            }
++        raise ImportError("mpq.structured_ortho required for structured rotation mode")
++    symmetric_equilibrate_wh = _not_available
++    def is_structured_rotation(r):
++        return False
++
++
++def _hadUt_or_block(X):
++    """matmul_hadUt with block Hadamard fallback for unsupported widths."""
++    try:
++        return utils.matmul_hadUt(X)
++    except AssertionError:
++        return apply_block_hadamard(X, had_dim=largest_pow2_factor(X.shape[-1]))
++
++
++def _hadU_or_block(X):
++    """matmul_hadU with block Hadamard fallback for unsupported widths."""
++    try:
++        return utils.matmul_hadU(X)
++    except AssertionError:
++        return apply_block_hadamard(X, had_dim=largest_pow2_factor(X.shape[-1]))
++
++
++def _apply_right_transform_t(X, state):
++    if state is None:
++        return _hadUt_or_block(X)
++    return apply_right_structured_ortho_t(X, state)
++
++
++def _apply_right_transform(X, state):
++    if state is None:
++        return _hadU_or_block(X)
++    return apply_right_structured_ortho(X, state)
++
++
++def _apply_left_transform_t(X, state):
++    if state is None:
++        return _hadUt_or_block(X.T).T
++    return apply_left_structured_ortho_t(X, state)
++
++
++def _apply_left_transform(X, state):
++    if state is None:
++        return _hadU_or_block(X.T).T
++    return apply_left_structured_ortho(X, state)
++
++
++def RHT_H(H, SU, left_state):
++    return _apply_right_transform_t(_apply_right_transform_t(H * SU, left_state).T * SU, left_state)
++
++
++def RHT_W(W, SU, SV, left_state, right_state):
++    Wr = _apply_right_transform_t(W * SU[None, :], left_state)
++    Wr = SV[:, None] * Wr
++    return _apply_left_transform_t(Wr, right_state)
+ 
+ 
+ def incoherence_preprocess(H, W, args):
+     dtype_ = torch.float64 if args.use_fp64 else torch.float32
+     device = H.device
+     (m, n) = W.shape
++    rotation = str(getattr(args, "incoh_mode", "had") or "had").strip().lower()
++    preprocess = str(getattr(args, "quant_preprocess", "none") or "none").strip().lower()
+ 
+     def _dump(Hr, Lhr, msg=''):
+         torch.save(Hr, f"{args.save_pfx}/Hr_debug_fft.pt")
+@@ -30,59 +117,113 @@ def incoherence_preprocess(H, W, args):
+     scaleWH = None
+     Wr = W
+     Hr = H
+-    if args.rescale_WH:
+-        Hr = H / H.abs().max()
+-        diagH = torch.diag(Hr)
+-        diagW2 = torch.diag(W.T @ W)
+-        diagH = torch.clamp(diagH, min=1e-8)
+-        diagW2 = torch.clamp(diagW2, min=1e-8)
+-        scaleWH = (diagH / diagW2).sqrt().sqrt().to(torch.float32)
+-        scaleWH = scaleWH.clamp(min=1e-8)
+-        Wr = Wr * scaleWH[None, :]
+-        Hr = Hr / scaleWH[None, :]
+-        Hr = Hr / scaleWH[:, None]
+-        scaleWH = scaleWH.cpu()
++    use_equil = bool(getattr(args, "rescale_WH", False)) or preprocess == "equil"
++    if use_equil:
++        Hr, Wr, scaleWH = symmetric_equilibrate_wh(H=H, W=W, iters=4)
++        Hr = Hr.to(dtype_)
++        Wr = Wr.to(dtype_)
++        scaleWH = scaleWH.to(torch.float32).cpu()
+ 
+     # randomized hadamard transformation on H, W
+-    if args.incoh_mode == "had":
++    left_state = None
++    right_state = None
++    left_fallback_reason = ""
++    right_fallback_reason = ""
++    if rotation == "had":
+         SU = (torch.randn(n, device=device).sign() + 1e-5).sign().to(dtype_)
+         SV = (torch.randn(m, device=device).sign() + 1e-5).sign().to(dtype_)
+-        Hr = RHT_H(Hr, SU)
+-        Wr = RHT_W(Wr, SU, SV)
++        Hr = RHT_H(Hr, SU, None)
++        Wr = RHT_W(Wr, SU, SV, None, None)
+     # randomized kronecker product on H, W
+-    elif args.incoh_mode == "kron":
++    elif rotation == "kron":
+         SU = utils.rand_ortho_butterfly_noblock(n).to(dtype_).to(device)
+         SV = utils.rand_ortho_butterfly_noblock(m).to(dtype_).to(device)
+         Hr = SU @ Hr @ SU.T
+         Wr = SV @ Wr @ SU.T
++    elif is_structured_rotation(rotation):
++        SU = (torch.randn(n, device=device).sign() + 1e-5).sign().to(dtype_)
++        SV = (torch.randn(m, device=device).sign() + 1e-5).sign().to(dtype_)
++        if n % (512 if "512" in rotation else 128) == 0:
++            left_state = build_structured_ortho_state(width=n, rotation=rotation, device=device)
++        else:
++            left_fallback_reason = f"width={n} not divisible by structured block size"
++        if m % (512 if "512" in rotation else 128) == 0:
++            right_state = build_structured_ortho_state(width=m, rotation=rotation, device=device)
++        else:
++            right_fallback_reason = f"width={m} not divisible by structured block size"
++        Hr = RHT_H(Hr, SU, left_state)
++        Wr = RHT_W(Wr, SU, SV, left_state, right_state)
+     else:
+         raise NotImplementedError
+     SV = SV.cpu()
+     SU = SU.cpu()
+-
+-    Lhr = torch.linalg.cholesky(Hr)
+-    if not torch.all(torch.isfinite(Lhr)):
++    left_state = None if left_state is None else StructuredOrthoState(
++        rotation=left_state.rotation,
++        width=left_state.width,
++        block_size=left_state.block_size,
++        depth=left_state.depth,
++        householder_count=left_state.householder_count,
++        stage_signs=left_state.stage_signs.cpu(),
++        stage_perms=left_state.stage_perms.cpu(),
++        stage_inv_perms=left_state.stage_inv_perms.cpu(),
++        householder=left_state.householder.cpu(),
++        fallback_reason=left_state.fallback_reason,
++    )
++    right_state = None if right_state is None else StructuredOrthoState(
++        rotation=right_state.rotation,
++        width=right_state.width,
++        block_size=right_state.block_size,
++        depth=right_state.depth,
++        householder_count=right_state.householder_count,
++        stage_signs=right_state.stage_signs.cpu(),
++        stage_perms=right_state.stage_perms.cpu(),
++        stage_inv_perms=right_state.stage_inv_perms.cpu(),
++        householder=right_state.householder.cpu(),
++        fallback_reason=right_state.fallback_reason,
++    )
++
++    Lhr = None
++    try:
++        Lhr = torch.linalg.cholesky(Hr)
++    except torch._C._LinAlgError:
++        diag_mean = float(torch.diagonal(Hr).mean().abs().item()) or 1.0
++        eye = torch.eye(Hr.shape[0], device=Hr.device, dtype=Hr.dtype)
++        for exp in (-4, -3, -2, -1, 0):
++            jitter = (10.0 ** exp) * max(diag_mean, 1.0)
++            try:
++                Lhr = torch.linalg.cholesky(Hr + jitter * eye)
++                break
++            except torch._C._LinAlgError:
++                continue
++    if Lhr is None or not torch.all(torch.isfinite(Lhr)):
+         return None
+ 
+     Wr = Wr.to(device)
+ 
+-    return Lhr, Hr, Wr, SU, SV, scaleWH
++    return Lhr, Hr, Wr, SU, SV, scaleWH, left_state, right_state, left_fallback_reason, right_fallback_reason
+ 
+ 
+-def incoherence_process(hatWr, SU, SV, scaleWH, args):
++def incoherence_process(hatWr, SU, SV, scaleWH, args, left_state=None, right_state=None):
+     device = hatWr.device
++    rotation = str(getattr(args, "incoh_mode", "had") or "had").strip().lower()
++    preprocess = str(getattr(args, "quant_preprocess", "none") or "none").strip().lower()
+     # reverse hadamard transformation
+-    if args.incoh_mode == 'had':
+-        hatWr = (utils.matmul_hadU(
+-            (utils.matmul_hadU(hatWr) * SU.to(device)).T) * SV.to(device)).T
++    if rotation == 'had':
++        hatWr = (_hadU_or_block(
++            (_hadU_or_block(hatWr) * SU.to(device)).T) * SV.to(device)).T
+     # reverse kronecker product
+-    elif args.incoh_mode == 'kron':
++    elif rotation == 'kron':
+         hatWr = SV.T.to(device) @ hatWr @ SU.to(device)
++    elif is_structured_rotation(rotation):
++        hatWr = _apply_right_transform(hatWr, left_state)
++        hatWr = hatWr * SU.to(device).view(1, -1)
++        hatWr = _apply_left_transform(hatWr, right_state)
++        hatWr = SV.to(device).view(-1, 1) * hatWr
+     else:
+         raise NotImplementedError
+ 
+     # reverse rescale W,H
+-    if args.rescale_WH:
++    if bool(getattr(args, "rescale_WH", False)) or preprocess == "equil":
+         hatWr /= scaleWH[None, :].to(device)
+ 
+     assert torch.isfinite(hatWr).all()
+@@ -354,7 +495,7 @@ def LDLQ_buffered_lowmem(Wr, Hr, L, D, cb, args, buf_cols=128):
      return hatWr, Qidxs
  
  
@@ -74,12 +376,35 @@ index 7ceb211..166bc14 100644
      orig_device = H_orig.device
      W_orig_dtype = W_orig.dtype
      dtype_ = torch.float64 if args.use_fp64 else torch.float32
-@@ -441,6 +441,21 @@ def quantize(H_orig, W_orig, rank, codebook_orig, args, device='cpu'):
+@@ -381,7 +522,7 @@ def quantize(H_orig, W_orig, rank, codebook_orig, args, device='cpu'):
+         utils.clean()
+         return quantize(H_orig, W_orig, rank, codebook_orig, new_args, device)
+ 
+-    Lhr, Hr, Wr, SU, SV, scaleWH = incoh_out
++    Lhr, Hr, Wr, SU, SV, scaleWH, left_state, right_state, left_fallback_reason, right_fallback_reason = incoh_out
+     del incoh_out
+     utils.clean()
+ 
+@@ -391,11 +532,10 @@ def quantize(H_orig, W_orig, rank, codebook_orig, args, device='cpu'):
+     glog.info(f'max abs of Hr: {((Hr.abs().max()))}')
+     glog.info(f'min diag of Lhr: {Lhr.diag().min().item()}')
+ 
+-    Wo = Wr.clone()
+-
+     # remove low rank components before LDLQ
+     if args.lora_rank > 0:
+         Wr, Hr = low_rank_preprocess(Wr, Hr, Lhr, args)
++    Wo = Wr.clone()
+ 
+     # block LDL
+     block_LDL_out = utils.block_LDL(Hr, codebook.codesz)
+@@ -441,6 +581,24 @@ def quantize(H_orig, W_orig, rank, codebook_orig, args, device='cpu'):
                                       args,
                                       buf_cols=128)
  
 +    solver = str(getattr(args, 'solver', 'quip') or 'quip').strip().lower()
 +    mpq_stats = None
++    cd_snapshot_idxs = {}
 +    if solver == 'mpq':
 +        from mpq.adapters.quip_sharp import mpq_refine_codebook
 +
@@ -92,30 +417,360 @@ index 7ceb211..166bc14 100644
 +            args,
 +            module_name=module_name,
 +        )
++        if isinstance(mpq_stats, dict):
++            cd_snapshot_idxs = mpq_stats.pop('_cd_snapshot_idxs', {})
 +
      Wr = Wr.cpu()
      Hr = Hr.cpu()
      L = L.cpu()
-@@ -472,6 +487,8 @@ def quantize(H_orig, W_orig, rank, codebook_orig, args, device='cpu'):
+@@ -459,9 +617,21 @@ def quantize(H_orig, W_orig, rank, codebook_orig, args, device='cpu'):
+         A, B = None, None
+ 
+     # reverse incoherence process
+-    hatW = incoherence_process(hatWr, SU, SV, scaleWH, args)
++    hatW = incoherence_process(
++        hatWr,
++        SU,
++        SV,
++        scaleWH,
++        args,
++        left_state=left_state,
++        right_state=right_state,
++    )
+ 
+     Qidxs = codebook.maybe_pack_idxs(Qidxs)
++    packed_cd_snapshots = {
++        str(int(budget)): codebook.maybe_pack_idxs(snapshot_idxs)
++        for budget, snapshot_idxs in sorted(cd_snapshot_idxs.items())
++    }
+ 
+     attr = {
+         'Qidxs': Qidxs.to(orig_device),
+@@ -472,6 +642,24 @@ def quantize(H_orig, W_orig, rank, codebook_orig, args, device='cpu'):
              torch.float16).to(orig_device),  # fuse Wscale into SV
          'scaleWH': scaleWH,
      }
++    left_serialized = serialize_structured_state(left_state, width=n, device=orig_device)
++    right_serialized = serialize_structured_state(right_state, width=m, device=orig_device)
++    for key, value in left_serialized.items():
++        attr[f'left_{key}'] = value.to(orig_device)
++    for key, value in right_serialized.items():
++        attr[f'right_{key}'] = value.to(orig_device)
++    attr['rotation_family'] = str(getattr(args, 'incoh_mode', 'had') or 'had')
++    attr['left_rotation_family'] = str(left_state.rotation if left_state is not None else 'had')
++    attr['right_rotation_family'] = str(right_state.rotation if right_state is not None else 'had')
++    attr['left_rotation_fallback_reason'] = str(left_fallback_reason)
++    attr['right_rotation_fallback_reason'] = str(right_fallback_reason)
 +    if mpq_stats is not None:
 +        attr['mpq_stats'] = mpq_stats
++    if packed_cd_snapshots:
++        attr['cd_snapshots'] = packed_cd_snapshots
++        attr['cd_snapshot_budgets'] = sorted(
++            int(budget) for budget in packed_cd_snapshots
++        )
  
      utils.clean()
  
-@@ -496,7 +513,7 @@ def quantize_linear(weights, save_path, hessian_path, cb, args, device='cpu'):
+@@ -496,7 +684,30 @@ def quantize_linear(weights, save_path, hessian_path, cb, args, device='cpu'):
          weights[i].to(dtype_) / scales[i] for i in range(len(weights))
      ]).to(dtype_)
      H = utils.regularize_H(H, n, args.sigma_reg)
 -    hatW, attr = quantize(H, W, args.lora_rank, cb, args, device)
++    input_fingerprint = {
++        'protocol': 'paired_w_h_sha256_v1',
++        'w_sha256': hashlib.sha256(
++            W.detach().cpu().contiguous().numpy().tobytes(order='C')
++        ).hexdigest(),
++        'h_sha256': hashlib.sha256(
++            H.detach().cpu().contiguous().numpy().tobytes(order='C')
++        ).hexdigest(),
++        'w_shape': list(W.shape),
++        'h_shape': list(H.shape),
++        'basis': 'pre_incoherence',
++    }
 +    hatW, attr = quantize(H, W, args.lora_rank, cb, args, device, module_name=os.path.basename(save_path))
++    packed_cd_snapshots = attr.pop('cd_snapshots', {})
++    if packed_cd_snapshots:
++        snapshot_root = os.path.join(os.path.dirname(save_path), 'cd_snapshots')
++        for budget, snapshot_idxs in packed_cd_snapshots.items():
++            budget_dir = os.path.join(snapshot_root, f'cd{int(budget)}')
++            os.makedirs(budget_dir, exist_ok=True)
++            torch.save(
++                {'Qidxs': snapshot_idxs},
++                os.path.join(budget_dir, os.path.basename(save_path)),
++            )
++        attr['cd_snapshot_path_pattern'] = 'cd_snapshots/cd{budget}/' + os.path.basename(save_path)
      if len(scales) == 1:
          # fuse single scale into SV too
          attr['SV'] *= scales[0]
+@@ -505,7 +716,20 @@ def quantize_linear(weights, save_path, hessian_path, cb, args, device='cpu'):
+         'fused': len(shapes) > 1,
+         'shapes': shapes,
+         'scales': scales,
++        'input_fingerprint': input_fingerprint,
+     })
+-    torch.save(attr, save_path)
++    if bool(getattr(args, 'summary_only', False)):
++        torch.save(
++            {
++                'mpq_stats': attr.get('mpq_stats'),
++                'fused': attr['fused'],
++                'shapes': attr['shapes'],
++                'scales': attr['scales'],
++                'input_fingerprint': attr['input_fingerprint'],
++            },
++            save_path,
++        )
++    else:
++        torch.save(attr, save_path)
+     utils.show_metrics(hatW, W, H.to(dtype_), save_path)
+     utils.clean()
+diff --git a/lib/codebook/latticee8_padded12.py b/lib/codebook/latticee8_padded12.py
+index 874be0fba39b2b2d7d289248cefc71f5c536ed79..0303a44c97f8ee8787081f051d0b2ccc00db68ba 100644
+--- a/lib/codebook/latticee8_padded12.py
++++ b/lib/codebook/latticee8_padded12.py
+@@ -18,6 +18,22 @@ from torch import nn
+ 
+ from lib.utils.matmul_had import matmul_hadU_cuda, matmul_hadUt_cuda
+ 
++try:
++    from mpq.structured_ortho import (
++        apply_left_structured_ortho,
++        apply_right_structured_ortho,
++        apply_right_structured_ortho_t,
++        deserialize_structured_state,
++    )
++except ImportError:
++    def _not_available(*args, **kwargs):
++        raise ImportError("mpq.structured_ortho is required for structured rotation mode but not installed")
++    apply_left_structured_ortho = _not_available
++    apply_right_structured_ortho = _not_available
++    apply_right_structured_ortho_t = _not_available
++    def deserialize_structured_state(**kwargs):
++        return None  # Hadamard-only mode: no structured state
++
+ _E8P_CODESZ = 8
+ 
+ 
+@@ -239,15 +255,51 @@ class QuantizedE8P12Linear(nn.Module):
+ 
+     def cache_WH(self, n, m, Qidxs_list, had_left, had_right, K_left, K_right,
+                  **kwargs):
+-        self.W = matmul_hadU_cuda(
+-            matmul_hadU_cuda(
+-                quiptools_cuda.decompress_packed_e8p(
+-                    Qidxs_list[0].view(m // 16, n // 64, 8, 4),
+-                    self.codebook.grid_packed_abs).float() / self.scale,
+-                had_left, K_left).T,
+-            had_right,
+-            K_right,
+-        ).to(torch.float16)
++        left_state = deserialize_structured_state(
++            width=n,
++            rotation_code=kwargs.get("left_rotation_code", torch.tensor(0, device=Qidxs_list[0].device)),
++            block_size=kwargs.get("left_block_size", torch.tensor(0, device=Qidxs_list[0].device)),
++            depth=kwargs.get("left_depth", torch.tensor(0, device=Qidxs_list[0].device)),
++            householder_count=kwargs.get("left_householder_count", torch.tensor(0, device=Qidxs_list[0].device)),
++            stage_signs=kwargs.get("left_stage_signs", torch.zeros(4, n, device=Qidxs_list[0].device)),
++            stage_perms=kwargs.get("left_stage_perms", torch.zeros(3, n, dtype=torch.int64, device=Qidxs_list[0].device)),
++            stage_inv_perms=kwargs.get("left_stage_inv_perms", torch.zeros(3, n, dtype=torch.int64, device=Qidxs_list[0].device)),
++            householder=kwargs.get("left_householder", torch.zeros(1, n, device=Qidxs_list[0].device)),
++        )
++        right_state = deserialize_structured_state(
++            width=m,
++            rotation_code=kwargs.get("right_rotation_code", torch.tensor(0, device=Qidxs_list[0].device)),
++            block_size=kwargs.get("right_block_size", torch.tensor(0, device=Qidxs_list[0].device)),
++            depth=kwargs.get("right_depth", torch.tensor(0, device=Qidxs_list[0].device)),
++            householder_count=kwargs.get("right_householder_count", torch.tensor(0, device=Qidxs_list[0].device)),
++            stage_signs=kwargs.get("right_stage_signs", torch.zeros(4, m, device=Qidxs_list[0].device)),
++            stage_perms=kwargs.get("right_stage_perms", torch.zeros(3, m, dtype=torch.int64, device=Qidxs_list[0].device)),
++            stage_inv_perms=kwargs.get("right_stage_inv_perms", torch.zeros(3, m, dtype=torch.int64, device=Qidxs_list[0].device)),
++            householder=kwargs.get("right_householder", torch.zeros(1, m, device=Qidxs_list[0].device)),
++        )
++        W_decompressed = quiptools_cuda.decompress_packed_e8p(
++            Qidxs_list[0].view(m // 16, n // 64, 8, 4),
++            self.codebook.grid_packed_abs,
++        ).float() / self.scale
++        if left_state is None and right_state is None:
++            self.W = matmul_hadU_cuda(
++                matmul_hadU_cuda(
++                    W_decompressed,
++                    had_left, K_left).T,
++                had_right,
++                K_right,
++            ).to(torch.float16)
++            return
++        W_dense = W_decompressed
++        if left_state is not None:
++            W_dense = apply_right_structured_ortho(W_dense, left_state)
++        else:
++            W_dense = matmul_hadU_cuda(W_dense, had_left, K_left)
++        if right_state is not None:
++            W_dense = apply_left_structured_ortho(W_dense, right_state)
++            self.W = W_dense.T.to(torch.float16)
++        else:
++            self.W = matmul_hadU_cuda(W_dense.T.contiguous(), had_right, K_right).to(torch.float16)
+ 
+     def forward(self,
+                 input,
+@@ -266,6 +318,28 @@ class QuantizedE8P12Linear(nn.Module):
+                 train_mode=False,
+                 **kwargs):
+         n, m = len(SU), len(SV)
++        left_state = deserialize_structured_state(
++            width=n,
++            rotation_code=kwargs.get("left_rotation_code", torch.tensor(0, device=input.device)),
++            block_size=kwargs.get("left_block_size", torch.tensor(0, device=input.device)),
++            depth=kwargs.get("left_depth", torch.tensor(0, device=input.device)),
++            householder_count=kwargs.get("left_householder_count", torch.tensor(0, device=input.device)),
++            stage_signs=kwargs.get("left_stage_signs", torch.zeros(4, n, device=input.device)),
++            stage_perms=kwargs.get("left_stage_perms", torch.zeros(3, n, dtype=torch.int64, device=input.device)),
++            stage_inv_perms=kwargs.get("left_stage_inv_perms", torch.zeros(3, n, dtype=torch.int64, device=input.device)),
++            householder=kwargs.get("left_householder", torch.zeros(1, n, device=input.device)),
++        )
++        right_state = deserialize_structured_state(
++            width=m,
++            rotation_code=kwargs.get("right_rotation_code", torch.tensor(0, device=input.device)),
++            block_size=kwargs.get("right_block_size", torch.tensor(0, device=input.device)),
++            depth=kwargs.get("right_depth", torch.tensor(0, device=input.device)),
++            householder_count=kwargs.get("right_householder_count", torch.tensor(0, device=input.device)),
++            stage_signs=kwargs.get("right_stage_signs", torch.zeros(4, m, device=input.device)),
++            stage_perms=kwargs.get("right_stage_perms", torch.zeros(3, m, dtype=torch.int64, device=input.device)),
++            stage_inv_perms=kwargs.get("right_stage_inv_perms", torch.zeros(3, m, dtype=torch.int64, device=input.device)),
++            householder=kwargs.get("right_householder", torch.zeros(1, m, device=input.device)),
++        )
+         x = input.view(-1, n).to(torch.float32)
+         if rescale_WH:
+             x /= scaleWH
+@@ -274,8 +348,11 @@ class QuantizedE8P12Linear(nn.Module):
+         if train_mode:
+             x = (x.to(torch.float16) @ self.W).float()
+         else:
+-            x = matmul_hadU_cuda(x, had_left_T, K_left) / self.scale
+-                
++            if left_state is None:
++                x = matmul_hadU_cuda(x, had_left_T, K_left) / self.scale
++            else:
++                x = apply_right_structured_ortho_t(x, left_state) / self.scale
++
+             if x.size(0) == 1:
+                 x = torch.ops.quip_lib.decode_matvec_e8p(
+                     x[0].to(torch.float16),
+@@ -289,7 +366,10 @@ class QuantizedE8P12Linear(nn.Module):
+                     m, n)
+                 x = (x.to(torch.float16) @ W_decompressed.T).to(torch.float32)
+ 
+-            x = matmul_hadU_cuda(x, had_right, K_right)
++            if right_state is None:
++                x = matmul_hadU_cuda(x, had_right, K_right)
++            else:
++                x = apply_right_structured_ortho_t(x, right_state)
+ 
+         x = x * SV * self.scale
+ 
+diff --git a/lib/linear/quantized_linear.py b/lib/linear/quantized_linear.py
+index 9d0ba8992de438834f2744cd083ca0ff734c684a..101dfbf2054315b1fd3754e64b692cb23d296fb6 100644
+--- a/lib/linear/quantized_linear.py
++++ b/lib/linear/quantized_linear.py
+@@ -70,6 +70,22 @@ class QuantizedLinear(nn.Module):
+         self.register_buffer("SV", torch.ones(out_features,
+                                               dtype=torch.float16))
+         self.register_buffer("Wscale", torch.ones(()))
++        self.register_buffer("left_rotation_code", torch.zeros((), dtype=torch.int32))
++        self.register_buffer("left_block_size", torch.zeros((), dtype=torch.int32))
++        self.register_buffer("left_depth", torch.zeros((), dtype=torch.int32))
++        self.register_buffer("left_householder_count", torch.zeros((), dtype=torch.int32))
++        self.register_buffer("left_stage_signs", torch.zeros(4, in_features, dtype=torch.float16))
++        self.register_buffer("left_stage_perms", torch.zeros(3, in_features, dtype=torch.int64))
++        self.register_buffer("left_stage_inv_perms", torch.zeros(3, in_features, dtype=torch.int64))
++        self.register_buffer("left_householder", torch.zeros(1, in_features, dtype=torch.float16))
++        self.register_buffer("right_rotation_code", torch.zeros((), dtype=torch.int32))
++        self.register_buffer("right_block_size", torch.zeros((), dtype=torch.int32))
++        self.register_buffer("right_depth", torch.zeros((), dtype=torch.int32))
++        self.register_buffer("right_householder_count", torch.zeros((), dtype=torch.int32))
++        self.register_buffer("right_stage_signs", torch.zeros(4, out_features, dtype=torch.float16))
++        self.register_buffer("right_stage_perms", torch.zeros(3, out_features, dtype=torch.int64))
++        self.register_buffer("right_stage_inv_perms", torch.zeros(3, out_features, dtype=torch.int64))
++        self.register_buffer("right_householder", torch.zeros(1, out_features, dtype=torch.float16))
+ 
+         self.built_codebook_class = False
+         self.built_graph = False
+@@ -125,14 +141,33 @@ class QuantizedLinear(nn.Module):
+ 
+             # cache hadamard transformed manifested weights
+             if self.train_mode:
++                had_left = None
++                if self.had_left_T is not None:
++                    had_left = self.had_left_T.T.contiguous()
+                 self.codebook_class.cache_WH(
+                     len(self.SU),
+                     len(self.SV),
+                     self.Qidxs_list,
+-                    self.had_left_T.T.contiguous(),
++                    had_left,
+                     self.had_right,
+                     self.K_left,
+                     self.K_right,
++                    left_rotation_code=self.left_rotation_code,
++                    left_block_size=self.left_block_size,
++                    left_depth=self.left_depth,
++                    left_householder_count=self.left_householder_count,
++                    left_stage_signs=self.left_stage_signs,
++                    left_stage_perms=self.left_stage_perms,
++                    left_stage_inv_perms=self.left_stage_inv_perms,
++                    left_householder=self.left_householder,
++                    right_rotation_code=self.right_rotation_code,
++                    right_block_size=self.right_block_size,
++                    right_depth=self.right_depth,
++                    right_householder_count=self.right_householder_count,
++                    right_stage_signs=self.right_stage_signs,
++                    right_stage_perms=self.right_stage_perms,
++                    right_stage_inv_perms=self.right_stage_inv_perms,
++                    right_householder=self.right_householder,
+                     resid_scale_override=self.resid_scale_override,
+                 )
+                 del self.Qidxs_list, self.had_left_T, self.had_right, self.K_left, self.K_right
+@@ -154,6 +189,22 @@ class QuantizedLinear(nn.Module):
+             self.had_right,
+             self.K_left,
+             self.K_right,
++            left_rotation_code=self.left_rotation_code,
++            left_block_size=self.left_block_size,
++            left_depth=self.left_depth,
++            left_householder_count=self.left_householder_count,
++            left_stage_signs=self.left_stage_signs,
++            left_stage_perms=self.left_stage_perms,
++            left_stage_inv_perms=self.left_stage_inv_perms,
++            left_householder=self.left_householder,
++            right_rotation_code=self.right_rotation_code,
++            right_block_size=self.right_block_size,
++            right_depth=self.right_depth,
++            right_householder_count=self.right_householder_count,
++            right_stage_signs=self.right_stage_signs,
++            right_stage_perms=self.right_stage_perms,
++            right_stage_inv_perms=self.right_stage_inv_perms,
++            right_householder=self.right_householder,
+             rank=self.rank,
+             A=self.A,
+             B=self.B,
+diff --git a/lib/utils/__init__.py b/lib/utils/__init__.py
+index 1801f6c739bbc38b1de59fc7f725d61881d0f371..c2c8952dfd8409be2f5b4f88ec9c1932bef2af1d 100644
+--- a/lib/utils/__init__.py
++++ b/lib/utils/__init__.py
+@@ -1,7 +1,10 @@
+ from .data_utils import *
+ from .finetune import *
+ from .graph_wrapper import *
+-from .lm_eval_adaptor import *
++try:
++    from .lm_eval_adaptor import *
++except (ImportError, ModuleNotFoundError):
++    pass
+ from .math_utils import *
+ from .matmul_had import *
+ from .matmul_kron import *
 diff --git a/lib/utils/data_utils.py b/lib/utils/data_utils.py
-index 02d1395..ebdfe30 100644
+index 02d13950e7abd364472a95d9cec6d1da25f754f7..6bec80a432601e7ae7d6d765abfa39282450c03b 100644
 --- a/lib/utils/data_utils.py
 +++ b/lib/utils/data_utils.py
 @@ -1,4 +1,5 @@
@@ -124,7 +779,19 @@ index 02d1395..ebdfe30 100644
  
  import glog
  import torch
-@@ -55,6 +56,67 @@ def wrap_tokenizer(tokenizer, x, ctx_size):
+@@ -6,6 +7,11 @@ from datasets import load_dataset
+ from torch.utils.data import DataLoader, Dataset
+ 
+ from lib import codebook
++try:
++    from mpq.structured_ortho import deserialize_structured_state
++except ImportError:
++    def deserialize_structured_state(**kwargs):
++        return None
+ 
+ from .matmul_had import matmul_hadU
+ 
+@@ -55,6 +61,67 @@ def wrap_tokenizer(tokenizer, x, ctx_size):
                       max_length=ctx_size)
  
  
@@ -192,7 +859,95 @@ index 02d1395..ebdfe30 100644
  def sample_rp1t(tokenizer, size=128, ctx_size=2048, nproc=1):
      dataset = load_dataset('togethercomputer/RedPajama-Data-1T-Sample',
                             split='train')
-@@ -201,14 +263,16 @@ class SimpleDataset(Dataset):
+@@ -121,12 +188,14 @@ def sample_falcon_refinedweb(tokenizer, size=128, ctx_size=2048, nproc=1):
+ 
+ 
+ def load_quip(save_name, cb, args, device, return_scales=False):
++    from lib.algo import quip
++
+     glog.info(f"loading cached compressed layer from path \"{save_name}\"")
+     dict_loaded = torch.load(save_name,
+                              map_location=torch.device('cuda', device))
+     SU = dict_loaded['SU'].to(device)
+     SV = dict_loaded['SV'].to(device)
+-    Wscale = dict_loaded['Wscale'].to(device)
++    Wscale = dict_loaded.get('Wscale', torch.ones((), dtype=torch.float32)).to(device)
+     Qidxs = dict_loaded['Qidxs'].to(device)
+     n, m = len(SU), len(SV)
+     hatWr = cb.to(device).by_idxs(Qidxs, packed=(cb.packsz != 1)).view(m, n)
+@@ -137,15 +206,38 @@ def load_quip(save_name, cb, args, device, return_scales=False):
+         B = dict_loaded['B'].to(device)
+         hatWr = hatWr + A @ B
+         del A, B
+-    if args.incoh_mode == "had":
+-        hatW = (matmul_hadU((matmul_hadU(hatWr) * SU).T) * SV).T
+-    elif args.incoh_mode == "kron":
+-        hatW = SV.T @ hatWr @ SU
+-    else:
+-        raise NotImplementedError
++    left_state = deserialize_structured_state(
++        width=n,
++        rotation_code=dict_loaded.get("left_rotation_code", torch.tensor(0)),
++        block_size=dict_loaded.get("left_block_size", torch.tensor(0)),
++        depth=dict_loaded.get("left_depth", torch.tensor(0)),
++        householder_count=dict_loaded.get("left_householder_count", torch.tensor(0)),
++        stage_signs=dict_loaded.get("left_stage_signs", torch.zeros(4, n)),
++        stage_perms=dict_loaded.get("left_stage_perms", torch.zeros(3, n, dtype=torch.int64)),
++        stage_inv_perms=dict_loaded.get("left_stage_inv_perms", torch.zeros(3, n, dtype=torch.int64)),
++        householder=dict_loaded.get("left_householder", torch.zeros(1, n)),
++    )
++    right_state = deserialize_structured_state(
++        width=m,
++        rotation_code=dict_loaded.get("right_rotation_code", torch.tensor(0)),
++        block_size=dict_loaded.get("right_block_size", torch.tensor(0)),
++        depth=dict_loaded.get("right_depth", torch.tensor(0)),
++        householder_count=dict_loaded.get("right_householder_count", torch.tensor(0)),
++        stage_signs=dict_loaded.get("right_stage_signs", torch.zeros(4, m)),
++        stage_perms=dict_loaded.get("right_stage_perms", torch.zeros(3, m, dtype=torch.int64)),
++        stage_inv_perms=dict_loaded.get("right_stage_inv_perms", torch.zeros(3, m, dtype=torch.int64)),
++        householder=dict_loaded.get("right_householder", torch.zeros(1, m)),
++    )
++    hatW = quip.incoherence_process(
++        hatWr,
++        SU,
++        SV,
++        dict_loaded.get("scaleWH"),
++        args,
++        left_state=left_state,
++        right_state=right_state,
++    )
+     del SU, SV
+-    if args.rescale_WH:
+-        hatW = hatW / dict_loaded['scaleWH'][None, :].to(device)
+ 
+     if return_scales:
+         scale_dict = {}
+@@ -171,6 +263,24 @@ def unpack_quip(module, saved_layer, codebook_id, codesz):
+         module.B.copy_(saved_layer['B'])
+     module.SU.copy_(saved_layer['SU'])
+     module.SV.copy_(saved_layer['SV'])
++    if 'left_rotation_code' in saved_layer:
++        module.left_rotation_code.copy_(saved_layer['left_rotation_code'].to(module.left_rotation_code))
++        module.left_block_size.copy_(saved_layer['left_block_size'].to(module.left_block_size))
++        module.left_depth.copy_(saved_layer['left_depth'].to(module.left_depth))
++        module.left_householder_count.copy_(saved_layer['left_householder_count'].to(module.left_householder_count))
++        module.left_stage_signs.copy_(saved_layer['left_stage_signs'].to(module.left_stage_signs))
++        module.left_stage_perms.copy_(saved_layer['left_stage_perms'].to(module.left_stage_perms))
++        module.left_stage_inv_perms.copy_(saved_layer['left_stage_inv_perms'].to(module.left_stage_inv_perms))
++        module.left_householder.copy_(saved_layer['left_householder'].to(module.left_householder))
++    if 'right_rotation_code' in saved_layer:
++        module.right_rotation_code.copy_(saved_layer['right_rotation_code'].to(module.right_rotation_code))
++        module.right_block_size.copy_(saved_layer['right_block_size'].to(module.right_block_size))
++        module.right_depth.copy_(saved_layer['right_depth'].to(module.right_depth))
++        module.right_householder_count.copy_(saved_layer['right_householder_count'].to(module.right_householder_count))
++        module.right_stage_signs.copy_(saved_layer['right_stage_signs'].to(module.right_stage_signs))
++        module.right_stage_perms.copy_(saved_layer['right_stage_perms'].to(module.right_stage_perms))
++        module.right_stage_inv_perms.copy_(saved_layer['right_stage_inv_perms'].to(module.right_stage_inv_perms))
++        module.right_householder.copy_(saved_layer['right_householder'].to(module.right_householder))
+     if module.rescale_WH:
+         module.scaleWH.copy_(saved_layer['scaleWH'])
+ 
+@@ -201,14 +311,16 @@ class SimpleDataset(Dataset):
  
  
  def split_data(X, Y, args):
@@ -211,24 +966,8 @@ index 02d1395..ebdfe30 100644
      valid_dl = DataLoader(valid_ds,
                            batch_size=args.ft_bs,
                            pin_memory=True,
-diff --git a/lib/utils/__init__.py b/lib/utils/__init__.py
-index 1801f6c..c2c8952 100644
---- a/lib/utils/__init__.py
-+++ b/lib/utils/__init__.py
-@@ -1,7 +1,10 @@
- from .data_utils import *
- from .finetune import *
- from .graph_wrapper import *
--from .lm_eval_adaptor import *
-+try:
-+    from .lm_eval_adaptor import *
-+except (ImportError, ModuleNotFoundError):
-+    pass
- from .math_utils import *
- from .matmul_had import *
- from .matmul_kron import *
 diff --git a/lib/utils/gptq_data_utils.py b/lib/utils/gptq_data_utils.py
-index 3e5b5ef..063a353 100644
+index 3e5b5ef470569c10db3256e1d6accae61f9dde78..063a353f241da4ba72e2b70379c39d78d0e5f09f 100644
 --- a/lib/utils/gptq_data_utils.py
 +++ b/lib/utils/gptq_data_utils.py
 @@ -82,7 +82,8 @@ def get_c4(nsamples, seed, seqlen, model):
@@ -262,10 +1001,10 @@ index 3e5b5ef..063a353 100644
          inp = trainenc.input_ids[:, i:j]
          tar = inp.clone()
 diff --git a/lib/utils/matmul_had.py b/lib/utils/matmul_had.py
-index 9915d0f..4697873 100644
+index 9915d0f5d4397c22a849eea32be3fe0acbff66c6..495246324be3ad21ea49fba742dccefc54fe9a13 100644
 --- a/lib/utils/matmul_had.py
 +++ b/lib/utils/matmul_had.py
-@@ -1,8 +1,20 @@
+@@ -1,62 +1,78 @@
 -import fast_hadamard_transform
 +import os
 +import sys
@@ -287,17 +1026,108 @@ index 9915d0f..4697873 100644
  
  def get_hadK(n, transpose=False):
      hadK, K = None, None
-@@ -30,6 +42,9 @@ def get_hadK(n, transpose=False):
-         assert (is_pow2(n // 108))
+-    if n % 172 == 0:  # llama-2-7b up
+-        assert (is_pow2(n // 172))
++    if n % 172 == 0 and is_pow2(n // 172):  # llama-2-7b up
+         K = 172
+         hadK = get_had172().T if transpose else get_had172()
+-    elif n % 156 == 0:  # llama-1-30b 3x hidden
+-        assert (is_pow2(n // 156))
++    elif n % 156 == 0 and is_pow2(n // 156):  # llama-1-30b 3x hidden
+         K = 156
+         hadK = get_had156().T if transpose else get_had156()
+-    elif n % 140 == 0:  # llama-1-30b intermediate
+-        assert (is_pow2(n // 140))
++    elif n % 140 == 0 and is_pow2(n // 140):  # llama-1-30b intermediate
+         K = 140
+         hadK = get_had140().T if transpose else get_had140()
+-    elif n % 124 == 0:  # falcon 180b
+-        assert (is_pow2(n // 124))
++    elif n % 124 == 0 and is_pow2(n // 124):  # falcon 180b
+         K = 124
+         hadK = get_had124().T if transpose else get_had124()
+-    elif n % 116 == 0:  # falcon 180b
+-        assert (is_pow2(n // 116))
++    elif n % 116 == 0 and is_pow2(n // 116):  # falcon 180b
+         K = 116
+         hadK = get_had116().T if transpose else get_had116()
+-    elif n % 108 == 0:  # llama-1-13b intermediate
+-        assert (is_pow2(n // 108))
++    elif n % 108 == 0 and is_pow2(n // 108):  # llama-1-13b intermediate
          K = 108
          hadK = get_had108().T if transpose else get_had108()
+-    elif n % 60 == 0:  # llama-1-13b 3x hidden
+-        assert (is_pow2(n // 60))
 +    elif n % 76 == 0 and is_pow2(n // 76):  # qwen3-4b intermediate / fused up
 +        K = 76
 +        hadK = get_had76().T if transpose else get_had76()
-     elif n % 60 == 0:  # llama-1-13b 3x hidden
-         assert (is_pow2(n // 60))
++    elif n % 60 == 0 and is_pow2(n // 60):  # llama-1-13b 3x hidden
          K = 60
-@@ -95,7 +110,62 @@ def hadamard_abstract(x: torch.Tensor, scale: float) -> torch.Tensor:
+         hadK = get_had60().T if transpose else get_had60()
+-    elif n % 52 == 0:  # llama-1-13b 1x hidden
+-        assert (is_pow2(n // 52))
++    elif n % 52 == 0 and is_pow2(n // 52):  # llama-1-13b 1x hidden
+         K = 52
+         hadK = get_had52().T if transpose else get_had52()
+-    elif n % 36 == 0:
+-        assert (is_pow2(n // 36))
++    elif n % 36 == 0 and is_pow2(n // 36):
+         K = 36
+         hadK = get_had36().T if transpose else get_had36()
+-    elif n % 28 == 0:
+-        assert (is_pow2(n // 28))
++    elif n % 28 == 0 and is_pow2(n // 28):
+         K = 28
+         hadK = get_had28().T if transpose else get_had28()
+-    elif n % 20 == 0:
+-        assert (is_pow2(n // 20))
++    elif n % 20 == 0 and is_pow2(n // 20):
+         K = 20
+         hadK = get_had20().T if transpose else get_had20()
+-    elif n % 12 == 0:
+-        assert (is_pow2(n // 12))
++    elif n % 12 == 0 and is_pow2(n // 12):
+         K = 12
+         hadK = get_had12().T if transpose else get_had12()
+-    else:
+-        assert (is_pow2(n))
++    elif is_pow2(n):
+         K = 1
++    else:
++        had_dim = int(n & -n)
++        if had_dim >= 2:
++            K = -had_dim
++            _warn_hadamard_fallback(
++                n,
++                f"[quip-sharp] hadamard fallback: width={n} -> block hadamard (had_dim={had_dim})",
++            )
++        else:
++            K = 0
++            _warn_hadamard_fallback(
++                n,
++                f"[quip-sharp] hadamard fallback: width={n} unsupported; using identity",
++            )
+ 
+     return hadK, K
+ 
+@@ -64,6 +80,16 @@ def get_hadK(n, transpose=False):
+ def matmul_hadU(X, transpose=False):
+     n = X.shape[-1]
+     hadK, K = get_hadK(n, transpose)
++    if K == 0:
++        return X
++    if K < 0:
++        had_dim = int(-K)
++        blocks = n // had_dim
++        shape = X.shape
++        return torch.ops.quip_lib.hadamard(
++            X.contiguous().view(-1, blocks, had_dim),
++            1 / (had_dim**0.5),
++        ).view(shape)
+     input = X.clone().view(-1, n, 1)
+     output = input.clone()
+     while input.shape[1] > K:
+@@ -95,11 +121,75 @@ def hadamard_abstract(x: torch.Tensor, scale: float) -> torch.Tensor:
  
  @torch.library.impl("quip_lib::hadamard", "default")
  def hadamard(x: torch.Tensor, scale: float) -> torch.Tensor:
@@ -361,8 +1191,39 @@ index 9915d0f..4697873 100644
  
  
  def matmul_hadU_cuda(X, hadK, K, transpose=False):
+     n = X.shape[-1]
++    if K == 0:
++        return X
++    if K < 0:
++        had_dim = int(-K)
++        blocks = n // had_dim
++        shape = X.shape
++        input = X.float().reshape(-1, blocks, had_dim)
++        input = torch.ops.quip_lib.hadamard(input.contiguous(), 1 / (had_dim**0.5))
++        return input.to(X.device).to(X.dtype).reshape(shape)
+     if K == 1:
+         return torch.ops.quip_lib.hadamard(X.contiguous(), 1/(n**0.5))
+ 
+@@ -118,6 +208,17 @@ def is_pow2(n):
+     return (n & (n - 1) == 0) and (n > 0)
+ 
+ 
++_warned_hadamard_fallback_widths = set()
++
++
++def _warn_hadamard_fallback(width: int, msg: str) -> None:
++    width = int(width)
++    if width in _warned_hadamard_fallback_widths:
++        return
++    print(str(msg), flush=True)
++    _warned_hadamard_fallback_widths.add(width)
++
++
+ # hadamard matrices for had12, had36.pal2, had52,will,
+ # # had60.pal, had108.pal, had140.pal, had156.will, had172.will:
+ # http://www.neilsloane.com/hadamard/index.html
 diff --git a/lib/utils/unsafe_import.py b/lib/utils/unsafe_import.py
-index 0b9b3ac..1f88a43 100644
+index 0b9b3ac2451af31b958f413cf196d5b89f359721..1f88a43be4fd003a53cec89d95cadd103410efe5 100644
 --- a/lib/utils/unsafe_import.py
 +++ b/lib/utils/unsafe_import.py
 @@ -27,6 +27,8 @@ def model_from_hf_path(path,
@@ -375,10 +1236,18 @@ index 0b9b3ac..1f88a43 100644
          else:
              raise Exception
 diff --git a/model/llama.py b/model/llama.py
-index 4007a8f..f4ecf4d 100644
+index 4007a8f4068a7e043dc90c44e84d3fbc4e9f026b..5cf6441941561c3f5743fd1a228c9753587d0119 100644
 --- a/model/llama.py
 +++ b/model/llama.py
-@@ -178,6 +178,33 @@ class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
+@@ -38,6 +38,7 @@ from transformers.modeling_outputs import (
+     QuestionAnsweringModelOutput,
+     SequenceClassifierOutputWithPast,
+ )
++from transformers.generation import GenerationMixin
+ from transformers.modeling_utils import PreTrainedModel
+ from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
+ from transformers.utils import (
+@@ -178,6 +179,33 @@ class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
          return cos, sin
  
  
@@ -412,7 +1281,7 @@ index 4007a8f..f4ecf4d 100644
  def rotate_half(x):
      """Rotates half the hidden dims of the input."""
      x1 = x[..., : x.shape[-1] // 2]
-@@ -342,7 +369,9 @@ class LlamaAttention(nn.Module):
+@@ -342,7 +370,9 @@ class LlamaAttention(nn.Module):
                  base=self.rope_theta,
              )
          else:
@@ -423,7 +1292,7 @@ index 4007a8f..f4ecf4d 100644
              scaling_factor = self.config.rope_scaling["factor"]
              if scaling_type == "linear":
                  self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
-@@ -358,6 +387,13 @@ class LlamaAttention(nn.Module):
+@@ -358,6 +388,13 @@ class LlamaAttention(nn.Module):
                      scaling_factor=scaling_factor,
                      base=self.rope_theta,
                  )
@@ -437,8 +1306,222 @@ index 4007a8f..f4ecf4d 100644
              else:
                  raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
  
+@@ -1002,9 +1039,19 @@ class LlamaModel(LlamaPreTrainedModel):
+ 
+         past_seen_tokens = 0
+         if use_cache:  # kept for BC (cache positions)
+-            if not isinstance(past_key_values, StaticCache):
++            if isinstance(past_key_values, Cache):
++                pass  # already in Cache form
++            elif past_key_values is None or (
++                hasattr(past_key_values, "__iter__")
++                and all(
++                    (kv is None) or (isinstance(kv, (tuple, list)) and (len(kv) == 0 or kv[0] is None))
++                    for kv in past_key_values
++                )
++            ):
++                past_key_values = DynamicCache()
++            else:
+                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+-                past_seen_tokens = past_key_values.get_seq_length()
++            past_seen_tokens = past_key_values.get_seq_length()
+ 
+         if cache_position is None:
+             if isinstance(past_key_values, StaticCache):
+@@ -1154,7 +1201,7 @@ class LlamaModel(LlamaPreTrainedModel):
+         return causal_mask
+ 
+ 
+-class LlamaForCausalLM(LlamaPreTrainedModel):
++class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
+     _tied_weights_keys = ["lm_head.weight"]
+ 
+     def __init__(self, config):
+@@ -1282,84 +1329,15 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
+     def prepare_inputs_for_generation(
+         self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, cache_position=None, **kwargs
+     ):
+-        # With static cache, the `past_key_values` is None
+-        # TODO joao: standardize interface for the different Cache classes and remove of this if
+-        has_static_cache = False
+-        if past_key_values is None:
+-            past_key_values = getattr(getattr(self.model.layers[0], "self_attn", {}), "past_key_value", None)
+-            has_static_cache = past_key_values is not None
+-
+-        past_length = 0
+-        if past_key_values is not None:
+-            if isinstance(past_key_values, Cache):
+-                past_length = cache_position[0] if cache_position is not None else past_key_values.get_seq_length()
+-                max_cache_length = (
+-                    torch.tensor(past_key_values.get_max_length(), device=input_ids.device)
+-                    if past_key_values.get_max_length() is not None
+-                    else None
+-                )
+-                cache_length = past_length if max_cache_length is None else torch.min(max_cache_length, past_length)
+-            # TODO joao: remove this `else` after `generate` prioritizes `Cache` objects
+-            else:
+-                cache_length = past_length = past_key_values[0][0].shape[2]
+-                max_cache_length = None
+-
+-            # Keep only the unprocessed tokens:
+-            # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
+-            # some of the inputs are exclusively passed as part of the cache (e.g. when passing input_embeds as
+-            # input)
+-            if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
+-                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
+-            # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
+-            # input_ids based on the past_length.
+-            elif past_length < input_ids.shape[1]:
+-                input_ids = input_ids[:, past_length:]
+-            # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
+-
+-            # If we are about to go beyond the maximum cache length, we need to crop the input attention mask.
+-            if (
+-                max_cache_length is not None
+-                and attention_mask is not None
+-                and cache_length + input_ids.shape[1] > max_cache_length
+-            ):
+-                attention_mask = attention_mask[:, -max_cache_length:]
+-
+-        position_ids = kwargs.get("position_ids", None)
+-        if attention_mask is not None and position_ids is None:
+-            # create position_ids on the fly for batch generation
+-            position_ids = attention_mask.long().cumsum(-1) - 1
+-            position_ids.masked_fill_(attention_mask == 0, 1)
+-            if past_key_values:
+-                position_ids = position_ids[:, -input_ids.shape[1] :]
+-
+-        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+-        if inputs_embeds is not None and past_key_values is None:
+-            model_inputs = {"inputs_embeds": inputs_embeds}
+-        else:
+-            # The `contiguous()` here is necessary to have a static stride during decoding. torchdynamo otherwise
+-            # recompiles graphs as the stride of the inputs is a guard. Ref: https://github.com/huggingface/transformers/pull/29114
+-            # TODO: use `next_tokens` directly instead.
+-            model_inputs = {"input_ids": input_ids.contiguous()}
+-
+-        input_length = position_ids.shape[-1] if position_ids is not None else input_ids.shape[-1]
+-        if cache_position is None:
+-            cache_position = torch.arange(past_length, past_length + input_length, device=input_ids.device)
+-        else:
+-            cache_position = cache_position[-input_length:]
+-
+-        if has_static_cache:
+-            past_key_values = None
+-
+-        model_inputs.update(
+-            {
+-                "position_ids": position_ids,
+-                "cache_position": cache_position,
+-                "past_key_values": past_key_values,
+-                "use_cache": kwargs.get("use_cache"),
+-                "attention_mask": attention_mask,
+-            }
++        return GenerationMixin.prepare_inputs_for_generation(
++            self,
++            input_ids=input_ids,
++            past_key_values=past_key_values,
++            attention_mask=attention_mask,
++            inputs_embeds=inputs_embeds,
++            cache_position=cache_position,
++            **kwargs,
+         )
+-        return model_inputs
+ 
+     @staticmethod
+     def _reorder_cache(past_key_values, beam_idx):
+diff --git a/model/mistral.py b/model/mistral.py
+index b478b1bde26ddadfa62ddd9dc2df6f2a1fb0aae5..553fe14d21157a264c560f854634d0bdee37f7c1 100644
+--- a/model/mistral.py
++++ b/model/mistral.py
+@@ -36,6 +36,7 @@ from transformers.modeling_attn_mask_utils import (
+ from transformers.modeling_outputs import (BaseModelOutputWithPast,
+                                            CausalLMOutputWithPast,
+                                            SequenceClassifierOutputWithPast)
++from transformers.generation import GenerationMixin
+ from transformers.modeling_utils import PreTrainedModel
+ from transformers.models.mistral.configuration_mistral import MistralConfig
+ from transformers.utils import (add_start_docstrings,
+@@ -1235,7 +1236,7 @@ class MistralModel(MistralPreTrainedModel):
+         )
+ 
+ 
+-class MistralForCausalLM(MistralPreTrainedModel):
++class MistralForCausalLM(MistralPreTrainedModel, GenerationMixin):
+     _tied_weights_keys = ["lm_head.weight"]
+ 
+     def __init__(self, config):
+@@ -1362,56 +1363,19 @@ class MistralForCausalLM(MistralPreTrainedModel):
+                                       past_key_values=None,
+                                       attention_mask=None,
+                                       inputs_embeds=None,
++                                      cache_position=None,
+                                       **kwargs):
+-        # Omit tokens covered by past_key_values
+-        if past_key_values is not None:
+-            if isinstance(past_key_values, Cache):
+-                cache_length = past_key_values.get_seq_length()
+-                past_length = past_key_values.seen_tokens
+-                max_cache_length = past_key_values.get_max_length()
+-            else:
+-                cache_length = past_length = past_key_values[0][0].shape[2]
+-                max_cache_length = None
+-
+-            # Keep only the unprocessed tokens:
+-            # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
+-            # some of the inputs are exclusively passed as part of the cache (e.g. when passing input_embeds as
+-            # input)
+-            if attention_mask is not None and attention_mask.shape[
+-                    1] > input_ids.shape[1]:
+-                input_ids = input_ids[:, -(attention_mask.shape[1] -
+-                                           past_length):]
+-            # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
+-            # input_ids based on the past_length.
+-            elif past_length < input_ids.shape[1]:
+-                input_ids = input_ids[:, past_length:]
+-            # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
+-
+-            # If we are about to go beyond the maximum cache length, we need to crop the input attention mask.
+-            if (max_cache_length is not None and attention_mask is not None
+-                    and cache_length + input_ids.shape[1] > max_cache_length):
+-                attention_mask = attention_mask[:, -max_cache_length:]
+-
+-        position_ids = kwargs.get("position_ids", None)
+-        if attention_mask is not None and position_ids is None:
+-            # create position_ids on the fly for batch generation
+-            position_ids = attention_mask.long().cumsum(-1) - 1
+-            position_ids.masked_fill_(attention_mask == 0, 1)
+-            if past_key_values:
+-                position_ids = position_ids[:, -input_ids.shape[1]:]
+-
+-        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+-        if inputs_embeds is not None and past_key_values is None:
+-            model_inputs = {"inputs_embeds": inputs_embeds}
+-        else:
+-            model_inputs = {"input_ids": input_ids}
+-
+-        model_inputs.update({
+-            "position_ids": position_ids,
+-            "past_key_values": past_key_values,
+-            "use_cache": kwargs.get("use_cache"),
+-            "attention_mask": attention_mask,
+-        })
++        model_inputs = GenerationMixin.prepare_inputs_for_generation(
++            self,
++            input_ids=input_ids,
++            past_key_values=past_key_values,
++            attention_mask=attention_mask,
++            inputs_embeds=inputs_embeds,
++            cache_position=cache_position,
++            **kwargs,
++        )
++        # This older Mistral forward path uses DynamicCache positions internally.
++        model_inputs.pop("cache_position", None)
+         return model_inputs
+ 
+     @staticmethod
 diff --git a/quantize_llama/hessian_offline_llama.py b/quantize_llama/hessian_offline_llama.py
-index 24cdf79..259a47f 100644
+index 24cdf7913919c577b92a9d326fd052c6e75efb10..259a47f03325d284f0c7119cbd69571b7892a941 100644
 --- a/quantize_llama/hessian_offline_llama.py
 +++ b/quantize_llama/hessian_offline_llama.py
 @@ -33,6 +33,8 @@ parser.add_argument('--async_copy_speed', default=-1, type=int)
@@ -728,7 +1811,7 @@ index 24cdf79..259a47f 100644
      args = parser.parse_args()
      torch.manual_seed(args.seed)
 diff --git a/quantize_llama/hfize_llama.py b/quantize_llama/hfize_llama.py
-index 3aa5e03..8719073 100644
+index 3aa5e03c11590e7d0dac3715de0db6b3f368d5ca..87190734440585c53725b36e61764e05ad39c58f 100644
 --- a/quantize_llama/hfize_llama.py
 +++ b/quantize_llama/hfize_llama.py
 @@ -20,7 +20,9 @@ parser.add_argument('--hf_output_path', type=str)
@@ -810,7 +1893,7 @@ index 3aa5e03..8719073 100644
  
      start = time.time()
 diff --git a/quantize_llama/quantize_finetune_llama.py b/quantize_llama/quantize_finetune_llama.py
-index af33222..45253ec 100644
+index af3322240ab177980f8a12a11412ea348571cf65..fb8e3560b3aa794449c49d72672e78c065190925 100644
 --- a/quantize_llama/quantize_finetune_llama.py
 +++ b/quantize_llama/quantize_finetune_llama.py
 @@ -23,6 +23,8 @@ parser.add_argument('--num_cpu_threads', default=8, type=int)
@@ -822,7 +1905,16 @@ index af33222..45253ec 100644
  parser.add_argument('--save_path', type=str)
  parser.add_argument('--hessian_path', type=str)
  parser.add_argument('--base_model', type=str)
-@@ -57,6 +59,45 @@ parser.add_argument('--ft_early_stop', default=3, type=int)
+@@ -31,7 +33,7 @@ parser.add_argument('--sigma_reg2', default=1e-2, type=float)
+ parser.add_argument('--incoh_mode',
+                     default='had',
+                     type=str,
+-                    choices=['had', 'kron'])
++                    choices=['had', 'kron', 'ibh128x2', 'ibh512x2', 'ibh512x3', 'ibh512x2_hh1'])
+ parser.add_argument('--lora_rank',
+                     default=0,
+                     type=int,
+@@ -57,6 +59,47 @@ parser.add_argument('--ft_early_stop', default=3, type=int)
  parser.add_argument('--ft_train_mode', action='store_true')
  parser.add_argument('--ft_grad_ckpt', action='store_true')
  
@@ -836,7 +1928,7 @@ index af33222..45253ec 100644
 +)
 +
 +# MPQ hyperparameters (used when --solver=mpq)
-+parser.add_argument('--mpq_init', default='random', type=str, choices=['random', 'rtn', 'ldlq'])
++parser.add_argument('--mpq_init', default='float', type=str, choices=['float', 'random', 'rtn', 'ldlq'])
 +parser.add_argument('--mpq_iters', default=4, type=int)
 +parser.add_argument('--mpq_damping', default=0.5, type=float)
 +parser.add_argument('--mpq_prior_tau', default=0.0, type=float)
@@ -858,17 +1950,51 @@ index af33222..45253ec 100644
 +parser.add_argument('--mpq_polish_metric', default='gram', type=str, choices=['gram', 'isotropic', 'diag'])
 +parser.add_argument('--mpq_polish_max_blocks', default=0, type=int)
 +parser.add_argument('--mpq_metric_rows_per_chunk', default=0, type=int)
++parser.add_argument('--mpq_snapshot_budgets', default='', type=str)
 +parser.add_argument('--mpq-method',
 +                    dest='mpq_method',
 +                    default='vamp',
 +                    type=str,
 +                    choices=['vamp', 'vamp-topk-polish'])
 +parser.add_argument('--mpq-topk-k', dest='mpq_topk_k', default=16, type=int)
++parser.add_argument('--stop-after-layer', default=None, type=int)
 +
  
  def check_exist(idx, args):
      suffix = ['qkv', 'o', 'up', 'down', 'layernorm']
-@@ -155,8 +196,15 @@ def main(args):
+@@ -72,6 +115,11 @@ def quantize_llama_layer(layer, idx, cb, args, device, pre_orig_emb, orig_emb,
+     if check_exist(idx, args):
+         return
+ 
++    # Spawned workers default to CUDA device 0 even when their tensors are
++    # placed on another visible GPU. Triton launches against the current
++    # device, so select the assigned device before constructing CUDA tensors.
++    torch.cuda.set_device(device)
++
+     mixed_layer = LlamaDecoderLayer(model_config, idx).cpu()
+     with torch.no_grad():
+         weights = [
+@@ -138,15 +186,18 @@ def main(args):
+ 
+     # save configs
+     all_config = {'quant_args': args, 'model_config': model.config}
++    use_equil = bool(args.rescale_WH) or str(getattr(args, 'quant_preprocess', 'none') or 'none').strip().lower() == 'equil'
+     quip_params = {
+         'lora_rank': args.lora_rank,
+-        'rescale_WH': args.rescale_WH,
++        'rescale_WH': use_equil,
+         'codebook': args.codebook,
+         'codebook_version': cb.version,
+         'codesz': cb.codesz,
+         'idx_dtype': str(cb.idx_dtype),
+         'packsz': cb.packsz,
+         'resid_scale_override': args.resid_scale_override,
++        'rotation_family': str(getattr(args, 'quant_rotation', getattr(args, 'incoh_mode', 'had'))),
++        'preprocess': str(getattr(args, 'quant_preprocess', 'none')),
+     }
+     all_config['model_config'].update({'quip_params': quip_params})
+     torch.save(all_config, os.path.join(args.save_path, 'config.pt'))
+@@ -155,8 +206,15 @@ def main(args):
      tokenizer.pad_token = tokenizer.eos_token
      glog.info('loaded model')
  
@@ -886,7 +2012,21 @@ index af33222..45253ec 100644
      glog.info('loaded dataset and devset')
  
      nproc = torch.cuda.device_count()
-@@ -190,16 +238,23 @@ def main(args):
+@@ -175,7 +233,13 @@ def main(args):
+ 
+     cur_device = 0
+     proc_list = [None for _ in range(nproc)]
++    stop_after_layer = None if args.stop_after_layer is None else int(args.stop_after_layer)
+     for i in range(len(model.model.layers)):
++        if stop_after_layer is not None and i > stop_after_layer:
++            break
++        if args.ft_epochs <= 0 and check_exist(i, args):
++            glog.info(f'skipping complete layer {i}')
++            continue
+         glog.info(f'layer {i} gpu {cur_device}')
+         if proc_list[cur_device] is not None:
+             proc_list[cur_device].join()
+@@ -190,16 +254,23 @@ def main(args):
              position_ids = position_ids.to(cur_device)
              attention_mask = attention_mask.to(cur_device)
              model.model.layers[i].to(cur_device)

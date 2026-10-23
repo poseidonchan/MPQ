@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import math
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 
+from ..baselines.cd_solvers import (
+    run_cdquant_e8p12_rankspace,
+    run_quantease_e8p12_hessian,
+)
+from ..baselines.ojbkq import OJBKQConfig, run_ojbkq_e8p12_hessian
 from ..combo import QuantCombo, make_combo
 from ..solver import (
     E8P12VampConfig,
@@ -41,7 +48,14 @@ def _vamp_hessian_eigen(
     n = int(H.shape[0])
     H_f64 = H.to(dtype=torch.float64)
     H_f64 = 0.5 * (H_f64 + H_f64.T)
-    lam, V = torch.linalg.eigh(H_f64)  # ascending order
+    if not torch.isfinite(H_f64).all():
+        H_f64 = torch.nan_to_num(H_f64, nan=0.0, posinf=0.0, neginf=0.0)
+    try:
+        lam, V = torch.linalg.eigh(H_f64)  # ascending order
+    except Exception:
+        lam_cpu, V_cpu = torch.linalg.eigh(H_f64.detach().cpu())
+        lam = lam_cpu.to(device=H_f64.device)
+        V = V_cpu.to(device=H_f64.device)
     lam = lam.to(dtype=torch.float32)
     V = V.to(dtype=torch.float32)
     max_lam = float(lam.max().item()) if lam.numel() else 0.0
@@ -106,6 +120,71 @@ def _exact_surrogate_chunk_means(
 @torch.inference_mode()
 def _resolve_block_rows(rows: int, requested: int) -> int:
     return min(int(rows), max(int(requested), 1))
+
+
+def _parse_cd_snapshot_budgets(args: Any, *, max_sweeps: int) -> set[int]:
+    raw = getattr(args, "mpq_snapshot_budgets", "")
+    if raw is None:
+        return set()
+    if isinstance(raw, str):
+        values = [item.strip() for item in raw.split(",") if item.strip()]
+    elif isinstance(raw, (list, tuple, set)):
+        values = list(raw)
+    else:
+        values = [raw]
+    budgets = {int(value) for value in values}
+    invalid = sorted(budget for budget in budgets if budget < 0 or budget > int(max_sweeps))
+    if invalid:
+        raise ValueError(
+            f"CD snapshot budgets {invalid} fall outside [0, {int(max_sweeps)}]."
+        )
+    return budgets
+
+
+def _extract_layer_index(module_name: str) -> Optional[int]:
+    match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", str(module_name))
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _summarize_e8p12_mechanism(
+    *,
+    module_name: str,
+    rows: int,
+    cols: int,
+    nblocks: int,
+    gamma_sum: float,
+    gamma_count: int,
+    gamma_min: float,
+    gamma_max: float,
+    changed_count: int,
+    changed_total: int,
+) -> Dict[str, Any]:
+    total_count = int(changed_total) if int(changed_total) > 0 else int(rows) * int(nblocks)
+    changed = int(changed_count)
+    gamma_mean = float(gamma_sum / max(int(gamma_count), 1))
+    return {
+        "regime": "2bit_e8p12",
+        "cleanup_unit": "e8p12_block",
+        "module": str(module_name),
+        "layer_index": _extract_layer_index(str(module_name)),
+        "bits": 2,
+        "rows": int(rows),
+        "cols": int(cols),
+        "nblocks": int(nblocks),
+        "stage1_gamma1_mean": gamma_mean,
+        "stage1_gamma1_min": float(gamma_min) if math.isfinite(gamma_min) else gamma_mean,
+        "stage1_gamma1_max": float(gamma_max) if math.isfinite(gamma_max) else gamma_mean,
+        "stage1_gamma1_count": int(gamma_count),
+        "cleanup_changed_count": int(changed),
+        "cleanup_total_count": int(total_count),
+        "cleanup_changed_fraction": float(changed / max(total_count, 1)),
+        "cleanup_agreement_fraction": float(1.0 - (changed / max(total_count, 1))),
+    }
 
 
 @torch.inference_mode()
@@ -356,13 +435,16 @@ def mpq_refine_codebook(
         )
     elif init_mode == "rtn":
         hatWr_init, Qidxs_init = _rtn_e8p12_init(Wr=Wr, cb=cb, resid_scale_override=resid_scale_override)
+    elif init_mode in {"float", "paper", "unquantized"}:
+        hatWr_init = Wr.to(dtype=torch.float32).clone()
+        _, Qidxs_init = _rtn_e8p12_init(Wr=Wr, cb=cb, resid_scale_override=resid_scale_override)
     elif init_mode == "zero":
         hatWr_init, Qidxs_init = _zero_e8p12_init(Wr=Wr, cb=cb, resid_scale_override=resid_scale_override)
     elif init_mode == "ldlq":
         hatWr_init = hatWr0.to(dtype=torch.float32)
         Qidxs_init = Qidxs0.to(dtype=getattr(cb, "idx_dtype", torch.int64))
     else:
-        raise ValueError(f"unknown mpq_init={init_mode!r} (expected 'random', 'rtn', 'zero', or 'ldlq').")
+        raise ValueError(f"unknown mpq_init={init_mode!r} (expected 'float', 'random', 'rtn', 'zero', or 'ldlq').")
 
     eigenvalues, V, rank, eigen_floor = _vamp_hessian_eigen(
         Hr,
@@ -404,26 +486,82 @@ def mpq_refine_codebook(
         m,
         int(getattr(args, "mpq_block_rows", adapter_cfg.block_rows) or adapter_cfg.block_rows),
     )
+    requested_snapshot_budgets = _parse_cd_snapshot_budgets(
+        args,
+        max_sweeps=int(getattr(args, "mpq_polish_sweeps", 0) or 0),
+    )
+    cd_snapshot_chunks: Dict[int, list[torch.Tensor]] = {
+        budget: [] for budget in sorted(requested_snapshot_budgets)
+    }
+    cd_trace_accumulator: Dict[int, Dict[str, float]] = {}
     exact_ldlq, exact_ldlq_chunks = _exact_surrogate_chunk_means(
         Wr,
         hatWr0.to(dtype=torch.float32),
         Hr,
         block_rows=block_rows,
     )
-    if combo is not None and combo.solver == "ldlq":
+    if combo is not None and combo.solver == "ldlq" and init_mode == "random":
+        final_hatWr = hatWr_init.clone()
+        final_Qidxs = Qidxs_init.clone()
+        exact_before, exact_before_chunks = _exact_surrogate_chunk_means(
+            Wr,
+            final_hatWr,
+            Hr,
+            block_rows=block_rows,
+        )
+    elif combo is not None and combo.solver in {"ldlq", "cdquant", "ojbkq"}:
         final_hatWr = hatWr0.to(dtype=torch.float32).clone()
         final_Qidxs = Qidxs0.to(dtype=getattr(cb, "idx_dtype", torch.int64)).clone()
         exact_before, exact_before_chunks = exact_ldlq, list(exact_ldlq_chunks)
+    elif combo is not None and combo.solver == "quantease":
+        qe_init_mode = str(getattr(args, "mpq_init", "float") or "float").strip().lower()
+        if qe_init_mode == "random":
+            final_hatWr, final_Qidxs = _random_e8p12_init(
+                cb=cb,
+                rows=m,
+                nblocks=nblocks,
+                seed_key=f"{module_name}:quantease_init",
+                base_seed=seed,
+                device=device,
+                dtype=Wr.dtype,
+            )
+            qe_init_label = "random_e8p12"
+        elif qe_init_mode == "rtn":
+            final_hatWr, final_Qidxs = _rtn_e8p12_init(Wr=Wr, cb=cb, resid_scale_override=resid_scale_override)
+            qe_init_label = "rtn"
+        elif qe_init_mode == "ldlq":
+            final_hatWr = hatWr0.to(dtype=torch.float32).clone()
+            final_Qidxs = Qidxs0.to(dtype=getattr(cb, "idx_dtype", torch.int64)).clone()
+            qe_init_label = "ldlq"
+        elif qe_init_mode in {"float", "paper", "unquantized"}:
+            final_hatWr = Wr.to(dtype=torch.float32).clone()
+            _, final_Qidxs = _rtn_e8p12_init(Wr=Wr, cb=cb, resid_scale_override=resid_scale_override)
+            qe_init_label = "float"
+        else:
+            raise ValueError(f"unknown QuantEase mpq_init={qe_init_mode!r} (expected 'float', 'random', 'rtn', or 'ldlq').")
+        exact_before, exact_before_chunks = _exact_surrogate_chunk_means(Wr, final_hatWr, Hr, block_rows=block_rows)
     else:
         final_hatWr = hatWr_init.clone()
         final_Qidxs = Qidxs_init.clone()
         exact_before, exact_before_chunks = _exact_surrogate_chunk_means(Wr, hatWr_init, Hr, block_rows=block_rows)
     obs_precision_block = float(obs_precision)
     stats_chunk: Dict[str, Any] = {}
+    gamma_sum = 0.0
+    gamma_count = 0
+    gamma_min = float("inf")
+    gamma_max = float("-inf")
+    changed_count = 0
+    changed_total = 0
     for row_start in range(0, m, block_rows):
         row_end = min(row_start + block_rows, m)
         rb = slice(row_start, row_end)
+        chunk_snapshots: Dict[int, torch.Tensor] = {}
+        chunk_trace: list[Dict[str, Any]] = []
         if combo is not None and combo.solver == "vamp":
+            debug_chunk: Dict[str, Any] = {
+                "summary_only": True,
+                "cd_snapshot_budgets": sorted(requested_snapshot_budgets),
+            }
             hat_chunk, idx_chunk, _err_chunk, stats_chunk = solve_e8p12_rankspace_vamp(
                 Wr=Wr[rb],
                 hatWr_init=final_hatWr[rb],
@@ -436,16 +574,48 @@ def mpq_refine_codebook(
                 module_name=module_name,
                 obs_precision_init=obs_precision_block,
                 log_stats=False,
+                debug_out=debug_chunk,
             )
             final_hatWr[rb] = hat_chunk
             final_Qidxs[rb] = idx_chunk
+            chunk_snapshots = debug_chunk.get("cd_snapshots", {})
+            chunk_trace = list(
+                stats_chunk.get("polish_trace", {}).get("sweep_trace", [])
+            )
             if bool(vamp_cfg.em_obs_precision) and float(vamp_cfg.obs_precision) <= 0.0:
                 obs_precision_block = float(stats_chunk.get("obs_precision_final", obs_precision_block))
+            if "gamma1_sum" in debug_chunk:
+                gamma_sum += float(debug_chunk.get("gamma1_sum", 0.0) or 0.0)
+                gamma_count += int(debug_chunk.get("gamma1_count", 0) or 0)
+                gamma_min = min(gamma_min, float(debug_chunk.get("gamma1_min", float("inf"))))
+                gamma_max = max(gamma_max, float(debug_chunk.get("gamma1_max", float("-inf"))))
+            else:
+                gamma_chunk = debug_chunk.get("gamma1")
+                if isinstance(gamma_chunk, torch.Tensor) and gamma_chunk.numel() > 0:
+                    gamma_chunk = gamma_chunk.to(dtype=torch.float64)
+                    gamma_sum += float(gamma_chunk.sum().item())
+                    gamma_count += int(gamma_chunk.numel())
+                    gamma_min = min(gamma_min, float(gamma_chunk.min().item()))
+                    gamma_max = max(gamma_max, float(gamma_chunk.max().item()))
+            if "changed_count" in debug_chunk:
+                changed_count += int(debug_chunk.get("changed_count", 0) or 0)
+                changed_total += int(debug_chunk.get("changed_total", 0) or 0)
+            else:
+                changed_mask = debug_chunk.get("changed_mask")
+                if isinstance(changed_mask, torch.Tensor):
+                    changed_count += int(changed_mask.to(dtype=torch.int64).sum().item())
+                    changed_total += int(changed_mask.numel())
         elif combo is not None and combo.solver == "ldlq":
+            solver_label = "e8p12_random_hard" if init_mode == "random" else "e8p12_ldlq"
             if combo.polish_mode == "none":
                 hat_chunk = final_hatWr[rb]
                 idx_chunk = final_Qidxs[rb]
-                stats_chunk = {"solver": "e8p12_ldlq", "polish_mode": "none", "accepted_updates": 0.0}
+                stats_chunk = {
+                    "solver": solver_label,
+                    "initialization": init_mode,
+                    "polish_mode": "none",
+                    "accepted_updates": 0.0,
+                }
             elif combo.polish_mode == "block_cd":
                 hat_chunk, idx_chunk, _err_chunk, polish_stats = polish_e8p12_rankspace(
                     x_init=final_hatWr[rb],
@@ -458,15 +628,20 @@ def mpq_refine_codebook(
                     polish_metric=str(getattr(args, "mpq_polish_metric", "gram")),
                     metric_rows_per_chunk=int(getattr(args, "mpq_metric_rows_per_chunk", 0)),
                     polish_max_blocks=int(getattr(args, "mpq_polish_max_blocks", 0)),
+                    snapshot_budgets=requested_snapshot_budgets,
+                    snapshots_out=chunk_snapshots,
                 )
                 stats_chunk = {
-                    "solver": "e8p12_ldlq",
+                    "solver": solver_label,
+                    "initialization": init_mode,
                     "polish_mode": "block_cd",
                     "polish_updates": float(polish_stats.get("accepted_updates", 0.0)),
+                    "polish_trace": polish_stats,
                 }
+                chunk_trace = list(polish_stats.get("sweep_trace", []))
             else:
                 aux_cfg = _build_vamp_cfg(args, polish_mode="none")
-                aux_debug: Dict[str, Any] = {}
+                aux_debug: Dict[str, Any] = {"capture_r1": True}
                 _aux_hat, _aux_idx, _aux_err, aux_stats = solve_e8p12_rankspace_vamp(
                     Wr=Wr[rb],
                     hatWr_init=final_hatWr[rb],
@@ -507,15 +682,125 @@ def mpq_refine_codebook(
                 if bool(aux_cfg.em_obs_precision) and float(aux_cfg.obs_precision) <= 0.0:
                     obs_precision_block = float(aux_stats.get("obs_precision_final", obs_precision_block))
                 stats_chunk = {
-                    "solver": "e8p12_ldlq",
+                    "solver": solver_label,
+                    "initialization": init_mode,
                     "polish_mode": "topk_block_cd",
                     "topk_k": int(topk["topk_idxs"].shape[-1]),
                     "polish_updates": float(polish_stats.get("accepted_updates", 0.0)),
                 }
             final_hatWr[rb] = hat_chunk
             final_Qidxs[rb] = idx_chunk
+        elif combo is not None and combo.solver in {"cdquant", "quantease", "ojbkq"}:
+            Y_u_chunk = Wr[rb].matmul(Vs)
+            if combo.solver == "cdquant":
+                hat_chunk, idx_chunk, _err_chunk, stats_chunk = run_cdquant_e8p12_rankspace(
+                    hatWr_init=final_hatWr[rb],
+                    Qidxs_init=final_Qidxs[rb],
+                    Y_u=Y_u_chunk,
+                    Vs=Vs,
+                    cb=cb,
+                    sweeps=max(int(getattr(args, "mpq_polish_sweeps", 3)), 1),
+                    polish_metric=str(getattr(args, "mpq_polish_metric", "gram")),
+                    metric_rows_per_chunk=int(getattr(args, "mpq_metric_rows_per_chunk", 0)),
+                    polish_max_blocks=int(getattr(args, "mpq_polish_max_blocks", 0)),
+                )
+            elif combo.solver == "quantease":
+                hat_chunk, idx_chunk, _err_chunk, stats_chunk = run_quantease_e8p12_hessian(
+                    Wr=Wr[rb],
+                    Hr=Hr,
+                    cb=cb,
+                    Y_u=Y_u_chunk,
+                    Vs=Vs,
+                    sweeps=max(int(getattr(args, "mpq_iters", 16)), 1),
+                    metric_rows_per_chunk=int(getattr(args, "mpq_metric_rows_per_chunk", 0)),
+                    hatWr_init=final_hatWr[rb],
+                    Qidxs_init=final_Qidxs[rb],
+                    init_label=qe_init_label,
+                )
+            else:
+                ojbkq_cfg = OJBKQConfig(
+                    enabled=True,
+                    random_trials=int(getattr(args, "ojbkq_random_trials", 4)),
+                    alpha_mode=str(getattr(args, "ojbkq_alpha_mode", "paper")),
+                    alpha_override=getattr(args, "ojbkq_alpha_override", None),
+                    alpha_scale=float(getattr(args, "ojbkq_alpha_scale", 1.0)),
+                    sample_topk=getattr(args, "ojbkq_sample_topk", None),
+                )
+                hat_chunk, idx_chunk, stats_chunk = run_ojbkq_e8p12_hessian(
+                    Wr=Wr[rb],
+                    Hr=Hr,
+                    hatWr0=final_hatWr[rb],
+                    Qidxs0=final_Qidxs[rb],
+                    cb=cb,
+                    config=ojbkq_cfg,
+                    module_name=module_name,
+                )
+                if combo.polish_mode != "none" and int(getattr(args, "mpq_polish_sweeps", 0)) > 0:
+                    hat_chunk, idx_chunk, _err_chunk, polish_stats = polish_e8p12_rankspace(
+                        x_init=hat_chunk,
+                        idxs_init=idx_chunk,
+                        Y_u=Y_u_chunk,
+                        Vs=Vs,
+                        cb=cb,
+                        sweeps=int(getattr(args, "mpq_polish_sweeps", 3)),
+                        polish_mode=str(combo.polish_mode),
+                        polish_metric=str(getattr(args, "mpq_polish_metric", "gram")),
+                        metric_rows_per_chunk=int(getattr(args, "mpq_metric_rows_per_chunk", 0)),
+                        polish_max_blocks=int(getattr(args, "mpq_polish_max_blocks", 0)),
+                        snapshot_budgets=requested_snapshot_budgets,
+                        snapshots_out=chunk_snapshots,
+                    )
+                    stats_chunk = {
+                        **stats_chunk,
+                        "post_ojbkq_polish_mode": str(combo.polish_mode),
+                        "post_ojbkq_polish_sweeps": int(getattr(args, "mpq_polish_sweeps", 3)),
+                        "post_ojbkq_polish_updates": float(
+                            polish_stats.get("accepted_updates", 0.0)
+                        ),
+                        "post_ojbkq_polish_trace": polish_stats,
+                    }
+                    chunk_trace = list(polish_stats.get("sweep_trace", []))
+            changed_count += int((idx_chunk != final_Qidxs[rb]).to(dtype=torch.int64).sum().item())
+            changed_total += int(idx_chunk.numel())
+            final_hatWr[rb] = hat_chunk
+            final_Qidxs[rb] = idx_chunk
         else:
             raise RuntimeError("failed to resolve QUIP solver combination")
+
+        if requested_snapshot_budgets:
+            missing_budgets = sorted(requested_snapshot_budgets - set(chunk_snapshots))
+            if missing_budgets:
+                raise RuntimeError(
+                    f"missing CD snapshots {missing_budgets} for {module_name} rows "
+                    f"[{row_start}, {row_end})"
+                )
+            for budget in sorted(requested_snapshot_budgets):
+                cd_snapshot_chunks[budget].append(chunk_snapshots[budget])
+        chunk_rows = int(row_end - row_start)
+        for trace_item in chunk_trace:
+            budget = int(trace_item["budget"])
+            accumulator = cd_trace_accumulator.setdefault(
+                budget,
+                {
+                    "weighted_objective": 0.0,
+                    "rows": 0.0,
+                    "accepted_updates_sweep": 0.0,
+                    "accepted_updates_cumulative": 0.0,
+                    "assignment_changes_from_cd0": 0.0,
+                    "assignments_total": 0.0,
+                },
+            )
+            accumulator["weighted_objective"] += (
+                float(trace_item["stabilized_objective_mean"]) * chunk_rows
+            )
+            accumulator["rows"] += chunk_rows
+            for key in (
+                "accepted_updates_sweep",
+                "accepted_updates_cumulative",
+                "assignment_changes_from_cd0",
+                "assignments_total",
+            ):
+                accumulator[key] += float(trace_item.get(key, 0))
 
     exact_after, exact_after_chunks = _exact_surrogate_chunk_means(Wr, final_hatWr, Hr, block_rows=block_rows)
 
@@ -558,5 +843,36 @@ def mpq_refine_codebook(
         "surrogate_chunk_violation_max_ratio": float(max_ratio),
         "solver_time_s": float(time.time() - start),
         "solver_stats": stats_chunk if "stats_chunk" in locals() else {},
+        "cd_trace": [
+            {
+                "budget": int(budget),
+                "stabilized_objective_mean": float(
+                    values["weighted_objective"] / max(values["rows"], 1.0)
+                ),
+                "accepted_updates_sweep": int(values["accepted_updates_sweep"]),
+                "accepted_updates_cumulative": int(values["accepted_updates_cumulative"]),
+                "assignment_changes_from_cd0": int(values["assignment_changes_from_cd0"]),
+                "assignments_total": int(values["assignments_total"]),
+            }
+            for budget, values in sorted(cd_trace_accumulator.items())
+        ],
+        "mechanism": _summarize_e8p12_mechanism(
+            module_name=str(module_name),
+            rows=int(m),
+            cols=int(n),
+            nblocks=int(nblocks),
+            gamma_sum=float(gamma_sum),
+            gamma_count=int(gamma_count),
+            gamma_min=float(gamma_min),
+            gamma_max=float(gamma_max),
+            changed_count=int(changed_count),
+            changed_total=int(changed_total),
+        ),
     }
+    if requested_snapshot_budgets:
+        stats["cd_snapshot_budgets"] = sorted(requested_snapshot_budgets)
+        stats["_cd_snapshot_idxs"] = {
+            int(budget): torch.cat(chunks, dim=0)
+            for budget, chunks in cd_snapshot_chunks.items()
+        }
     return final_hatWr.to(dtype=hatWr0.dtype), final_Qidxs, stats

@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
-from typing import Dict, Optional, Protocol, Tuple
+from typing import Any, Dict, Optional, Protocol, Tuple
 
 import torch
 
-from ..linear import stabilize_cholesky
+from ..linear import hessian_objective_mean, stabilize_cholesky
 
 
 class CandidateProvider(Protocol):
@@ -313,7 +313,7 @@ class BlockCDConfig:
     accept_tol: float = 0.0
     metric_rows_per_chunk: int = 0  # for large codebooks (optional)
     max_blocks_per_sweep: int = 0  # if >0, only polish top-K blocks by static importance
-    order_mode: str = "greedy_gain"  # "static" | "greedy_gain"
+    order_mode: str = "greedy_gain"  # "static" | "cyclic" | "greedy_gain"
     compile_steps: bool = True
 
 
@@ -339,7 +339,11 @@ def block_coordinate_descent_rankspace(
     provider: CandidateProvider,
     cfg: BlockCDConfig,
     idxs_init: Optional[torch.Tensor] = None,  # (B, n_blocks) for codebook-style decisions
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, float]]:
+    snapshot_budgets: Optional[set[int]] = None,
+    snapshots_out: Optional[Dict[int, torch.Tensor]] = None,
+    raw_target: Optional[torch.Tensor] = None,
+    raw_gram: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]:
     """Generic rank-space block-coordinate polish.
 
     Objective: minimize ||Y_u - x Vs||^2 subject to discrete constraints supplied by `provider`.
@@ -351,7 +355,11 @@ def block_coordinate_descent_rankspace(
     """
     sweeps = max(int(cfg.sweeps), 0)
     if sweeps <= 0 or x.numel() == 0 or Vs.numel() == 0:
-        return x, None, {"accepted_updates": 0.0}
+        return x, idxs_init, {
+            "accepted_updates": 0.0,
+            "sweep_trace": [],
+            "stabilized_objective_nonincreasing": True,
+        }
 
     metric = str(cfg.metric or "diag").strip().lower()
     if metric not in ("diag", "gram", "isotropic"):
@@ -359,8 +367,8 @@ def block_coordinate_descent_rankspace(
     if metric == "isotropic":
         metric = "diag"
     order_mode = str(getattr(cfg, "order_mode", "greedy_gain") or "greedy_gain").strip().lower()
-    if order_mode not in ("static", "greedy_gain"):
-        raise ValueError(f"unsupported order_mode={order_mode!r}; expected 'static'|'greedy_gain'.")
+    if order_mode not in ("static", "cyclic", "greedy_gain"):
+        raise ValueError(f"unsupported order_mode={order_mode!r}; expected 'static'|'cyclic'|'greedy_gain'.")
 
     B, n = x.shape
     blocks = _resolve_blocks(n, int(block_size))
@@ -394,6 +402,7 @@ def block_coordinate_descent_rankspace(
         block_meta.append((start, end, Vs_blk_t, Vs_blk.contiguous(), gram_raw, gram_chol, diag_inv, gram_inv))
         importance[bi] = float(torch.diag(gram_raw).sum().item())
     static_order_list = torch.argsort(importance, descending=True).tolist()
+    cyclic_order_list = list(range(len(blocks)))
     max_blocks = int(getattr(cfg, "max_blocks_per_sweep", 0) or 0)
     gram_inv_stack = torch.stack(gram_inv_list, dim=0).contiguous() if gram_inv_list else None
     diag_inv_stack = torch.stack(diag_inv_list, dim=0).contiguous() if diag_inv_list else None
@@ -401,6 +410,52 @@ def block_coordinate_descent_rankspace(
     accept_tol = max(float(cfg.accept_tol), 0.0)
     accepted_count = torch.zeros((), dtype=torch.long, device=x_work.device)
     idxs_out: Optional[torch.Tensor] = idxs_init.clone() if idxs_init is not None else None
+    idxs_cd0 = idxs_out.clone() if idxs_out is not None else None
+    requested_snapshots = {
+        int(budget)
+        for budget in (snapshot_budgets or set())
+        if 0 <= int(budget) <= sweeps
+    }
+    if (
+        snapshots_out is not None
+        and idxs_out is not None
+        and 0 in requested_snapshots
+    ):
+        snapshots_out[0] = idxs_out.detach().to(device="cpu").clone()
+    if (raw_target is None) != (raw_gram is None):
+        raise ValueError("raw_target and raw_gram must be provided together.")
+
+    def trace_item(
+        *,
+        budget: int,
+        accepted_updates_sweep: int,
+        accepted_updates_cumulative: int,
+        assignment_changes_from_cd0: int,
+    ) -> Dict[str, Any]:
+        item: Dict[str, Any] = {
+            "budget": int(budget),
+            "stabilized_objective_mean": float(residual_norm.mean().item()),
+            "accepted_updates_sweep": int(accepted_updates_sweep),
+            "accepted_updates_cumulative": int(accepted_updates_cumulative),
+            "assignment_changes_from_cd0": int(assignment_changes_from_cd0),
+            "assignments_total": int(idxs_out.numel()) if idxs_out is not None else 0,
+        }
+        if raw_target is not None and raw_gram is not None:
+            item["raw_objective_mean"] = hessian_objective_mean(
+                target=raw_target,
+                x=x_work,
+                gram=raw_gram,
+            )
+        return item
+
+    sweep_trace: list[Dict[str, Any]] = [
+        trace_item(
+            budget=0,
+            accepted_updates_sweep=0,
+            accepted_updates_cumulative=0,
+            assignment_changes_from_cd0=0,
+        )
+    ]
 
     # Detect compiled block-step paths.
     compile_steps = bool(getattr(cfg, "compile_steps", True))
@@ -440,7 +495,8 @@ def block_coordinate_descent_rankspace(
     else:
         accept_step = _get_cd_accept_step(device=x_work.device)
 
-    for _ in range(sweeps):
+    for sweep_index in range(1, sweeps + 1):
+        accepted_before = int(accepted_count.item())
         if order_mode == "greedy_gain":
             gain = _batched_greedy_gain(
                 residual_u=residual_u,
@@ -451,6 +507,8 @@ def block_coordinate_descent_rankspace(
                 diag_inv=diag_inv_stack,
             )
             order_list = torch.argsort(gain, descending=True).tolist()
+        elif order_mode == "cyclic":
+            order_list = list(cyclic_order_list)
         else:
             order_list = list(static_order_list)
         if max_blocks > 0:
@@ -531,7 +589,40 @@ def block_coordinate_descent_rankspace(
                         idxs_out = cand_idxs.new_empty((B, len(blocks)), dtype=cand_idxs.dtype, device=cand_idxs.device)
                     idxs_out[:, bi] = torch.where(accept, cand_idxs, idxs_out[:, bi])
 
-    return x_work.to(dtype=x.dtype), idxs_out, {"accepted_updates": float(accepted_count.item())}
+        accepted_after = int(accepted_count.item())
+        assignment_changes = (
+            int((idxs_out != idxs_cd0).to(dtype=torch.int64).sum().item())
+            if idxs_out is not None and idxs_cd0 is not None
+            else 0
+        )
+        sweep_trace.append(
+            trace_item(
+                budget=int(sweep_index),
+                accepted_updates_sweep=int(accepted_after - accepted_before),
+                accepted_updates_cumulative=int(accepted_after),
+                assignment_changes_from_cd0=assignment_changes,
+            )
+        )
+        if (
+            snapshots_out is not None
+            and idxs_out is not None
+            and sweep_index in requested_snapshots
+        ):
+            snapshots_out[sweep_index] = idxs_out.detach().to(device="cpu").clone()
+
+    objective_values = [
+        float(item["stabilized_objective_mean"])
+        for item in sweep_trace
+    ]
+    nonincreasing = all(
+        after <= before + max(1e-8, abs(before) * 1e-7)
+        for before, after in zip(objective_values, objective_values[1:])
+    )
+    return x_work.to(dtype=x.dtype), idxs_out, {
+        "accepted_updates": float(accepted_count.item()),
+        "sweep_trace": sweep_trace,
+        "stabilized_objective_nonincreasing": bool(nonincreasing),
+    }
 
 
 @dataclass(frozen=True)
@@ -559,7 +650,7 @@ class UniformScalarProvider:
         q = torch.round(target.to(dtype=torch.float32) / scale + zero)
         q = torch.clamp(q, 0, int(self.maxq)).to(dtype=torch.int32)
         xq = scale * (q.to(dtype=torch.float32) - zero)
-        return xq.to(dtype=x_block.dtype), None
+        return xq.to(dtype=x_block.dtype), q.squeeze(-1)
 
 
 @dataclass(frozen=True)

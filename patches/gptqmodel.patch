@@ -14,22 +14,336 @@ index 7a054508..5d5c8554 100644
  from dataclasses import dataclass
  from typing import Dict, List, Optional, Tuple, Union
  
+diff --git a/gptqmodel/looper/awq_processor.py b/gptqmodel/looper/awq_processor.py
+index e2246383..f4ea2701 100644
+--- a/gptqmodel/looper/awq_processor.py
++++ b/gptqmodel/looper/awq_processor.py
+@@ -685,29 +685,27 @@ class AWQProcessor(LoopProcessor):
+         else:
+             w_mean = (w_sum / row_count).to(weight_dtype)
+ 
+-        # [STEP 2]: Compute per-channel mean of the input activation with chunking
+-        # Stream directly on the source device to avoid creating full CPU copies while still enforcing
+-        # a predictable memory bound derived from max_chunk_memory.
+-        inp_flat = inp.abs().view(-1, inp.shape[-1])
+-        num_elements = inp_flat.size(0)
+-        num_channels = inp_flat.size(1)
++        # [STEP 2]: Compute per-channel mean of |inp| in chunks without ever
++        # materializing the full `inp.abs()` copy (which doubles peak memory and
++        # OOMs on large models such as Llama-2-70B MLP layers with calib=128).
++        # `inp_2d` is a view of `inp`, so no extra allocation. Each chunk's
++        # `.abs()` and `.to(float32)` only materializes `chunk_size × num_channels`.
++        inp_2d = inp.reshape(-1, inp.shape[-1])
++        num_elements = inp_2d.size(0)
++        num_channels = inp_2d.size(1)
+         float32_size = torch.tensor([], dtype=torch.float32).element_size()
+-        element_size_bytes = float32_size  # accumulation happens in FP32
++        element_size_bytes = float32_size  # fp32 temporary per chunk
+ 
+-        # Calculate chunk size dynamically based on the available memory budget (default 1 GiB).
+         chunk_size = int(self.max_chunk_memory // (element_size_bytes * num_channels))
+         chunk_size = min(chunk_size, num_elements)
+         chunk_size = max(chunk_size, 1)
+ 
+-        # Use float32 for sum calculation
+         x_sum = torch.zeros(num_channels, dtype=torch.float32, device=inp.device)
+-
+         for i in range(0, num_elements, chunk_size):
+             end = min(i + chunk_size, num_elements)
+-            chunk = inp_flat[i:end]
+-            # Accumulate each chunk in FP32 to balance precision and memory usage.
+-            chunk_sum = chunk.to(torch.float32).sum(dim=0)
+-            x_sum += chunk_sum
++            chunk_abs = inp_2d[i:end].abs().to(torch.float32)
++            x_sum += chunk_abs.sum(dim=0)
++            del chunk_abs
+ 
+         x_mean = (x_sum / num_elements).to(inp.dtype)
+         del x_sum
+@@ -720,9 +718,18 @@ class AWQProcessor(LoopProcessor):
+             module_kwargs.setdefault(key, value)
+ 
+         with ctx(torch.inference_mode()):
+-            fp16_output = self._module_forward(inp, module2inspect, module_kwargs)
+-
+-        fp16_output = fp16_output.clip(torch.finfo(fp16_output.dtype).min, torch.finfo(fp16_output.dtype).max)
++            chunk_size = self._effective_quant_batch_size(inp)
++            if chunk_size is None:
++                fp16_output = self._module_forward(inp, module2inspect, module_kwargs)
++                fp16_output = fp16_output.clip(torch.finfo(fp16_output.dtype).min, torch.finfo(fp16_output.dtype).max)
++            else:
++                fp16_output = []
++                for fp16_chunk in self._iter_module_forward_outputs(inp, module2inspect, module_kwargs):
++                    fp16_chunk = fp16_chunk.clip(torch.finfo(fp16_chunk.dtype).min, torch.finfo(fp16_chunk.dtype).max)
++                    fp16_output.append(fp16_chunk.detach().cpu())
++                    del fp16_chunk
++                    if inp.device.type == "cuda":
++                        torch.cuda.empty_cache()
+ 
+         # [STEP 4]: Compute loss
+         best_scales, loss = self._compute_best_scale(
+@@ -945,6 +952,12 @@ class AWQProcessor(LoopProcessor):
+         if prev_scale_hint is not None:
+             w_mean = w_mean * float(prev_scale_hint)
+ 
++        fp16_output_chunks: Optional[List[torch.Tensor]] = None
++        fp16_output_numel: Optional[int] = None
++        if isinstance(fp16_output, list):
++            fp16_output_chunks = fp16_output
++            fp16_output_numel = sum(chunk.numel() for chunk in fp16_output_chunks)
++
+         for ratio in range(n_grid):
+             # create new scales
+             ratio = ratio / n_grid
+@@ -969,12 +982,22 @@ class AWQProcessor(LoopProcessor):
+                 self._pseudo_quantize_tensor_into(fc.weight, fc.weight)
+                 fc.weight.div_(scales_view)
+ 
+-            # W * X
+-            int_w_output = self._module_forward(x, module2inspect, kwargs)
+-            int_w_output = int_w_output.clip(torch.finfo(int_w_output.dtype).min, torch.finfo(int_w_output.dtype).max)
++            if fp16_output_chunks is not None and fp16_output_numel is not None:
++                loss = self._compute_chunked_loss(
++                    fp16_output_chunks=fp16_output_chunks,
++                    num_elements=fp16_output_numel,
++                    x=x,
++                    module=module2inspect,
++                    module_kwargs=kwargs,
++                    device=device,
++                )
++            else:
++                # W * X
++                int_w_output = self._module_forward(x, module2inspect, kwargs)
++                int_w_output = int_w_output.clip(torch.finfo(int_w_output.dtype).min, torch.finfo(int_w_output.dtype).max)
+ 
+-            # compute mean squared error (L2 norm)
+-            loss = self._compute_loss(fp16_output, int_w_output, device)
++                # compute mean squared error (L2 norm)
++                loss = self._compute_loss(fp16_output, int_w_output, device)
+ 
+             history.append(loss)
+             if loss < best_error:
+@@ -983,6 +1006,8 @@ class AWQProcessor(LoopProcessor):
+                 best_scales = scales.clone()
+             for fc in linears2scale:
+                 fc.weight.copy_(orig_weights_cpu[fc].to(device=fc.weight.device, dtype=fc.weight.dtype))
++            if device.type == "cuda":
++                torch.cuda.empty_cache()
+ 
+         # Reset weights one final time so callers always see the pristine FP copy.
+         for fc in linears2scale:
+@@ -1030,9 +1055,62 @@ class AWQProcessor(LoopProcessor):
+         return loss
+ 
+     @torch.inference_mode()
+-    def _module_forward(
++    def _compute_chunked_loss(
++            self,
++            fp16_output_chunks: List[torch.Tensor],
++            num_elements: int,
++            x: torch.Tensor,
++            module: torch.nn.Module,
++            module_kwargs: Dict,
++            device: torch.device,
++    ) -> float:
++        if not fp16_output_chunks or num_elements <= 0:
++            return 0.0
++
++        loss_sum = 0.0
++        for fp16_chunk, int_w_chunk in zip(
++            fp16_output_chunks,
++            self._iter_module_forward_outputs(x, module, module_kwargs),
++        ):
++            int_w_chunk = int_w_chunk.clip(torch.finfo(int_w_chunk.dtype).min, torch.finfo(int_w_chunk.dtype).max)
++
++            fp16_flat = fp16_chunk.view(-1)
++            int_w_flat = int_w_chunk.view(-1)
++            element_size_bytes = max(fp16_chunk.element_size(), int_w_chunk.element_size())
++            chunk_size = self.max_chunk_memory // (element_size_bytes * 2)
++            chunk_size = max(1, min(chunk_size, fp16_flat.size(0)))
++
++            for fp16_sub, int_w_sub in zip(torch.split(fp16_flat, chunk_size), torch.split(int_w_flat, chunk_size)):
++                loss_sum += (fp16_sub.to(device) - int_w_sub.to(device)).float().pow(2).sum().item()
++
++            del int_w_chunk, fp16_flat, int_w_flat
++            if device.type == "cuda":
++                torch.cuda.empty_cache()
++
++        return loss_sum / num_elements
++
++    def _effective_quant_batch_size(self, x: torch.Tensor) -> Optional[int]:
++        if self._quant_batch_size is None:
++            return None
++
++        try:
++            chunk_size = int(self._quant_batch_size)
++        except (TypeError, ValueError):
++            return None
++
++        if chunk_size <= 0 or x.dim() == 0:
++            return None
++
++        if int(x.shape[0]) <= chunk_size:
++            return None
++
++        return max(1, chunk_size)
++
++    @torch.inference_mode()
++    def _iter_module_forward_outputs(
+             self, x: torch.Tensor, module: torch.nn.Module, module_kwargs: Dict
+-    ) -> torch.Tensor:
++    ):
++        module_kwargs = dict(module_kwargs)
+         target_device = None
+         try:
+             target_device = next(module.parameters()).device
+@@ -1065,6 +1143,7 @@ class AWQProcessor(LoopProcessor):
+         else:
+             batch_dim = 1
+             seq_len = x.shape[0]
++        chunk_size = self._effective_quant_batch_size(x)
+ 
+         supports_position_ids = False
+         supports_position_embeddings = False
+@@ -1092,19 +1171,21 @@ class AWQProcessor(LoopProcessor):
+                 if supports_position_ids:
+                     module_kwargs["position_ids"] = pos_for_rotary
+ 
+-            x_for_rotary = x if target_device is None else x.to(target_device)
+-            module_kwargs["position_embeddings"] = rotary(x_for_rotary, pos_for_rotary)
++            if chunk_size is None:
++                x_for_rotary = x if target_device is None else x.to(target_device)
++                module_kwargs["position_embeddings"] = rotary(x_for_rotary, pos_for_rotary)
+         elif supports_position_ids and seq_len is not None and "position_ids" not in module_kwargs:
+             pos_values = torch.arange(seq_len, device=target_device or x.device, dtype=torch.long)
+             if x.dim() >= 2:
+                 pos_values = pos_values.unsqueeze(0).expand(batch_dim, -1)
+             module_kwargs["position_ids"] = pos_values
+ 
+-        if self._quant_batch_size is None or self._quant_batch_size <= 1:
++        if chunk_size is None:
+             module_output = module(x, **module_kwargs)
+             if isinstance(module_output, tuple):
+                 module_output = module_output[0]
+-            return module_output
++            yield module_output
++            return
+ 
+         def _slice_value(val, length):
+             if isinstance(val, torch.Tensor) and val.shape[0] == module_kwargs.get("position_ids", val).shape[0]:
+@@ -1118,19 +1199,40 @@ class AWQProcessor(LoopProcessor):
+                 return type(val)(sliced)
+             return val
+ 
+-        outputs = []
+-        for x_partial in torch.split(x, self._quant_batch_size, dim=0):
++        for x_partial in torch.split(x, chunk_size, dim=0):
+             partial_kwargs = {
+                 key: _slice_value(value, x_partial.shape[0])
+                 for key, value in module_kwargs.items()
+             }
++            if rotary is not None and supports_position_embeddings:
++                partial_pos_ids = partial_kwargs.get("position_ids") if supports_position_ids else None
++                if partial_pos_ids is None or partial_pos_ids.shape[-1] != seq_len:
++                    partial_pos_ids = torch.arange(seq_len, device=target_device or x_partial.device, dtype=torch.long)
++                    if x_partial.dim() >= 2:
++                        partial_pos_ids = partial_pos_ids.unsqueeze(0).expand(x_partial.shape[0], -1)
++                    if supports_position_ids:
++                        partial_kwargs["position_ids"] = partial_pos_ids
++                else:
++                    partial_pos_ids = partial_pos_ids.to(target_device or partial_pos_ids.device)
++                    if supports_position_ids:
++                        partial_kwargs["position_ids"] = partial_pos_ids
++
++                x_partial_for_rotary = x_partial if target_device is None else x_partial.to(target_device)
++                partial_kwargs["position_embeddings"] = rotary(x_partial_for_rotary, partial_pos_ids)
+             partial_output = module(x_partial, **partial_kwargs)
+             if isinstance(partial_output, tuple):
+                 partial_output = partial_output[0]
+-            outputs.append(partial_output)
++            yield partial_output
+ 
+-        module_output = torch.cat(outputs, dim=0)
++    @torch.inference_mode()
++    def _module_forward(
++            self, x: torch.Tensor, module: torch.nn.Module, module_kwargs: Dict
++    ) -> torch.Tensor:
++        outputs = list(self._iter_module_forward_outputs(x, module, module_kwargs))
++        if len(outputs) == 1:
++            return outputs[0]
+ 
++        module_output = torch.cat(outputs, dim=0)
+         return module_output
+ 
+     def apply_quant(self, named_linears: Dict[str, NamedModule], scales_list):
 diff --git a/gptqmodel/looper/gptq_processor.py b/gptqmodel/looper/gptq_processor.py
-index e9b342a5..ace53bf6 100644
+index e9b342a5..a6a41e68 100644
 --- a/gptqmodel/looper/gptq_processor.py
 +++ b/gptqmodel/looper/gptq_processor.py
-@@ -322,6 +322,23 @@ class GPTQProcessor(LoopProcessor):
+@@ -69,6 +69,25 @@ class GPTQProcessor(LoopProcessor):
+             return
+ 
+         qcfg_clone = copy.deepcopy(self.qcfg)
++        mpq_cfg = getattr(self.qcfg, "mpq", None)
++        mpq_cfg_clone = getattr(qcfg_clone, "mpq", None)
++        shared_mechanism = getattr(mpq_cfg, "_mechanism_summaries", None)
++        if mpq_cfg is not None and mpq_cfg_clone is not None and isinstance(shared_mechanism, list):
++            mpq_cfg_clone._mechanism_summaries = shared_mechanism
++        if mpq_cfg is not None and mpq_cfg_clone is not None:
++            shared_mpq_stats = getattr(mpq_cfg, "_layer_stats", None)
++            if not isinstance(shared_mpq_stats, list):
++                shared_mpq_stats = []
++                setattr(mpq_cfg, "_layer_stats", shared_mpq_stats)
++            mpq_cfg_clone._layer_stats = shared_mpq_stats
++        ojbkq_cfg = getattr(self.qcfg, "ojbkq", None)
++        ojbkq_cfg_clone = getattr(qcfg_clone, "ojbkq", None)
++        if ojbkq_cfg is not None and ojbkq_cfg_clone is not None:
++            shared_ojbkq_stats = getattr(ojbkq_cfg, "_layer_stats", None)
++            if not isinstance(shared_ojbkq_stats, list):
++                shared_ojbkq_stats = []
++                setattr(ojbkq_cfg, "_layer_stats", shared_ojbkq_stats)
++            ojbkq_cfg_clone._layer_stats = shared_ojbkq_stats
+ 
+         # dynamic overrides
+         if self.qcfg.dynamic is not None:
+@@ -207,13 +226,17 @@ class GPTQProcessor(LoopProcessor):
+         workspace_summary = getattr(g, "_borrow_workspace_last_summary", None)
+         workspace_totals = getattr(g, "_borrow_workspace_totals", None)
+ 
+-        module.stream_state_payload_to_cpu(
+-            {
+-                "q_scales": q_scales,
+-                "q_zeros": q_zeros,
+-                "q_g_idx": q_g_idx,
+-            },
+-        )
++        state_payload = {
++            "q_scales": q_scales,
++            "q_zeros": q_zeros,
++            "q_g_idx": q_g_idx,
++        }
++        internal_qint = getattr(g, "_mpq_internal_qint", None)
++        if isinstance(internal_qint, torch.Tensor):
++            state_payload["mpq_internal_qint"] = internal_qint
++        module.stream_state_payload_to_cpu(state_payload)
++        if hasattr(g, "_mpq_internal_qint"):
++            delattr(g, "_mpq_internal_qint")
+         del q_scales, q_zeros, q_g_idx
+ 
+         with self.lock:
+@@ -322,6 +345,24 @@ class GPTQProcessor(LoopProcessor):
  
          # cleanup all memory or states vars persistently added by this processor
          module.stream_sync()
 +        mpq_cfg = getattr(self.qcfg, "mpq", None)
-+        if (
++        internal_hadamard = bool(
 +            mpq_cfg is not None
 +            and bool(getattr(mpq_cfg, "enabled", False))
-+            and str(getattr(mpq_cfg, "solver", "")) == "vamp"
-+            and str(getattr(self.qcfg, "rotation", None)) == "hadamard"
-+        ):
-+            # MPQ exact-full path with internal Hadamard is a dense research path; skip packing/export.
++            and str(getattr(mpq_cfg, "rotation_mode", "")).strip().lower() == "internal_hadamard"
++        )
++        if internal_hadamard and "mpq_internal_qint" not in module.state:
++            # Native GPTQ/OJBKQ internal-rotation paths do not expose integer
++            # assignments yet and remain dense research paths.
 +            with (self.lock):
 +                if self.calculate_w_wq_diff:
 +                    module.weight.data = module.state.pop("wq").to(CPU)
@@ -42,11 +356,57 @@ index e9b342a5..ace53bf6 100644
          with (self.lock):
              # if calculate_w_wq_diff is enabled (eora), we need to revert our original wq
              if self.calculate_w_wq_diff:
+@@ -334,11 +375,24 @@ class GPTQProcessor(LoopProcessor):
+             q_zeros = module.state.pop("q_zeros").clone()
+             q_scales = module.state.pop("q_scales").clone()
+             q_g_idx = module.state.pop("q_g_idx").clone()
++            internal_qint = module.state.pop("mpq_internal_qint", None)
+ 
+         assert q_zeros.device == CPU
+         assert q_scales.device == CPU
+         assert q_g_idx.device == CPU
+ 
++        if internal_hadamard:
++            if not isinstance(internal_qint, torch.Tensor):
++                raise RuntimeError(f"Missing MPQ integer assignments for {module.full_name!r}")
++            group_index = q_g_idx.to(dtype=torch.long)
++            scale_full = q_scales.index_select(1, group_index)
++            zero_full = q_zeros.index_select(1, group_index)
++            packed_basis_weight = scale_full * (
++                internal_qint.to(dtype=scale_full.dtype) - zero_full
++            )
++            module.weight.data = packed_basis_weight.to(dtype=module.weight.dtype)
++            del internal_qint, group_index, scale_full, zero_full, packed_basis_weight
++
+         layers = find_modules(model.model)
+         module_label = getattr(module, "full_name", getattr(module, "name", ""))
+         parent_key = getattr(module, "full_name", getattr(module, "name", None))
+@@ -421,6 +475,20 @@ class GPTQProcessor(LoopProcessor):
+         model.quantized = True
+         model.quantize_config.quant_method = METHOD.GPTQ
+ 
++        mpq_cfg = getattr(self.qcfg, "mpq", None)
++        if (
++            mpq_cfg is not None
++            and bool(getattr(mpq_cfg, "enabled", False))
++            and str(getattr(mpq_cfg, "rotation_mode", "")).strip().lower() == "internal_hadamard"
++        ):
++            from mpq.adapters.gptqmodel import install_internal_hadamard_input_hooks
++
++            count = install_internal_hadamard_input_hooks(
++                model.model,
++                rotation_seed=int(getattr(mpq_cfg, "rotation_seed", 0)),
++            )
++            log.info("MPQ: installed internal-Hadamard input hooks on %d packed modules.", count)
++
+         super().finalize(model=model, **kwargs)
+ 
+     def verify_calibration_dataset(self, processor_index: int) -> bool:
 diff --git a/gptqmodel/models/base.py b/gptqmodel/models/base.py
-index 7d16f5ae..e6c63923 100644
+index 7d16f5ae..9a1cae7a 100644
 --- a/gptqmodel/models/base.py
 +++ b/gptqmodel/models/base.py
-@@ -749,30 +749,39 @@ class BaseQModel(nn.Module):
+@@ -749,30 +749,38 @@ class BaseQModel(nn.Module):
  
          # rotate model
          if self.quantize_config.rotation:
@@ -78,10 +438,9 @@ index 7d16f5ae..e6c63923 100644
 +            if (
 +                mpq_cfg is not None
 +                and bool(getattr(mpq_cfg, "enabled", False))
-+                and str(getattr(mpq_cfg, "solver", "")) == "vamp"
-+                and str(self.quantize_config.rotation) == "hadamard"
++                and str(getattr(mpq_cfg, "rotation_mode", "")).strip().lower() == "internal_hadamard"
 +            ):
-+                log.info("MPQ `rotation=hadamard`: using internal right-side Hadamard; skipping model rotation.")
++                log.info("MPQ `rotation=internal_hadamard`: using internal right-side Hadamard; skipping model rotation.")
 +            else:
 +                from gptqmodel.models.definitions.llama import LlamaQModel
 +                from gptqmodel.models.definitions.qwen2 import Qwen2QModel
@@ -110,6 +469,36 @@ index 7d16f5ae..e6c63923 100644
  
          # init processor with default GPTQ processor
          from ..looper.tensorparallel_weight_processor import TensorParallelWeightProcessor
+diff --git a/gptqmodel/models/loader.py b/gptqmodel/models/loader.py
+index 23a72177..06632322 100644
+--- a/gptqmodel/models/loader.py
++++ b/gptqmodel/models/loader.py
+@@ -917,7 +917,7 @@ def ModelLoader(cls):
+                 cls.generate = lambda _, **kwargs: mlx_generate(model=model, tokenizer=tokenizer, **kwargs)
+ 
+ 
+-        return cls(
++        instance = cls(
+             model,
+             quantized=True,
+             quantize_config=qcfg,
+@@ -927,6 +927,16 @@ def ModelLoader(cls):
+             trust_remote_code=trust_remote_code,
+             model_local_path=model_local_path,
+         )
++        rotation_meta = (qcfg.meta or {}).get("mpq_input_rotation")
++        if isinstance(rotation_meta, dict) and rotation_meta.get("mode") == "internal_block_hadamard":
++            from mpq.adapters.gptqmodel import install_internal_hadamard_input_hooks
++
++            count = install_internal_hadamard_input_hooks(
++                instance.model,
++                rotation_seed=int(rotation_meta.get("seed", 0)),
++            )
++            log.info("MPQ: restored internal-Hadamard input hooks on %d packed modules.", count)
++        return instance
+ 
+     cls.from_quantized = from_quantized
+ 
 diff --git a/gptqmodel/models/writer.py b/gptqmodel/models/writer.py
 index 0767fcc2..58a0b12a 100644
 --- a/gptqmodel/models/writer.py
@@ -140,8 +529,20 @@ index 9cb7a38d..9ad6cd86 100644
          # load adapter if any
          if adapter is not None:
              if adapter.path in LORA_MERGED_WEIGHT_PATHS:
+diff --git a/gptqmodel/nn_modules/triton_utils/dequant.py b/gptqmodel/nn_modules/triton_utils/dequant.py
+index aa9fd917..f8e22be6 100644
+--- a/gptqmodel/nn_modules/triton_utils/dequant.py
++++ b/gptqmodel/nn_modules/triton_utils/dequant.py
+@@ -59,6 +59,7 @@ def dequant_kernel(
+         tl.load(
+             scales_ptr + (col_idx + out_features * groups),
+             mask=xmask,
++            other=0.0,
+             eviction_policy="evict_last",
+         ),
+         tl.float32,
 diff --git a/gptqmodel/quantization/config.py b/gptqmodel/quantization/config.py
-index 97998f41..68f76e28 100644
+index 97998f41..b38f2dff 100644
 --- a/gptqmodel/quantization/config.py
 +++ b/gptqmodel/quantization/config.py
 @@ -10,7 +10,10 @@ from enum import Enum
@@ -156,18 +557,17 @@ index 97998f41..68f76e28 100644
  import torch
  from packaging import version
  
-@@ -324,6 +327,51 @@ class HessianConfig:
+@@ -324,6 +327,52 @@ class HessianConfig:
              raise ValueError("HessianConfig: `staging_dtype` must be a torch.dtype or string.")
  
  
 +@dataclass
 +class MPQConfig:
-+    """MPQ exact-full VAMP + greedy polish (research path).
++    """MPQ exact-full VAMP + greedy polish.
 +
 +    This is a dense quantization path that can optionally use an internal right-side
-+    Hadamard rotation for preconditioning. When that internal rotation is enabled
-+    (`rotation='hadamard'`), the result is intended for dense evaluation and is not
-+    packed/exported as a GPTQ checkpoint.
++    Hadamard rotation for preconditioning. MPQ-managed solvers can pack weights in
++    that rotated basis and restore the matching input transforms at load time.
 +    """
 +
 +    enabled: bool = False
@@ -194,6 +594,8 @@ index 97998f41..68f76e28 100644
 +
 +    # Greedy polish
 +    polish_sweeps: int = 3
++    compile_block_cd: bool = False
++    block_cd_backend: str = "eager"
 +
 +    # Full-layer driver
 +    block_rows: int = 32
@@ -208,7 +610,7 @@ index 97998f41..68f76e28 100644
  @dataclass
  class GPTAQConfig:
      alpha: float = field(default=0.25)
-@@ -693,6 +741,9 @@ class QuantizeConfig():
+@@ -693,6 +742,9 @@ class QuantizeConfig():
      # Hessian accumulation controls (GPTQ only)
      hessian: Optional[HessianConfig] = field(default_factory=HessianConfig)
  
@@ -219,10 +621,31 @@ index 97998f41..68f76e28 100644
      # Takes a list of devices and returns either the original list or a filtered subset
      compute_device_filter: Optional[callable] = field(
 diff --git a/gptqmodel/quantization/gptq.py b/gptqmodel/quantization/gptq.py
-index ae0921aa..edded766 100644
+index ae0921aa..8709dda6 100644
 --- a/gptqmodel/quantization/gptq.py
 +++ b/gptqmodel/quantization/gptq.py
-@@ -935,6 +935,85 @@ class GPTQ:
+@@ -42,8 +42,6 @@ lock = threading.Lock()
+ _WORKSPACE_CACHE: Dict[Tuple[str, Optional[int]], torch.Tensor] = {}
+ _WORKSPACE_LOCKS: Dict[Tuple[str, Optional[int]], threading.Lock] = {}
+ _BF16_SUPPORT_CACHE: Dict[Tuple[str, Optional[int]], bool] = {}
+-
+-
+ def _device_cache_key(device: torch.device) -> Tuple[str, Optional[int]]:
+     dev = torch.device(device)
+     return dev.type, dev.index
+@@ -911,11 +909,6 @@ class GPTQ:
+             use_hessian = True
+             self.finalize_hessian(target_device=target_device)
+ 
+-        # Temporarily disable torch.compile due to compatibility issues with torch 2.8
+-        # Will re-enable once the issue is fixed
+-        # if not TORCH_GTE_28 and not self.qcfg.mock_quantization:
+-        #     self.hessian_inverse = torch_compile(self.hessian_inverse)
+-
+         if self.qcfg.mock_quantization:
+             # Use simplified hessian inverse (identity matrix)
+             self.hessian_inverse = self.mock_hessian_inverse
+@@ -935,6 +928,140 @@ class GPTQ:
              W = self.module_copy.to(device=self.H.device)
              del self.module_copy
  
@@ -233,12 +656,19 @@ index ae0921aa..edded766 100644
 +            and str(getattr(mpq_cfg, "solver", "")) == "gptq"
 +            and str(getattr(mpq_cfg, "polish_mode", "none")) != "none"
 +        )
-+        W_mpq_ref = W.clone() if mpq_gptq_postprocess else None
-+        H_mpq_ref = self.H.clone() if mpq_gptq_postprocess else None
++        mpq_gptq_internal_rotation = bool(
++            mpq_cfg is not None
++            and bool(getattr(mpq_cfg, "enabled", False))
++            and str(getattr(mpq_cfg, "solver", "")) == "gptq"
++            and str(getattr(mpq_cfg, "rotation_mode", "")).strip().lower() == "internal_hadamard"
++        )
++        W_mpq_ref = None
++        H_mpq_ref = None
++        module_full_name = getattr(self._named_module, "full_name", self.name)
 +        if (
 +            mpq_cfg is not None
 +            and bool(getattr(mpq_cfg, "enabled", False))
-+            and str(getattr(mpq_cfg, "solver", "vamp")) == "vamp"
++            and str(getattr(mpq_cfg, "solver", "vamp")).strip().lower() in {"vamp", "cdquant", "quantease", "ojbkq"}
 +        ):
 +            from mpq.adapters.gptqmodel import GPTQAdapterConfig, run_mpq_quantization
 +            from mpq.solver import UniformVampConfig
@@ -260,6 +690,8 @@ index ae0921aa..edded766 100644
 +                polish_sweeps=int(getattr(mpq_cfg, "polish_sweeps", 3)),
 +                polish_mode=str(getattr(mpq_cfg, "polish_mode", "block_cd") or "block_cd"),
 +                topk_k=int(getattr(mpq_cfg, "topk_k", 8) or 8),
++                compile_block_cd=bool(getattr(mpq_cfg, "compile_block_cd", False)),
++                block_cd_backend=str(getattr(mpq_cfg, "block_cd_backend", "") or ""),
 +            )
 +            adapter_cfg = GPTQAdapterConfig(
 +                hessian_scale=float(getattr(mpq_cfg, "hessian_scale", 0.5)),
@@ -274,10 +706,28 @@ index ae0921aa..edded766 100644
 +                H=self.H,
 +                quantizer=self.quantizer,
 +                qcfg=self.qcfg,
-+                module_name=self.name,
++                module_name=str(module_full_name),
 +                vamp_cfg=vamp_cfg,
 +                adapter_cfg=adapter_cfg,
 +            )
++            if (
++                bool(getattr(mpq_cfg, "rotation_internal", False))
++                and isinstance(_q_int, torch.Tensor)
++            ):
++                self._mpq_internal_qint = _q_int
++            mechanism = _stats.get("mechanism") if isinstance(_stats, dict) else None
++            if isinstance(mechanism, dict):
++                bucket = getattr(mpq_cfg, "_mechanism_summaries", None)
++                if not isinstance(bucket, list):
++                    bucket = []
++                    setattr(mpq_cfg, "_mechanism_summaries", bucket)
++                bucket.append(mechanism)
++            if isinstance(_stats, dict):
++                stats_bucket = getattr(mpq_cfg, "_layer_stats", None)
++                if not isinstance(stats_bucket, list):
++                    stats_bucket = []
++                    setattr(mpq_cfg, "_layer_stats", stats_bucket)
++                stats_bucket.append(_stats)
 +
 +            if scale is None or zero is None:
 +                scale = Q.new_empty((Q.shape[0], 0), dtype=torch.float32)
@@ -305,10 +755,38 @@ index ae0921aa..edded766 100644
 +            damp = 0.0
 +            return Q, scale, zero, g_idx, float(duration), avg_loss, damp, self.nsamples
 +
++        internal_rotation_plan = None
++        if mpq_gptq_internal_rotation:
++            from mpq.adapters.gptqmodel import GPTQAdapterConfig, finalize_gptq_internal_hadamard, prepare_gptq_internal_hadamard
++
++            adapter_cfg = GPTQAdapterConfig(
++                hessian_scale=float(getattr(mpq_cfg, "hessian_scale", 0.5)),
++                block_rows=int(getattr(mpq_cfg, "block_rows", 32)),
++                jitter_base=float(getattr(mpq_cfg, "eigen_jitter", 1e-6)),
++                eigen_floor_scale=float(getattr(mpq_cfg, "eigen_floor_scale", 1e-6)),
++                rotation_seed=int(getattr(mpq_cfg, "rotation_seed", 0)),
++            )
++            W, self.H, internal_rotation_plan = prepare_gptq_internal_hadamard(
++                W=W,
++                H=self.H,
++                qcfg=self.qcfg,
++                module_name=str(module_full_name),
++                adapter_cfg=adapter_cfg,
++            )
++            if mpq_gptq_postprocess:
++                # Postprocess must run in the same rotated basis as the internal-rotation GPTQ solve.
++                W_mpq_ref = W.clone()
++                H_mpq_ref = self.H.clone()
++
++        if mpq_gptq_postprocess and W_mpq_ref is None:
++            # Non-internal GPTQ postprocess should see the original column order, before desc_act reordering.
++            W_mpq_ref = W.clone()
++            H_mpq_ref = self.H.clone()
++
          self.quantizer.find_params(W, weight=True)
  
          # H = self.H.to(device=self.H.device)
-@@ -990,6 +1069,51 @@ class GPTQ:
+@@ -990,6 +1117,82 @@ class GPTQ:
          else:
              Hinv, damp = None, 0.0
  
@@ -332,6 +810,37 @@ index ae0921aa..edded766 100644
 +                    module_name=self.name,
 +                )
 +            )
++            _ojbkq_bucket = getattr(ojbkq_cfg, "_layer_stats", None)
++            if not isinstance(_ojbkq_bucket, list):
++                _ojbkq_bucket = []
++                setattr(ojbkq_cfg, "_layer_stats", _ojbkq_bucket)
++            if isinstance(_ojbkq_stats, dict):
++                _ojbkq_bucket.append(_ojbkq_stats)
++
++            # The OJBKQ hook returns before GPTQ's common epilogue below. Apply
++            # the same inverse activation permutation and internal rotation
++            # here so dense weights are restored to the module's native basis.
++            if self.qcfg.desc_act and use_hessian:
++                Q_ojbkq = Q_ojbkq[:, invperm]
++                q_int_ojbkq = q_int_ojbkq[:, invperm]
++                g_idx_ojbkq = g_idx_ojbkq[invperm]
++
++            if mpq_gptq_internal_rotation and internal_rotation_plan is not None:
++                from mpq.adapters.gptqmodel import finalize_gptq_internal_hadamard
++
++                Q_ojbkq = finalize_gptq_internal_hadamard(
++                    Q_work=Q_ojbkq,
++                    rotation_plan=internal_rotation_plan,
++                )
++                scale_ojbkq = Q_ojbkq.new_empty(
++                    (Q_ojbkq.shape[0], 0), dtype=torch.float32
++                )
++                zero_ojbkq = Q_ojbkq.new_empty(
++                    (Q_ojbkq.shape[0], 0), dtype=torch.float32
++                )
++                g_idx_ojbkq = torch.empty(
++                    (Q_ojbkq.shape[1],), dtype=torch.int32, device=Q_ojbkq.device
++                )
 +
 +            if self._tp_pad_cols:
 +                valid_cols = self._original_columns
@@ -360,7 +869,7 @@ index ae0921aa..edded766 100644
          # Use simplified loop when mock_quantization is active
          if self.qcfg.mock_quantization:
              for i1 in range(0, self.columns, blocksize):
-@@ -1171,10 +1295,6 @@ class GPTQ:
+@@ -1171,10 +1374,6 @@ class GPTQ:
          else:
              avg_loss = f"{resolved_strategy.value} failsafe" if failsafe_configured else 999999999
  
@@ -371,7 +880,7 @@ index ae0921aa..edded766 100644
          group_size = self.qcfg.group_size if self.qcfg.group_size != -1 else self.columns
  
          if self.qcfg.static_groups and self.qcfg.desc_act:
-@@ -1200,11 +1320,56 @@ class GPTQ:
+@@ -1200,11 +1399,73 @@ class GPTQ:
              zero = temp_zero
              del final_perm, inv_final, global_perm, inv_global_perm, inv_global_perm_list, local_perms
  
@@ -405,9 +914,26 @@ index ae0921aa..edded766 100644
 +                zero_groups=zero,
 +                g_idx=g_idx,
 +                qcfg=self.qcfg,
-+                module_name=self.name,
++                module_name=str(module_full_name),
 +                adapter_cfg=adapter_cfg,
 +            )
++            mechanism = _stats_post.get("mechanism") if isinstance(_stats_post, dict) else None
++            if isinstance(mechanism, dict):
++                bucket = getattr(mpq_cfg, "_mechanism_summaries", None)
++                if not isinstance(bucket, list):
++                    bucket = []
++                    setattr(mpq_cfg, "_mechanism_summaries", bucket)
++                bucket.append(mechanism)
++        if mpq_gptq_internal_rotation and internal_rotation_plan is not None:
++            from mpq.adapters.gptqmodel import finalize_gptq_internal_hadamard
++
++            Q = finalize_gptq_internal_hadamard(
++                Q_work=Q,
++                rotation_plan=internal_rotation_plan,
++            )
++            scale = Q.new_empty((Q.shape[0], 0), dtype=torch.float32)
++            zero = Q.new_empty((Q.shape[0], 0), dtype=torch.float32)
++            g_idx = torch.empty((Q.shape[1],), dtype=torch.int32, device=Q.device)
 +
 +        del Losses
 +        del H_mpq_ref
@@ -428,7 +954,7 @@ index ae0921aa..edded766 100644
          if isinstance(self.module, transformers.Conv1D):
              Q = Q.t()
  
-@@ -1213,18 +1378,6 @@ class GPTQ:
+@@ -1213,18 +1474,6 @@ class GPTQ:
          else:
              Q = Q.to(self.module.weight.dtype)
  

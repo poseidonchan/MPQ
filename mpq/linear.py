@@ -94,6 +94,30 @@ def vamp_rankspace_error(
     return (Y_u - x.matmul(Vs)).square().sum(dim=1)
 
 
+@torch.inference_mode()
+def hessian_objective_mean(
+    *,
+    target: torch.Tensor,
+    x: torch.Tensor,
+    gram: torch.Tensor,
+) -> float:
+    """Return mean row-wise ``(target - x) H (target - x)^T``."""
+    if target.shape != x.shape:
+        raise ValueError(
+            f"target/x shape mismatch: {tuple(target.shape)} != {tuple(x.shape)}"
+        )
+    if gram.ndim != 2 or gram.shape != (x.shape[1], x.shape[1]):
+        raise ValueError(
+            f"invalid gram shape {tuple(gram.shape)} for x={tuple(x.shape)}"
+        )
+    if x.numel() == 0:
+        return 0.0
+    delta = target.to(device=x.device, dtype=torch.float32) - x.to(dtype=torch.float32)
+    gram_f32 = gram.to(device=x.device, dtype=torch.float32)
+    value = (delta.matmul(gram_f32) * delta).sum(dim=1)
+    return float(value.mean().item())
+
+
 def stabilize_cholesky(
     gram: torch.Tensor,
     *,

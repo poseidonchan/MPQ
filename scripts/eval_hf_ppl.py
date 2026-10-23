@@ -16,6 +16,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from mpq.eval_utils import (
+    eval_token_fingerprint,
     eval_ppl_from_tokens,
     eval_protocol_for_dataset,
     load_or_build_c4_tokens,
@@ -116,6 +117,11 @@ def main() -> None:
         help="Load QUIP# hfized checkpoints via third_party/quip-sharp model loader (legacy Llama path).",
     )
     parser.add_argument(
+        "--gptqmodel",
+        action="store_true",
+        help="Load a packed scalar checkpoint with GPTQModel.",
+    )
+    parser.add_argument(
         "--tokenizer-ref",
         type=str,
         default=None,
@@ -127,6 +133,8 @@ def main() -> None:
     parser.add_argument("--max_eval_tokens", type=int, default=0, help="0 => paper-style defaults: full Wikitext2, C4 = 256*seqlen")
     parser.add_argument("--json_out", type=str, default=None)
     args = parser.parse_args()
+    if bool(args.quip) and bool(args.gptqmodel):
+        parser.error("--quip and --gptqmodel are mutually exclusive")
 
     random.seed(int(args.seed))
     torch.random.manual_seed(int(args.seed))
@@ -147,6 +155,15 @@ def main() -> None:
         )
         tokenizer_source = str(args.tokenizer_ref) if args.tokenizer_ref else str(model_ref)
         tokenizer = _load_tokenizer(tokenizer_source)
+    elif bool(args.gptqmodel):
+        from gptqmodel import GPTQModel
+
+        tokenizer_source = str(args.tokenizer_ref) if args.tokenizer_ref else str(model_path)
+        tokenizer = _load_tokenizer(tokenizer_source)
+        model = GPTQModel.load(
+            model_path,
+            device="cuda:0" if torch.cuda.is_available() else "cpu",
+        )
     else:
         tokenizer_source = str(args.tokenizer_ref) if args.tokenizer_ref else str(model_path)
         tokenizer = _load_tokenizer(tokenizer_source)
@@ -154,10 +171,11 @@ def main() -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     model.eval()
-    if not bool(args.quip):
+    if not bool(args.quip) and not bool(args.gptqmodel):
         model.to("cuda:0" if torch.cuda.is_available() else "cpu")
 
     ppls = {}
+    token_fingerprints = {}
     requested_max_eval_tokens = int(args.max_eval_tokens)
     eval_protocol = {}
     for dataset in args.datasets:
@@ -187,17 +205,20 @@ def main() -> None:
             )
         else:
             raise ValueError(f"unsupported eval dataset: {dataset_norm!r}")
+        token_fingerprints[dataset_norm] = eval_token_fingerprint(tokens)
         ppl = eval_ppl_from_tokens(model, tokens, seqlen=int(args.seqlen))
         print(f"{dataset_norm} perplexity: {ppl}", flush=True)
         ppls[dataset_norm] = float(ppl)
 
     if args.json_out:
         payload = {
+            "loader": "quip" if args.quip else ("gptqmodel" if args.gptqmodel else "transformers"),
             "seed": int(args.seed),
             "seqlen": int(args.seqlen),
             "datasets": list(args.datasets),
             "max_eval_tokens": requested_max_eval_tokens,
             "eval_protocol": eval_protocol,
+            "token_fingerprints": token_fingerprints,
             "ppl": ppls,
         }
         Path(args.json_out).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")

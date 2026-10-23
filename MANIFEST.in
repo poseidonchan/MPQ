@@ -1,0 +1,26 @@
+include README.md
+include LICENSE
+include THIRD_PARTY_NOTICES.md
+include install.sh
+include pyproject.toml
+recursive-include mpq *.py
+recursive-exclude mpq *.pdf *.md
+recursive-include examples *.py
+recursive-include tests *.py
+include docs/quickstart.md
+include docs/theory.md
+recursive-include patches *.py *.patch
+include scripts/backend_gptq.py
+include scripts/backend_quip.py
+include scripts/build_cuda_ext.sh
+include scripts/eval_hf_ppl.py
+include scripts/eval_lm_eval.py
+include scripts/hessian_offline_dense.py
+include scripts/hessian_offline_llama_wrapper.py
+include scripts/hfize_dense_decoder.py
+include scripts/prepare_awq_model.py
+include scripts/quantize_dense_decoder.py
+include scripts/quantize_llama_mpq_wrapper.py
+include scripts/setup_env_gptq.sh
+include scripts/setup_env_quip.sh
+prune results

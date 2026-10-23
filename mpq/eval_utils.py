@@ -8,6 +8,8 @@ from pathlib import Path
 import torch
 from datasets import load_dataset
 
+from mpq.data import tensor_sha256
+
 
 def eval_protocol_for_dataset(dataset: str, *, seqlen: int, requested_max_eval_tokens: int) -> dict:
     dataset_norm = str(dataset).strip().lower()
@@ -38,6 +40,15 @@ def eval_protocol_for_dataset(dataset: str, *, seqlen: int, requested_max_eval_t
             "effective_max_eval_tokens": 256 * int(seqlen),
         }
     raise ValueError(f"unsupported eval dataset: {dataset_norm!r}")
+
+
+def eval_token_fingerprint(tokens: torch.Tensor) -> dict:
+    return {
+        "protocol": "token_ids_sha256_v1",
+        "sha256": tensor_sha256(tokens.to(dtype=torch.int64)),
+        "shape": [int(dim) for dim in tokens.shape],
+        "tokens": int(tokens.numel()),
+    }
 
 
 @torch.inference_mode()
@@ -129,13 +140,13 @@ def eval_ppl_from_tokens(
         batch = tokens[:, i * seqlen : (i + 1) * seqlen]
         outputs = model(batch, use_cache=False)
         logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = batch[:, 1:].contiguous()
+        shift_logits = logits[:, :-1, :].contiguous().float()
+        shift_labels = batch[:, 1:].contiguous().to(shift_logits.device)
         loss = torch.nn.functional.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
         )
-        nlls.append(loss.float() * (int(seqlen) - 1))
+        nlls.append(loss.float().to(runtime_device) * (int(seqlen) - 1))
 
     total_nll = torch.stack(nlls).sum()
     total_tokens = nsamples * (int(seqlen) - 1)
